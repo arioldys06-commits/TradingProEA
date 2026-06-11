@@ -632,9 +632,87 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <div id="mtf-read" style="font-size:13px;color:var(--muted);line-height:1.7">Presiona Analizar para ver la lectura.</div>
   </div>
 </div>
-      <div id="page-bot" class="page" style="display:none"><div class="page-title">Bot autónomo</div><div class="coming-soon"><div class="icon">🤖</div><p>Módulo Bot — próxima parte</p></div></div>
+      <div id="page-bot" class="page" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+    <div class="page-title" style="margin:0">Bot autónomo — H1/M30</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button id="botToggleBtn" onclick="toggleBot()" style="background:var(--bg2);color:var(--muted);border:1px solid var(--b1);border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">Bot: OFF</button>
+      <button onclick="scanBot(true)" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">⚡ Escanear ahora</button>
+      <button onclick="clearBotEntries()" style="background:none;color:var(--muted);border:1px solid var(--b1);border-radius:var(--r);padding:6px 12px;font-size:12px;cursor:pointer">🗑 Limpiar</button>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px">
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Estado</div><div style="font-size:16px;font-weight:600" id="bot-status">OFF</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Score mínimo</div><div style="font-size:16px;font-weight:600;font-family:var(--mono);color:var(--gold)">75/100</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Trades hoy</div><div style="font-size:16px;font-weight:600;font-family:var(--mono)" id="bot-today">0/3</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Tendencia H1</div><div style="font-size:16px;font-weight:600" id="bot-h1">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Confirm M30</div><div style="font-size:16px;font-weight:600" id="bot-m30">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Pendientes</div><div style="font-size:16px;font-weight:600;font-family:var(--mono)" id="bot-pending">0</div></div>
+  </div>
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px;margin-bottom:16px">
+    <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Lectura del bot</div>
+    <div id="bot-read" style="font-size:12px;color:var(--muted)">Activa el bot o usa Escanear ahora.</div>
+  </div>
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px">
+    <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Entradas del bot</div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="border-bottom:1px solid var(--b1)">
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Hora</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Tipo</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Entrada</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">SL</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">TP1</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Score</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Motivo</th>
+        </tr></thead>
+        <tbody id="bot-entries"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
       <div id="page-backtest" class="page" style="display:none"><div class="page-title">Backtests</div><div class="coming-soon"><div class="icon">🧪</div><p>Módulo Backtests — próxima parte</p></div></div>
-      <div id="page-ai" class="page" style="display:none"><div class="page-title">Análisis IA</div><div class="coming-soon"><div class="icon">✨</div><p>Módulo IA — próxima parte</p></div></div>
+      <div id="page-ai" class="page" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <div class="page-title" style="margin:0">Análisis IA — Claude Vision</div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:16px">
+      <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px">Configuración</div>
+      <div style="margin-bottom:10px">
+        <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">API Key Anthropic</label>
+        <input type="password" id="ai-key" placeholder="sk-ant-api03-..." style="width:100%;background:var(--bg);border:1px solid var(--b1);border-radius:var(--r);color:var(--text);padding:8px 10px;font-size:12px;font-family:var(--mono);outline:none">
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Captura del gráfico</label>
+        <input type="file" id="ai-img" accept="image/*" onchange="previewImg(this)" style="width:100%;background:var(--bg);border:1px solid var(--b1);border-radius:var(--r);color:var(--text);padding:8px 10px;font-size:12px;outline:none">
+      </div>
+      <img id="ai-preview" style="display:none;width:100%;border-radius:var(--r);margin-bottom:10px;max-height:180px;object-fit:cover">
+      <div style="margin-bottom:10px">
+        <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Pregunta adicional (opcional)</label>
+        <textarea id="ai-msg" rows="2" placeholder="Ej: ¿Hay setup SELL en H1?" style="width:100%;background:var(--bg);border:1px solid var(--b1);border-radius:var(--r);color:var(--text);padding:8px 10px;font-size:12px;font-family:var(--sans);outline:none;resize:vertical"></textarea>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+        <input type="checkbox" id="ai-ctx" checked style="width:auto;cursor:pointer">
+        <label for="ai-ctx" style="font-size:12px;color:var(--muted);cursor:pointer">Incluir contexto del sistema</label>
+      </div>
+      <button id="ai-btn" onclick="analyzeWithAI()" style="width:100%;background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:10px;font-size:13px;font-weight:600;cursor:pointer">🔍 Analizar con Claude</button>
+      <div id="ai-status" style="font-size:11px;color:var(--muted);margin-top:8px;text-align:center"></div>
+    </div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:16px;display:flex;flex-direction:column">
+      <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Respuesta de Claude</div>
+      <div id="ai-response" style="flex:1;background:var(--bg);border:1px solid var(--b1);border-radius:var(--r);padding:12px;font-size:12px;color:var(--muted);line-height:1.8;white-space:pre-wrap;min-height:300px;overflow-y:auto">El análisis aparecerá aquí.</div>
+    </div>
+  </div>
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em">Historial (últimos 10)</div>
+      <button onclick="clearAIHistory()" style="font-size:11px;color:var(--dim);background:none;border:1px solid var(--b1);border-radius:var(--r);padding:3px 8px;cursor:pointer">Limpiar</button>
+    </div>
+    <div id="ai-history"></div>
+  </div>
+  <p style="font-size:11px;color:var(--dim);margin-top:8px">Las imágenes se envían directamente a la API de Anthropic. No se almacenan en el sistema.</p>
+</div>
       <div id="page-news" class="page" style="display:none"><div class="page-title">Noticias</div><div class="coming-soon"><div class="icon">📰</div><p>Módulo Noticias — próxima parte</p></div></div>
       <div id="page-risk" class="page" style="display:none"><div class="page-title">Gestión de riesgo</div><div class="coming-soon"><div class="icon">🧮</div><p>Módulo Riesgo — próxima parte</p></div></div>
 
@@ -674,6 +752,9 @@ function initApp(){
   calcRisk();
   refreshAll();
   startClock();
+  renderBot();
+  renderAIHistory();
+  if(botOn) scanBot(false);
 }
 
 // ── TRADINGVIEW ──
@@ -1390,6 +1471,313 @@ async function loadDesk() {
   const todayT=(currentSignals||[]).filter(s=>new Date(s.created_at).toDateString()===today&&s.status==='CLOSED').length;
   const tt=document.getElementById('dk-trades');
   if(tt){tt.textContent=todayT+'/3';tt.style.color=todayT>=3?'var(--red)':todayT>=2?'var(--yellow)':'var(--green)';}
+}
+
+
+// ════════════════════════════════════════
+// BOT AUTÓNOMO
+// ════════════════════════════════════════
+let botOn = localStorage.getItem('botOn') === 'true';
+let botTimer = null;
+let botEntries = JSON.parse(localStorage.getItem('botEntries') || '[]');
+const BOT_MIN_SCORE = 75;
+const BOT_MAX_DAILY = 3;
+const BOT_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+let botLastTrade = Number(localStorage.getItem('botLastTrade') || 0);
+let botContext = { h1: '-', m30: '-', score: 0 };
+
+function saveBotState() {
+  localStorage.setItem('botOn', botOn ? 'true' : 'false');
+  localStorage.setItem('botEntries', JSON.stringify(botEntries.slice(0, 100)));
+  localStorage.setItem('botLastTrade', String(botLastTrade));
+}
+
+function botTodayCount() {
+  const today = new Date().toDateString();
+  return botEntries.filter(e => new Date(e.time).toDateString() === today).length;
+}
+
+function renderBot() {
+  const btn = document.getElementById('botToggleBtn');
+  if (btn) {
+    btn.textContent = botOn ? 'Bot: ON ●' : 'Bot: OFF';
+    btn.style.background = botOn ? 'rgba(34,197,94,.15)' : 'var(--bg2)';
+    btn.style.color = botOn ? 'var(--green)' : 'var(--muted)';
+    btn.style.borderColor = botOn ? 'rgba(34,197,94,.3)' : 'var(--b1)';
+  }
+  const statusEl = document.getElementById('bot-status');
+  if (statusEl) {
+    statusEl.textContent = botOn ? 'ON' : 'OFF';
+    statusEl.style.color = botOn ? 'var(--green)' : 'var(--dim)';
+  }
+  const todayEl = document.getElementById('bot-today');
+  if (todayEl) todayEl.textContent = botTodayCount() + '/3';
+  const pendEl = document.getElementById('bot-pending');
+  if (pendEl) pendEl.textContent = botEntries.length;
+  document.getElementById('bot-h1').innerHTML = colorDir(botContext.h1 === 'BUY' || botContext.h1 === 'SELL' ? botContext.h1 : null);
+  document.getElementById('bot-m30').innerHTML = colorDir(botContext.m30 === 'BUY' || botContext.m30 === 'SELL' ? botContext.m30 : null);
+
+  const tbody = document.getElementById('bot-entries');
+  if (!tbody) return;
+  if (!botEntries.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;text-align:center;color:var(--dim)">Sin entradas todavía.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = botEntries.slice(0, 30).map(e => `<tr style="border-bottom:1px solid var(--bg2)">
+    <td style="padding:6px 8px;color:var(--dim)">${new Date(e.time).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit'})}</td>
+    <td style="padding:6px 8px">${e.type === 'BUY' ? '<span style="color:var(--green);font-weight:600">BUY</span>' : '<span style="color:var(--red);font-weight:600">SELL</span>'}</td>
+    <td style="padding:6px 8px;font-family:var(--mono)">${n(e.entry)}</td>
+    <td style="padding:6px 8px;font-family:var(--mono);color:var(--red)">${n(e.sl)}</td>
+    <td style="padding:6px 8px;font-family:var(--mono);color:var(--green)">${n(e.tp1)}</td>
+    <td style="padding:6px 8px;font-family:var(--mono);color:var(--gold)">${e.score}/100</td>
+    <td style="padding:6px 8px;color:var(--dim);font-size:11px">${e.reason}</td>
+  </tr>`).join('');
+}
+
+function toggleBot() {
+  botOn = !botOn;
+  saveBotState();
+  renderBot();
+  if (botOn) scanBot(false);
+}
+
+function clearBotEntries() {
+  botEntries = [];
+  saveBotState();
+  renderBot();
+}
+
+async function scanBot(manual = false) {
+  const now = Date.now();
+  const today = botTodayCount();
+  if (today >= BOT_MAX_DAILY) {
+    const readEl = document.getElementById('bot-read');
+    if (readEl) readEl.textContent = 'Límite diario alcanzado (3/3). Retomamos mañana.';
+    if (manual) alert('Límite diario alcanzado.');
+    return;
+  }
+  if (!manual && botLastTrade && (now - botLastTrade) < BOT_COOLDOWN_MS) {
+    const mins = Math.ceil((BOT_COOLDOWN_MS - (now - botLastTrade)) / 60000);
+    const readEl = document.getElementById('bot-read');
+    if (readEl) readEl.textContent = `Cooldown activo. Próximo escaneo en ${mins} min.`;
+    return;
+  }
+
+  const readEl = document.getElementById('bot-read');
+  if (readEl) readEl.textContent = 'Escaneando setups H1/M30...';
+
+  const [h1r, m30r] = await Promise.all([
+    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument','XAUUSD').eq('timeframe','H1').order('candle_time',{ascending:false}).limit(100),
+    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument','XAUUSD').eq('timeframe','M30').order('candle_time',{ascending:false}).limit(100),
+  ]);
+
+  const toC = rows => (rows?.data||[]).slice().reverse().map(c=>({time:c.candle_time,H:+c.high,L:+c.low,O:+c.open,C:+c.close}));
+  const ch1 = toC(h1r), cm30 = toC(m30r);
+  if (!ch1.length) { if(readEl) readEl.textContent = 'Sin velas H1.'; return; }
+
+  const dirH1 = (() => {
+    const cl = ch1.map(c=>c.C);
+    const e9=emaVal(cl,9), e20=emaVal(cl,20);
+    return e9&&e20?(e9>e20?'BUY':'SELL'):null;
+  })();
+  const dirM30 = (() => {
+    if (!cm30.length) return null;
+    const cl = cm30.map(c=>c.C);
+    const e9=emaVal(cl,9), e20=emaVal(cl,20);
+    return e9&&e20?(e9>e20?'BUY':'SELL'):null;
+  })();
+
+  botContext = { h1: dirH1||'-', m30: dirM30||'-', score: 0 };
+
+  const last = ch1[ch1.length-1];
+  const atr = calcATR(ch1.slice(-20));
+
+  // Detectar sweep H1
+  const {highs, lows} = detectSwingHL(ch1);
+  const sh = highs.slice(-1)[0]?.price, sl = lows.slice(-1)[0]?.price;
+  const sweepH = sh && last.H > sh && last.C < sh;
+  const sweepL = sl && last.L < sl && last.C > sl;
+
+  // BOS H1
+  const r = ch1.slice(-20);
+  const rH=Math.max(...r.map(c=>c.H).slice(-5)), pH=Math.max(...r.map(c=>c.H).slice(-10,-5));
+  const rL=Math.min(...r.map(c=>c.L).slice(-5)), pL=Math.min(...r.map(c=>c.L).slice(-10,-5));
+  const bos = rH>pH&&rL>pL?'BUY':rH<pH&&rL<pL?'SELL':null;
+  const choch = rH>pH&&rL<pL?'BUY':rH<pH&&rL>pL?'SELL':null;
+
+  let score = 0, sigType = null, reasons = [];
+
+  if (dirH1 === 'BUY') {
+    score += 30; reasons.push('H1 BUY');
+    if (dirM30 === 'BUY') { score += 20; reasons.push('M30 confirma'); }
+    if (sweepL) { score += 25; reasons.push('Sweep Low H1'); }
+    if (choch === 'BUY') { score += 20; reasons.push('CHoCH BUY'); }
+    else if (bos === 'BUY') { score += 10; reasons.push('BOS BUY'); }
+    if (isInKillzone()) { score += 5; reasons.push('Killzone'); }
+    sigType = 'BUY';
+  } else if (dirH1 === 'SELL') {
+    score += 30; reasons.push('H1 SELL');
+    if (dirM30 === 'SELL') { score += 20; reasons.push('M30 confirma'); }
+    if (sweepH) { score += 25; reasons.push('Sweep High H1'); }
+    if (choch === 'SELL') { score += 20; reasons.push('CHoCH SELL'); }
+    else if (bos === 'SELL') { score += 10; reasons.push('BOS SELL'); }
+    if (isInKillzone()) { score += 5; reasons.push('Killzone'); }
+    sigType = 'SELL';
+  }
+
+  score = Math.min(score, 100);
+  botContext.score = score;
+  renderBot();
+
+  if (!sigType || score < BOT_MIN_SCORE) {
+    if (readEl) readEl.textContent = `Sin setup válido. Score: ${score}/100. Esperando condiciones. H1: ${dirH1||'-'} | M30: ${dirM30||'-'}`;
+    if (manual) alert(`Sin entrada. Score: ${score}/100`);
+    return;
+  }
+
+  const entry = last.C;
+  const slPts = Math.max(atr * 1.2, 8);
+  const entryObj = {
+    time: new Date().toISOString(),
+    type: sigType,
+    entry,
+    sl: sigType==='BUY' ? entry-slPts : entry+slPts,
+    tp1: sigType==='BUY' ? entry+slPts*1.5 : entry-slPts*1.5,
+    tp2: sigType==='BUY' ? entry+slPts*3 : entry-slPts*3,
+    score,
+    reason: reasons.join(' + ')
+  };
+
+  botEntries.unshift(entryObj);
+  botLastTrade = now;
+  saveBotState();
+  renderBot();
+
+  if (readEl) readEl.textContent = `Entrada ${sigType} detectada. Score: ${score}/100. ${reasons.join(' · ')}`;
+  if (manual) alert(`Entrada ${sigType} | Score: ${score}/100\n${reasons.join(', ')}`);
+
+  showBotToast(entryObj);
+}
+
+function showBotToast(e) {
+  const old = document.getElementById('botToast');
+  if (old) old.remove();
+  const div = document.createElement('div');
+  div.id = 'botToast';
+  div.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:9999;background:var(--bg1);border:1px solid var(--gold);border-radius:var(--r2);padding:14px 16px;max-width:300px;box-shadow:0 8px 24px rgba(0,0,0,.4);animation:slideUp .3s ease';
+  div.innerHTML = `<div style="font-size:13px;font-weight:600;color:var(--gold);margin-bottom:4px">🤖 Bot — ${e.type}</div><div style="font-size:12px;color:var(--text)">Score: ${e.score}/100<br>Entrada: ${n(e.entry)} | SL: ${n(e.sl)}<br>TP1: ${n(e.tp1)}</div>`;
+  document.body.appendChild(div);
+  setTimeout(() => { const t = document.getElementById('botToast'); if(t) t.remove(); }, 8000);
+}
+
+// ════════════════════════════════════════
+// ANÁLISIS IA — CLAUDE VISION
+// ════════════════════════════════════════
+const AI_SYSTEM = `Eres un analista institucional especializado en XAUUSD usando Smart Money Concepts (SMC).
+Analiza el gráfico y responde SIEMPRE con esta estructura:
+1. TENDENCIA: (alcista/bajista/lateral + explicación)
+2. ESTRUCTURA: (BOS, CHoCH, swings relevantes)
+3. ZONAS CLAVE: (soportes, resistencias, OBs, FVGs)
+4. LIQUIDEZ: (equal highs/lows, stop hunts posibles)
+5. SETUP: (BUY/SELL/ESPERAR + entrada, SL, TP sugeridos)
+6. CONFLUENCIAS: (qué confirma o invalida)
+7. RECOMENDACIÓN: (una línea concreta)
+Sé directo y específico.`;
+
+function previewImg(input) {
+  const preview = document.getElementById('ai-preview');
+  if (input.files && input.files[0]) {
+    const r = new FileReader();
+    r.onload = e => { preview.src = e.target.result; preview.style.display = 'block'; };
+    r.readAsDataURL(input.files[0]);
+  }
+}
+
+async function analyzeWithAI() {
+  const apiKey = document.getElementById('ai-key').value.trim();
+  const userMsg = document.getElementById('ai-msg').value.trim();
+  const fileInput = document.getElementById('ai-img');
+  const statusEl = document.getElementById('ai-status');
+  const responseEl = document.getElementById('ai-response');
+  const btn = document.getElementById('ai-btn');
+  const includeCtx = document.getElementById('ai-ctx').checked;
+
+  if (!apiKey) { statusEl.textContent = 'Ingresa tu API key.'; return; }
+  if (!fileInput.files.length && !userMsg) { statusEl.textContent = 'Sube imagen o escribe pregunta.'; return; }
+
+  statusEl.textContent = 'Analizando con Claude...';
+  responseEl.textContent = 'Procesando...';
+  btn.disabled = true;
+
+  try {
+    let ctx = '';
+    if (includeCtx && currentAnalysis) {
+      ctx = `\n\nCONTEXTO: Tendencia ${currentAnalysis.trend} | PDH: ${n(currentAnalysis.weekly_high)} | PDL: ${n(currentAnalysis.weekly_low)} | Score sistema: ${document.getElementById('topScore')?.textContent||'-'}`;
+    }
+
+    const content = [];
+    if (fileInput.files.length) {
+      const file = fileInput.files[0];
+      const b64 = await new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.readAsDataURL(file); });
+      content.push({ type: 'image', source: { type: 'base64', media_type: file.type || 'image/jpeg', data: b64 } });
+    }
+    content.push({ type: 'text', text: (userMsg || 'Analiza este gráfico XAUUSD y dame tu recomendación.') + ctx });
+
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify({ model: 'claude-opus-4-5-20251101', max_tokens: 1500, system: AI_SYSTEM, messages: [{ role: 'user', content }] })
+    });
+
+    const data = await res.json();
+    if (data.error) { statusEl.textContent = 'Error: ' + data.error.message; responseEl.textContent = ''; return; }
+
+    const text = data.content?.[0]?.text || 'Sin respuesta.';
+    statusEl.textContent = 'Análisis completado.';
+    responseEl.innerHTML = text.replace(/\n/g,'<br>').replace(/\*\*(.*?)\*\*/g,'<strong style="color:var(--gold)">$1</strong>');
+
+    const hist = JSON.parse(localStorage.getItem('ai_hist') || '[]');
+    hist.unshift({ time: new Date().toLocaleString(), q: userMsg || 'Análisis imagen', a: text });
+    if (hist.length > 10) hist.pop();
+    localStorage.setItem('ai_hist', JSON.stringify(hist));
+    renderAIHistory();
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    responseEl.textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderAIHistory() {
+  const el = document.getElementById('ai-history');
+  if (!el) return;
+  const hist = JSON.parse(localStorage.getItem('ai_hist') || '[]');
+  if (!hist.length) { el.innerHTML = '<div style="color:var(--dim);font-size:12px">Sin historial.</div>'; return; }
+  el.innerHTML = hist.map((h,i) => `
+    <div style="background:var(--bg2);border:1px solid var(--b1);border-radius:var(--r);padding:10px;margin-bottom:6px;cursor:pointer" onclick="toggleAIHist(${i})">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:11px;color:var(--dim)">${h.time}</span>
+        <span style="font-size:11px;color:var(--dim)">▼</span>
+      </div>
+      <div style="font-size:12px;color:var(--text);margin-top:4px">${h.q}</div>
+      <div id="ai-h-${i}" style="display:none;margin-top:8px;font-size:11px;color:var(--muted);line-height:1.6">${h.a.replace(/\n/g,'<br>')}</div>
+    </div>`).join('');
+}
+
+function toggleAIHist(i) {
+  const el = document.getElementById('ai-h-' + i);
+  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function clearAIHistory() {
+  localStorage.removeItem('ai_hist');
+  renderAIHistory();
 }
 
 // ── AUTO REFRESH ──
