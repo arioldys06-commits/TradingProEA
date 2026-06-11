@@ -337,8 +337,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <div class="maincontent" id="mainContent">
 
       <!-- CHART PAGE (default) -->
-      <div id="page-chart" style="display:flex;flex:1;flex-direction:column;overflow:hidden">
-        <div class="center">
+      <div id="page-chart" style="display:flex;flex:1;flex-direction:row;overflow:hidden">
+        <div class="center" style="flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0">
           <div class="chart-toolbar">
             <span style="font-size:12px;font-weight:500;color:var(--text);font-family:var(--mono)">XAUUSD</span>
             <div class="toolbar-sep"></div>
@@ -394,6 +394,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
             </div>
           </div>
         </div>
+
+        </div><!-- /center -->
 
         <!-- RIGHT PANEL -->
         <div class="rightpanel">
