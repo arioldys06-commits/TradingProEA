@@ -833,9 +833,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 </div><!-- /app -->
 
 <script>
-const SUPA_URL=qilvrvnwdtpbkcfwktqs;
-const SUPA_KEY="sb_publishable_pb10ZXfNyiSkTQIYkGfjKA_Bd6ItcPY";
-const sb=supabase.createClient(SUPA_URL,SUPA_KEY);
+const SUPA_URL = "https://qilvrvnwdtpbkcfwktqs.supabase.co";
+const SUPA_KEY = "sb_publishable_pb10ZXfNyiSkTQIYkGfjKA_Bd6ItcPY";
+const sb = supabase.createClient(SUPA_URL, SUPA_KEY);
+
+console.log("SUPABASE ACTIVA:", SUPA_URL);
+
 let currentTF='5',autoOn=false,autoTimer=null;
 let currentSignals=[],currentAnalysis=null;
 
