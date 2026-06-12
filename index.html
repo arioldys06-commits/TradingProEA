@@ -874,16 +874,18 @@ function initApp(){
 }
 
 // ── TRADINGVIEW ──
-function loadTVChart(tf){
-  tf=tf||currentTF;
-  const frame=document.getElementById('tv_chart');
-  const params=new URLSearchParams({
-    symbol:'OANDA:XAUUSD',interval:tf,
-    timezone:'America/New_York',theme:'dark',style:'1',locale:'es',
-    allow_symbol_change:'false',hide_top_toolbar:'false',
-    hide_legend:'false',save_image:'false',
-    studies:JSON.stringify(['EMA@tv-basicstudies','EMA@tv-basicstudies','EMA@tv-basicstudies']),
-  });
+const params=new URLSearchParams({
+  symbol:'OANDA:XAUUSD',
+  interval:tf,
+  timezone:'America/New_York',
+  theme:'dark',
+  style:'1',
+  locale:'es',
+  allow_symbol_change:'false',
+  hide_top_toolbar:'false',
+  hide_legend:'false',
+  save_image:'false'
+});
   frame.src=`https://www.tradingview.com/widgetembed/?${params.toString()}`;
 }
 
