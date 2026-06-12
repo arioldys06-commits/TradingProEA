@@ -894,10 +894,56 @@ function setTF(tf){
   document.querySelectorAll('.tf-btn').forEach(b=>b.classList.remove('active'));
   const map={'1':'M1','5':'M5','15':'M15','30':'M30','60':'H1','240':'H4','D':'D1'};
   document.querySelectorAll('.tf-btn').forEach(b=>{if(b.textContent===map[tf])b.classList.add('active');});
+  function loadTVChart(tf){
+  tf = tf || currentTF;
+  const frame = document.getElementById('tv_chart');
+
+  const params = new URLSearchParams({
+    symbol: 'OANDA:XAUUSD',
+    interval: tf,
+    timezone: 'America/New_York',
+    theme: 'dark',
+    style: '1',
+    locale: 'es',
+    allow_symbol_change: 'false',
+    hide_top_toolbar: 'false',
+    hide_legend: 'false',
+    save_image: 'false'
+  });
+
+  frame.src = 'https://www.tradingview.com/widgetembed/?' + params.toString();
+}
+
+function setTF(tf){
+  currentTF = tf;
+
+  document.querySelectorAll('.tf-btn').forEach(b => {
+    b.classList.remove('active');
+  });
+
+  const map = {
+    '1': 'M1',
+    '5': 'M5',
+    '15': 'M15',
+    '30': 'M30',
+    '60': 'H1',
+    '240': 'H4',
+    'D': 'D1'
+  };
+
+  document.querySelectorAll('.tf-btn').forEach(b => {
+    if (b.textContent === map[tf]) {
+      b.classList.add('active');
+    }
+  });
+
   loadTVChart(tf);
 }
 
-function toggleLayer(btn){btn.classList.toggle('on');}
+function toggleLayer(btn){
+  btn.classList.toggle('on');
+}
+
 
 // ── PAGE NAV ──
 function switchPage(id){
