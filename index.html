@@ -272,6 +272,25 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 /* ── SECTION ── */
 .sec-title{font-size:10px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.07em;margin:10px 0 4px}
 .rp-section{margin-bottom:12px}
+
+/* ── EMA CONTROL PANEL ── */
+.ema-control-panel {
+  background: var(--bg2);
+  border: 1px solid var(--b1);
+  border-radius: var(--r2);
+  padding: 14px;
+  margin-bottom: 16px;
+}
+.ema-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
 </style>
 </head>
 <body>
@@ -355,8 +374,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
             <span class="layer-btn on" onclick="toggleLayer(this)">OB</span>
             <span class="layer-btn on" onclick="toggleLayer(this)">Señales</span>
             <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
-              <span style="font-size:10px;color:var(--dim)">● EMA9</span>
-              <span style="font-size:10px;color:var(--dim)">● EMA20</span>
+              <span style="font-size:10px;color:var(--yellow);font-weight:600">● EMA3</span>
+              <span style="font-size:10px;color:var(--blue);font-weight:600">● EMA9</span>
+              <span style="font-size:10px;color:var(--gold);font-weight:600">● EMA20</span>
               <span style="font-size:10px;color:var(--dim)">● EMA200</span>
             </div>
           </div>
@@ -391,6 +411,26 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
               <div class="sc-row"><span class="sc-label">Lotaje</span><span class="sc-val" id="sc-lot">-</span></div>
               <div class="sc-row"><span class="sc-label">SL</span><span class="sc-val r" id="sc-sl">-</span></div>
               <div class="sc-row"><span class="sc-label">Trades hoy</span><span class="sc-val" id="sc-trades">0/3</span></div>
+            </div>
+            <!-- ★ NEW: EMA strip panel -->
+            <div class="strip-col">
+              <div class="sc-title">EMAs M5</div>
+              <div class="sc-row">
+                <span class="sc-label" style="color:var(--yellow)">EMA 3</span>
+                <span class="sc-val" id="strip-ema3" style="font-size:11px">-</span>
+              </div>
+              <div class="sc-row">
+                <span class="sc-label" style="color:var(--blue)">EMA 9</span>
+                <span class="sc-val" id="strip-ema9" style="font-size:11px">-</span>
+              </div>
+              <div class="sc-row">
+                <span class="sc-label" style="color:var(--gold)">EMA 20</span>
+                <span class="sc-val" id="strip-ema20" style="font-size:11px">-</span>
+              </div>
+              <div class="sc-row">
+                <span class="sc-label">Cruce</span>
+                <span class="sc-val" id="strip-ema-cross">-</span>
+              </div>
             </div>
           </div>
         </div>
@@ -513,6 +553,46 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <button onclick="loadScalpingM5()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Analizar</button>
   </div>
   <div id="scalp-status" style="margin-bottom:12px"></div>
+
+  <!-- ★ NEW: EMA Control Panel -->
+  <div class="ema-control-panel">
+    <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Control EMA 3 / 9 / 20 — M5</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">
+      <div style="background:var(--bg3);border-radius:var(--r);padding:10px;border-left:3px solid var(--yellow)">
+        <div style="font-size:10px;color:var(--yellow);font-weight:700;margin-bottom:4px">EMA 3</div>
+        <div style="font-size:16px;font-weight:600;font-family:var(--mono)" id="s5-ema3">-</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:2px">Momentum</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:var(--r);padding:10px;border-left:3px solid var(--blue)">
+        <div style="font-size:10px;color:var(--blue);font-weight:700;margin-bottom:4px">EMA 9</div>
+        <div style="font-size:16px;font-weight:600;font-family:var(--mono)" id="s5-ema9">-</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:2px">Tendencia corta</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:var(--r);padding:10px;border-left:3px solid var(--gold)">
+        <div style="font-size:10px;color:var(--gold);font-weight:700;margin-bottom:4px">EMA 20</div>
+        <div style="font-size:16px;font-weight:600;font-family:var(--mono)" id="s5-ema20">-</div>
+        <div style="font-size:10px;color:var(--dim);margin-top:2px">Filtro sesgo</div>
+      </div>
+    </div>
+    <div id="s5-ema-status" style="font-size:12px;padding:8px 12px;border-radius:var(--r);background:var(--bg3);color:var(--dim);text-align:center">
+      Presiona Analizar para ver el estado de las EMAs
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px">
+      <div style="background:var(--bg3);border-radius:var(--r);padding:6px;text-align:center">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:2px">EMA3 &gt; EMA9</div>
+        <div style="font-size:11px;font-weight:600" id="s5-cross-39">-</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:var(--r);padding:6px;text-align:center">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:2px">EMA9 &gt; EMA20</div>
+        <div style="font-size:11px;font-weight:600" id="s5-cross-920">-</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:var(--r);padding:6px;text-align:center">
+        <div style="font-size:9px;color:var(--dim);margin-bottom:2px">Alineación</div>
+        <div style="font-size:11px;font-weight:600" id="s5-ema-align">-</div>
+      </div>
+    </div>
+  </div>
+
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px">
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Señal</div><div style="font-size:20px;font-weight:600;font-family:var(--mono)" id="s5-type">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Entrada</div><div style="font-size:20px;font-weight:600;font-family:var(--mono);color:var(--gold)" id="s5-entry">-</div></div>
@@ -529,8 +609,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">H1</div><div style="font-size:13px;font-weight:600" id="s5-h1">-</div></div>
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">H2</div><div style="font-size:13px;font-weight:600" id="s5-h2">-</div></div>
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">RSI M5</div><div style="font-size:13px;font-weight:600" id="s5-rsi">-</div></div>
-        <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">EMA9</div><div style="font-size:13px;font-weight:600;font-family:var(--mono)" id="s5-ema9">-</div></div>
-        <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">ATR</div><div style="font-size:13px;font-weight:600;font-family:var(--mono)" id="s5-atr">-</div></div>
+        <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">ATR M5</div><div style="font-size:13px;font-weight:600;font-family:var(--mono)" id="s5-atr">-</div></div>
+        <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">Killzone</div><div style="font-size:13px;font-weight:600" id="s5-kz">-</div></div>
       </div>
     </div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px">
@@ -540,8 +620,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">BOS/CHoCH</div><div style="font-size:13px;font-weight:600" id="s5-bos">-</div></div>
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">FVG</div><div style="font-size:13px;font-weight:600" id="s5-fvg">-</div></div>
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">OB</div><div style="font-size:13px;font-weight:600" id="s5-ob">-</div></div>
-        <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">Killzone</div><div style="font-size:13px;font-weight:600" id="s5-kz">-</div></div>
         <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">Sesgo D1</div><div style="font-size:13px;font-weight:600" id="s5-bias">-</div></div>
+        <div style="background:var(--bg2);border-radius:var(--r);padding:8px"><div style="font-size:10px;color:var(--dim);margin-bottom:2px">EMA Align</div><div style="font-size:13px;font-weight:600" id="s5-ema-smc">-</div></div>
       </div>
     </div>
   </div>
@@ -808,8 +888,6 @@ const SUPA_URL = "https://qilvrvnwdtpbkcfwktqs.supabase.co";
 const SUPA_KEY = "sb_publishable_pb10ZXfNyiSkTQIYkGfjKA_Bd6ItcPY";
 const sb = supabase.createClient(SUPA_URL, SUPA_KEY);
 
-console.log("SUPABASE ACTIVA:", SUPA_URL);
-
 let currentTF = '5', autoOn = false, autoTimer = null;
 let currentSignals = [], currentAnalysis = null;
 
@@ -845,7 +923,7 @@ function initApp() {
   if (botOn) scanBot(false);
 }
 
-// ── TRADINGVIEW ── (FIXED: was duplicated and nested causing SyntaxError)
+// ── TRADINGVIEW ──
 function loadTVChart(tf) {
   tf = tf || currentTF;
   const frame = document.getElementById('tv_chart');
@@ -874,9 +952,7 @@ function setTF(tf) {
   loadTVChart(tf);
 }
 
-function toggleLayer(btn) {
-  btn.classList.toggle('on');
-}
+function toggleLayer(btn) { btn.classList.toggle('on'); }
 
 // ── PAGE NAV ──
 function switchPage(id) {
@@ -895,7 +971,6 @@ function switchPage(id) {
   if (id === 'signals') renderSignalsPage();
 }
 
-// ── RIGHT PANEL TABS ──
 function rpTab(id, btn) {
   document.querySelectorAll('.rp-tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
@@ -910,8 +985,7 @@ function startClock() {
     const rdH = ((now.getUTCHours() - 4) + 24) % 24;
     const rdM = String(now.getUTCMinutes()).padStart(2, '0');
     const rdS = String(now.getUTCSeconds()).padStart(2, '0');
-    document.getElementById('topTime').textContent =
-      String(rdH).padStart(2, '0') + ':' + rdM + ':' + rdS + ' RD';
+    document.getElementById('topTime').textContent = String(rdH).padStart(2, '0') + ':' + rdM + ':' + rdS + ' RD';
     updateSession(rdH, now.getUTCMinutes());
   }
   tick(); setInterval(tick, 1000);
@@ -931,7 +1005,6 @@ function updateSession(h, m) {
   document.getElementById('sc-session').className = 'sc-val ' + (cls === 'active' ? 'g' : '');
 }
 
-// ── DATA ──
 const n = (v) => v == null || isNaN(+v) ? '-' : (+v).toFixed(2);
 
 async function refreshAll() {
@@ -984,9 +1057,7 @@ async function refreshAll() {
   renderSignalsPage();
 
   const best = currentSignals[0];
-  if (best) {
-    document.getElementById('topScore').textContent = 'Score: ' + best.confidence + '/100';
-  }
+  if (best) document.getElementById('topScore').textContent = 'Score: ' + best.confidence + '/100';
 }
 
 function calcATR(candles, period = 14) {
@@ -1007,7 +1078,27 @@ function ema(closes, period) {
   return e;
 }
 
+// ── LOAD CONFLUENCE — with EMA 3/9/20 strip update ──
 function loadConfluence(m5, h1) {
+  // ★ Update bottom strip EMA panel
+  if (m5.length >= 20) {
+    const closes5 = m5.slice().reverse().map(c => +c.close);
+    const e3 = ema(closes5, 3), e9v = ema(closes5, 9), e20v = ema(closes5, 20);
+    const s3 = document.getElementById('strip-ema3');
+    const s9 = document.getElementById('strip-ema9');
+    const s20 = document.getElementById('strip-ema20');
+    const sCross = document.getElementById('strip-ema-cross');
+    if (s3 && e3) { s3.textContent = e3.toFixed(2); s3.style.color = (e9v && e3 > e9v) ? 'var(--green)' : 'var(--red)'; }
+    if (s9 && e9v) { s9.textContent = e9v.toFixed(2); s9.style.color = (e20v && e9v > e20v) ? 'var(--green)' : 'var(--red)'; }
+    if (s20 && e20v) { s20.textContent = e20v.toFixed(2); s20.style.color = 'var(--muted)'; }
+    if (sCross && e3 && e9v && e20v) {
+      if (e3 > e9v && e9v > e20v) sCross.innerHTML = '<span style="color:var(--green);font-weight:700">▲ BULL</span>';
+      else if (e3 < e9v && e9v < e20v) sCross.innerHTML = '<span style="color:var(--red);font-weight:700">▼ BEAR</span>';
+      else if (e3 > e9v) sCross.innerHTML = '<span style="color:var(--yellow);font-weight:700">↗ MOM↑</span>';
+      else sCross.innerHTML = '<span style="color:var(--yellow);font-weight:700">↘ MOM↓</span>';
+    }
+  }
+
   const getDir = (candles) => {
     if (candles.length < 10) return null;
     const closes = candles.map(c => +c.close).reverse();
@@ -1042,13 +1133,11 @@ function loadConfluence(m5, h1) {
   if (dirM5 === 'SELL' || dirH1 === 'SELL') {
     const latest = parseFloat(document.getElementById('sc-price').textContent) || 0;
     const atrv = parseFloat(document.getElementById('cAtr').value) || 5.5;
-    const sl = (latest + atrv * 1.2).toFixed(2);
-    document.getElementById('sc-sl').textContent = sl;
+    document.getElementById('sc-sl').textContent = (latest + atrv * 1.2).toFixed(2);
   } else if (dirM5 === 'BUY' || dirH1 === 'BUY') {
     const latest = parseFloat(document.getElementById('sc-price').textContent) || 0;
     const atrv = parseFloat(document.getElementById('cAtr').value) || 5.5;
-    const sl = (latest - atrv * 1.2).toFixed(2);
-    document.getElementById('sc-sl').textContent = sl;
+    document.getElementById('sc-sl').textContent = (latest - atrv * 1.2).toFixed(2);
   }
   document.getElementById('sc-lot').textContent = lot;
 }
@@ -1162,7 +1251,7 @@ function calcRisk() {
 }
 
 // ════════════════════════════════════════
-// SCALPING M5
+// SCALPING M5 — con EMA 3/9/20
 // ════════════════════════════════════════
 function emaVal(closes, period) {
   if (!closes || closes.length < period) return null;
@@ -1263,7 +1352,8 @@ async function loadScalpingM5() {
   }
 
   const closes5 = c5.map(c => c.C);
-  const e9 = emaVal(closes5, 9), e20 = emaVal(closes5, 20), e50 = emaVal(closes5, 50);
+  // ★ EMA 3, 9, 20 calculadas
+  const e3 = emaVal(closes5, 3), e9 = emaVal(closes5, 9), e20 = emaVal(closes5, 20), e50 = emaVal(closes5, 50);
   const rsi = rsiVal(closes5, 14);
   const atr = calcATR(c5.slice(-20));
   const last = c5[c5.length - 1];
@@ -1294,43 +1384,50 @@ async function loadScalpingM5() {
   const choch = rH > pH && rL < pL ? 'BUY' : rH < pH && rL > pL ? 'SELL' : null;
   const bosLabel = choch ? 'CHoCH ' + choch : bos ? 'BOS ' + bos : null;
 
+  // ★ EMA alignment logic
+  const allBull = e3 && e9 && e20 && e3 > e9 && e9 > e20;
+  const allBear = e3 && e9 && e20 && e3 < e9 && e9 < e20;
+  const cross39up = e3 && e9 && e3 > e9 && !(e9 > e20);
+  const cross39dn = e3 && e9 && e3 < e9 && !(e9 < e20);
+
   let score = 0, reasons = [], sigType = null;
   if (sweepLow && emaDir === 'BUY' && rsi < 70) {
-    sigType = 'BUY'; score += 40; reasons.push('Sweep Low M5');
+    sigType = 'BUY'; score += 35; reasons.push('Sweep Low M5');
     if (dirM30 === 'BUY') { score += 15; reasons.push('M30 BUY'); }
     if (dirH1 === 'BUY') { score += 15; reasons.push('H1 BUY'); }
     if (dirH2 === 'BUY') { score += 10; reasons.push('H2 BUY'); }
     if (obs.some(o => o.type === 'BUY')) { score += 10; reasons.push('OB alcista'); }
     if (fvgs.some(f => f.type === 'BUY')) { score += 5; reasons.push('FVG alcista'); }
     if (isInKillzone()) { score += 5; reasons.push('Killzone activa'); }
+    // ★ EMA3 momentum bonus
+    if (allBull) { score += 10; reasons.push('EMA3>9>20 ▲ Alineación total'); }
+    else if (e3 && e9 && e3 > e9) { score += 5; reasons.push('EMA3>EMA9 momentum alcista'); }
   } else if (sweepHigh && emaDir === 'SELL' && rsi > 30) {
-    sigType = 'SELL'; score += 40; reasons.push('Sweep High M5');
+    sigType = 'SELL'; score += 35; reasons.push('Sweep High M5');
     if (dirM30 === 'SELL') { score += 15; reasons.push('M30 SELL'); }
     if (dirH1 === 'SELL') { score += 15; reasons.push('H1 SELL'); }
     if (dirH2 === 'SELL') { score += 10; reasons.push('H2 SELL'); }
     if (obs.some(o => o.type === 'SELL')) { score += 10; reasons.push('OB bajista'); }
     if (fvgs.some(f => f.type === 'SELL')) { score += 5; reasons.push('FVG bajista'); }
     if (isInKillzone()) { score += 5; reasons.push('Killzone activa'); }
+    // ★ EMA3 momentum bonus
+    if (allBear) { score += 10; reasons.push('EMA3<9<20 ▼ Alineación total'); }
+    else if (e3 && e9 && e3 < e9) { score += 5; reasons.push('EMA3<EMA9 momentum bajista'); }
   }
   score = Math.min(score, 100);
 
+  // ── Update UI ──
   const typeEl = document.getElementById('s5-type');
   if (sigType) {
     typeEl.innerHTML = colorDir(sigType);
-    const entry = n(last.C);
     const slPts = atr * 1.2;
-    const sl = sigType === 'BUY' ? n(last.C - slPts) : n(last.C + slPts);
-    const tp1 = sigType === 'BUY' ? n(last.C + slPts * 1.5) : n(last.C - slPts * 1.5);
-    const tp2 = sigType === 'BUY' ? n(last.C + slPts * 3) : n(last.C - slPts * 3);
-    document.getElementById('s5-entry').textContent = entry;
-    document.getElementById('s5-sl').textContent = sl;
-    document.getElementById('s5-tp1').textContent = tp1;
-    document.getElementById('s5-tp2').textContent = tp2;
+    document.getElementById('s5-entry').textContent = n(last.C);
+    document.getElementById('s5-sl').textContent = sigType === 'BUY' ? n(last.C - slPts) : n(last.C + slPts);
+    document.getElementById('s5-tp1').textContent = sigType === 'BUY' ? n(last.C + slPts * 1.5) : n(last.C - slPts * 1.5);
+    document.getElementById('s5-tp2').textContent = sigType === 'BUY' ? n(last.C + slPts * 3) : n(last.C - slPts * 3);
     document.getElementById('s5-score').textContent = score + '/100';
   } else {
-    ['s5-type', 's5-entry', 's5-sl', 's5-tp1', 's5-tp2'].forEach(id => {
-      document.getElementById(id).textContent = '-';
-    });
+    ['s5-type','s5-entry','s5-sl','s5-tp1','s5-tp2'].forEach(id => document.getElementById(id).textContent = '-');
     document.getElementById('s5-score').textContent = '0/100';
   }
 
@@ -1338,7 +1435,6 @@ async function loadScalpingM5() {
   document.getElementById('s5-h1').innerHTML = colorDir(dirH1);
   document.getElementById('s5-h2').innerHTML = colorDir(dirH2);
   document.getElementById('s5-rsi').textContent = rsi;
-  document.getElementById('s5-ema9').textContent = e9 ? n(e9) : '-';
   document.getElementById('s5-atr').textContent = n(atr);
   document.getElementById('s5-sweep').innerHTML = sweepLow ? colorDir('BUY') : sweepHigh ? colorDir('SELL') : '<span style="color:var(--dim)">No</span>';
   document.getElementById('s5-bos').innerHTML = bosLabel ? colorDir(bosLabel.split(' ')[1]) : '<span style="color:var(--dim)">No</span>';
@@ -1348,6 +1444,62 @@ async function loadScalpingM5() {
 
   const bias = currentAnalysis?.trend || '-';
   document.getElementById('s5-bias').innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : '<span style="color:var(--yellow)">LATERAL</span>';
+
+  // ★ EMA SMC cell
+  const emaSmc = document.getElementById('s5-ema-smc');
+  if (emaSmc) {
+    if (allBull) emaSmc.innerHTML = '<span style="color:var(--green);font-weight:700">▲ BULL</span>';
+    else if (allBear) emaSmc.innerHTML = '<span style="color:var(--red);font-weight:700">▼ BEAR</span>';
+    else emaSmc.innerHTML = '<span style="color:var(--yellow)">MIXTO</span>';
+  }
+
+  // ★ EMA Control Panel update
+  const e3El = document.getElementById('s5-ema3');
+  const e9El = document.getElementById('s5-ema9');
+  const e20El = document.getElementById('s5-ema20');
+  const emaStatusEl = document.getElementById('s5-ema-status');
+  const cross39El = document.getElementById('s5-cross-39');
+  const cross920El = document.getElementById('s5-cross-920');
+  const alignEl = document.getElementById('s5-ema-align');
+
+  if (e3El && e3) { e3El.textContent = n(e3); e3El.style.color = (e9 && e3 > e9) ? 'var(--green)' : 'var(--red)'; }
+  if (e9El && e9) { e9El.textContent = n(e9); e9El.style.color = (e20 && e9 > e20) ? 'var(--green)' : 'var(--red)'; }
+  if (e20El && e20) { e20El.textContent = n(e20); e20El.style.color = 'var(--muted)'; }
+
+  if (cross39El && e3 && e9) {
+    cross39El.innerHTML = e3 > e9
+      ? '<span style="color:var(--green)">✓ Sí</span>'
+      : '<span style="color:var(--red)">✗ No</span>';
+  }
+  if (cross920El && e9 && e20) {
+    cross920El.innerHTML = e9 > e20
+      ? '<span style="color:var(--green)">✓ Sí</span>'
+      : '<span style="color:var(--red)">✗ No</span>';
+  }
+  if (alignEl) {
+    if (allBull) alignEl.innerHTML = '<span style="color:var(--green);font-weight:700">▲ TOTAL</span>';
+    else if (allBear) alignEl.innerHTML = '<span style="color:var(--red);font-weight:700">▼ TOTAL</span>';
+    else alignEl.innerHTML = '<span style="color:var(--yellow)">PARCIAL</span>';
+  }
+
+  if (emaStatusEl && e3 && e9 && e20) {
+    if (allBull) {
+      emaStatusEl.innerHTML = '<span style="color:var(--green);font-weight:700">▲ ALCISTA TOTAL — EMA3 &gt; EMA9 &gt; EMA20 — Momentum confirma BUY</span>';
+      emaStatusEl.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:var(--r);background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);text-align:center';
+    } else if (allBear) {
+      emaStatusEl.innerHTML = '<span style="color:var(--red);font-weight:700">▼ BAJISTA TOTAL — EMA3 &lt; EMA9 &lt; EMA20 — Momentum confirma SELL</span>';
+      emaStatusEl.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:var(--r);background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);text-align:center';
+    } else if (e3 > e9) {
+      emaStatusEl.innerHTML = '<span style="color:var(--yellow);font-weight:600">↗ CRUCE ALCISTA — EMA3 &gt; EMA9 pero EMA9 aún bajo EMA20 — Momentum temprano BUY</span>';
+      emaStatusEl.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:var(--r);background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);text-align:center';
+    } else if (e3 < e9) {
+      emaStatusEl.innerHTML = '<span style="color:var(--yellow);font-weight:600">↘ CRUCE BAJISTA — EMA3 &lt; EMA9 pero EMA9 aún sobre EMA20 — Momentum temprano SELL</span>';
+      emaStatusEl.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:var(--r);background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);text-align:center';
+    } else {
+      emaStatusEl.innerHTML = '<span style="color:var(--dim)">~ NEUTRAL — Sin alineación clara en EMAs</span>';
+      emaStatusEl.style.cssText = 'font-size:12px;padding:8px 12px;border-radius:var(--r);background:var(--bg3);text-align:center';
+    }
+  }
 
   document.getElementById('s5-reasons').innerHTML = reasons.length
     ? reasons.map(r => `<div style="padding:2px 0;border-bottom:1px solid var(--bg2)">• ${r}</div>`).join('')
@@ -1536,7 +1688,7 @@ async function loadDesk() {
   if (currentAnalysis) {
     const bias = currentAnalysis.trend;
     const biasEl = document.getElementById('dk-bias');
-    if (biasEl) { biasEl.innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : bias; }
+    if (biasEl) biasEl.innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : bias;
     const dxyEl = document.getElementById('dk-dxy');
     if (dxyEl) { dxyEl.textContent = bias === 'BAJISTA' ? 'FUERTE' : 'DÉBIL'; dxyEl.style.color = bias === 'BAJISTA' ? 'var(--red)' : 'var(--green)'; }
     const high = +currentAnalysis.weekly_high, low = +currentAnalysis.weekly_low;
@@ -1654,17 +1806,8 @@ async function scanBot(manual = false) {
   const ch1 = toC(h1r), cm30 = toC(m30r);
   if (!ch1.length) { if (readEl) readEl.textContent = 'Sin velas H1.'; return; }
 
-  const dirH1 = (() => {
-    const cl = ch1.map(c => c.C);
-    const e9 = emaVal(cl, 9), e20 = emaVal(cl, 20);
-    return e9 && e20 ? (e9 > e20 ? 'BUY' : 'SELL') : null;
-  })();
-  const dirM30 = (() => {
-    if (!cm30.length) return null;
-    const cl = cm30.map(c => c.C);
-    const e9 = emaVal(cl, 9), e20 = emaVal(cl, 20);
-    return e9 && e20 ? (e9 > e20 ? 'BUY' : 'SELL') : null;
-  })();
+  const dirH1 = (() => { const cl = ch1.map(c => c.C); const e9 = emaVal(cl, 9), e20 = emaVal(cl, 20); return e9 && e20 ? (e9 > e20 ? 'BUY' : 'SELL') : null; })();
+  const dirM30 = (() => { if (!cm30.length) return null; const cl = cm30.map(c => c.C); const e9 = emaVal(cl, 9), e20 = emaVal(cl, 20); return e9 && e20 ? (e9 > e20 ? 'BUY' : 'SELL') : null; })();
 
   botContext = { h1: dirH1 || '-', m30: dirM30 || '-', score: 0 };
 
@@ -1707,7 +1850,7 @@ async function scanBot(manual = false) {
   renderBot();
 
   if (!sigType || score < BOT_MIN_SCORE) {
-    if (readEl) readEl.textContent = `Sin setup válido. Score: ${score}/100. Esperando condiciones. H1: ${dirH1 || '-'} | M30: ${dirM30 || '-'}`;
+    if (readEl) readEl.textContent = `Sin setup válido. Score: ${score}/100. H1: ${dirH1 || '-'} | M30: ${dirM30 || '-'}`;
     if (manual) alert(`Sin entrada. Score: ${score}/100`);
     return;
   }
@@ -1716,13 +1859,11 @@ async function scanBot(manual = false) {
   const slPts = Math.max(atr * 1.2, 8);
   const entryObj = {
     time: new Date().toISOString(),
-    type: sigType,
-    entry,
+    type: sigType, entry,
     sl: sigType === 'BUY' ? entry - slPts : entry + slPts,
     tp1: sigType === 'BUY' ? entry + slPts * 1.5 : entry - slPts * 1.5,
     tp2: sigType === 'BUY' ? entry + slPts * 3 : entry - slPts * 3,
-    score,
-    reason: reasons.join(' + ')
+    score, reason: reasons.join(' + ')
   };
 
   botEntries.unshift(entryObj);
@@ -1732,7 +1873,6 @@ async function scanBot(manual = false) {
 
   if (readEl) readEl.textContent = `Entrada ${sigType} detectada. Score: ${score}/100. ${reasons.join(' · ')}`;
   if (manual) alert(`Entrada ${sigType} | Score: ${score}/100\n${reasons.join(', ')}`);
-
   showBotToast(entryObj);
 }
 
@@ -1884,12 +2024,10 @@ function loadNews() {
   const alertEl = document.getElementById('news-alert');
 
   if (riskEl) { riskEl.textContent = 'ALTO'; riskEl.style.color = 'var(--red)'; }
-
   if (currentAnalysis) {
     const bias = currentAnalysis.trend;
     if (usdEl) { usdEl.textContent = bias === 'BAJISTA' ? 'FUERTE' : 'DÉBIL'; usdEl.style.color = bias === 'BAJISTA' ? 'var(--red)' : 'var(--green)'; }
   }
-
   if (nextEl) nextEl.textContent = 'Ver Forex Factory';
   if (actionEl) { actionEl.textContent = inKZ ? 'Killzone activa' : 'Zona muerta'; actionEl.style.color = inKZ ? 'var(--green)' : 'var(--dim)'; }
 
@@ -1919,13 +2057,11 @@ function loadNews() {
 // ════════════════════════════════════════
 async function loadBacktests() {
   const { data, error } = await sb.from('backtests').select('*').order('created_at', { ascending: false }).limit(30);
-
   if (error || !data || !data.length) {
     const tbody = document.getElementById('bt-table');
     if (tbody) tbody.innerHTML = '<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--dim)">No hay backtests guardados todavía.</td></tr>';
     return;
   }
-
   const latest = data[0];
   document.getElementById('bt-total').textContent = latest.total_trades || '-';
   document.getElementById('bt-wins').textContent = latest.winning_trades || '-';
@@ -1936,7 +2072,6 @@ async function loadBacktests() {
   if (pf) { pf.textContent = latest.profit_factor || '-'; pf.style.color = latest.profit_factor >= 1.5 ? 'var(--green)' : latest.profit_factor >= 1 ? 'var(--yellow)' : 'var(--red)'; }
   document.getElementById('bt-dd').textContent = latest.drawdown || '-';
   document.getElementById('bt-hour').textContent = latest.best_hour || '-';
-
   const tbody = document.getElementById('bt-table');
   if (tbody) tbody.innerHTML = data.map(b => `<tr style="border-bottom:1px solid var(--bg2)">
     <td style="padding:6px 8px;color:var(--dim)">${new Date(b.created_at).toLocaleDateString('es')}</td>
@@ -1990,7 +2125,6 @@ function calcFullRisk() {
     </div>
     ${parseFloat(rr1) < 1.5 ? '<div style="margin-top:8px;padding:8px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:var(--r);font-size:11px;color:var(--red)">⚠ RR menor a 1:1.5. No recomendado entrar.</div>' : ''}
   `;
-
   loadRiskPerf();
 }
 
