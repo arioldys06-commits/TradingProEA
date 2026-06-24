@@ -47,6 +47,17 @@ import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
+# TradingPro AI Elite
+# Import protegido para que el motor principal no se caiga si el módulo AI tiene error.
+try:
+    from strategy.tradingpro_ai import analyze_tradingpro_ai
+    AI_ENGINE_AVAILABLE = True
+    AI_ENGINE_IMPORT_ERROR = None
+except Exception as e:
+    analyze_tradingpro_ai = None
+    AI_ENGINE_AVAILABLE = False
+    AI_ENGINE_IMPORT_ERROR = e
+
 load_dotenv()
 
 SUPABASE_URL     = os.getenv("SUPABASE_URL")
@@ -905,6 +916,44 @@ def analyze():
 
     signals_found = 0
 
+    # ── TradingPro AI Elite
+    try:
+        if not AI_ENGINE_AVAILABLE or analyze_tradingpro_ai is None:
+            print(f"  [AI] TradingPro AI Elite desactivado: {AI_ENGINE_IMPORT_ERROR}")
+        else:
+            c5_ai = [{
+                "time": c["time"],
+                "open": c["O"],
+                "high": c["H"],
+                "low": c["L"],
+                "close": c["C"],
+                "volume": c["V"],
+            } for c in c5]
+
+            c15_rows = get_candles("M15", 250)
+            c15 = to_candles(c15_rows)
+
+            c15_ai = [{
+                "time": c["time"],
+                "open": c["O"],
+                "high": c["H"],
+                "low": c["L"],
+                "close": c["C"],
+                "volume": c["V"],
+            } for c in c15]
+
+            sig = analyze_tradingpro_ai(c15_ai, c5_ai)
+
+            if sig:
+                if publish_signal(sig):
+                    signals_found += 1
+                else:
+                    print("  [AI] TradingPro AI Elite: señal detectada pero no publicada")
+            else:
+                print("  [AI] TradingPro AI Elite: sin setup")
+    except Exception as e:
+        print(f"  [AI] Error TradingPro AI Elite: {e}")
+
     # ── Estrategia 1: Scalping M5 SMC
     try:
         sig = strategy_scalping_m5(c5, c30, ch1)
@@ -970,6 +1019,7 @@ def main():
     print(f"  Score mínimo: {MIN_SCORE} | Max diario: {MAX_DAILY}")
     print(f"  Cooldown por estrategia: {SIGNAL_COOLDOWN}s")
     print(f"  Estrategias activas:")
+    print(f"    AI. TradingPro AI Elite (Confluence Engine)")
     print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib)")
     print(f"    2. Killzone Breakout (London/NY)")
     print(f"    3. FVG Fill M5")
