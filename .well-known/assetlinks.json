@@ -1,0 +1,9 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.arioldys.tradingproea",
+    "sha256_cert_fingerprints":
+    ["73:F5:DC:DD:E7:27:E0:94:D1:A4:E8:91:D9:2F:25:68:D5:BC:61:05:06:92:90:94:85:1E:C1:2A:47:59:F3:0A"]
+  }
+}]
