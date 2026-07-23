@@ -697,6 +697,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       <button onclick="clearBotEntries()" style="background:none;color:var(--muted);border:1px solid var(--b1);border-radius:var(--r);padding:6px 12px;font-size:12px;cursor:pointer">🗑 Limpiar</button>
     </div>
   </div>
+  <div style="background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);border-radius:var(--r);padding:10px 12px;font-size:12px;color:#fbbf24;margin-bottom:16px">
+    ⚠ Este panel es una simulación visual (solo guarda datos en tu navegador). No ejecuta órdenes reales en MT5 — eso solo lo hace <code>bot_engine.py</code> corriendo en tu PC.
+  </div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px">
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Estado</div><div style="font-size:16px;font-weight:600" id="bot-status">OFF</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Score mínimo</div><div style="font-size:16px;font-weight:600;font-family:var(--mono);color:var(--gold)">75/100</div></div>
@@ -1007,6 +1010,18 @@ function updateSession(h, m) {
 
 const n = (v) => v == null || isNaN(+v) ? '-' : (+v).toFixed(2);
 
+// ★ FIX: una señal solo se considera "vigente" para el score de arriba si
+// esta PENDING y fue creada hace poco. Antes, cualquier señal vieja o
+// expirada (incluso de hace un mes) podia pisar el score de arriba con
+// un numero que no tenia nada que ver con el mercado actual.
+const TOP_SCORE_MAX_AGE_MIN = 15;
+
+function isSignalFreshForTopScore(sig) {
+  if (!sig || sig.status !== 'PENDING' || !sig.created_at) return false;
+  const ageMin = (Date.now() - new Date(sig.created_at).getTime()) / 60000;
+  return ageMin <= TOP_SCORE_MAX_AGE_MIN;
+}
+
 async function refreshAll() {
   const [a, s, candles] = await Promise.all([
     sb.from('analysis_results').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle(),
@@ -1056,8 +1071,14 @@ async function refreshAll() {
   renderSignals();
   renderSignalsPage();
 
+  // ★ FIX: solo pisar el score "en vivo" (calculado por loadConfluence)
+  // con el de una señal real de Supabase si esa señal esta PENDING y
+  // fue publicada hace poco. Si no, dejamos el score en vivo tal cual.
   const best = currentSignals[0];
-  if (best) document.getElementById('topScore').textContent = 'Score: ' + best.confidence + '/100';
+  if (isSignalFreshForTopScore(best)) {
+    document.getElementById('topScore').textContent =
+      'Score: ' + best.confidence + '/100 · ' + (best.strategy || '');
+  }
 }
 
 function calcATR(candles, period = 14) {
@@ -1127,7 +1148,9 @@ function loadConfluence(m5, h1) {
   const atr = parseFloat(document.getElementById('sc-atr').textContent) || 0;
   if (atr > 2 && atr < 15) score += 10;
   document.getElementById('sc-score').textContent = score + '/100';
-  document.getElementById('topScore').textContent = 'Score: ' + score + '/100';
+  // ★ FIX: este es el score "en vivo" del confluence — refreshAll() solo
+  // lo pisara despues si hay una señal real PENDING y fresca en Supabase.
+  document.getElementById('topScore').textContent = 'Score: ' + score + '/100 (en vivo)';
 
   const lot = parseFloat(document.getElementById('crLot').textContent) || 0.01;
   if (dirM5 === 'SELL' || dirH1 === 'SELL') {
@@ -1709,7 +1732,7 @@ async function loadDesk() {
 }
 
 // ════════════════════════════════════════
-// BOT AUTÓNOMO
+// BOT AUTÓNOMO (SIMULACIÓN — no ejecuta nada real en MT5)
 // ════════════════════════════════════════
 let botOn = localStorage.getItem('botOn') === 'true';
 let botTimer = null;
