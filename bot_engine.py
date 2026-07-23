@@ -7,7 +7,7 @@ TradingProEA - Execution Engine
 
 Reglas:
 - Score minimo: 75
-- Lotaje fijo: 0.02
+- Lotaje dinamico: se calcula segun balance real y % de riesgo (position_sizing.py)
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
 - Maximo 3 operaciones por dia
@@ -31,6 +31,7 @@ except ImportError:
     print("ERROR: Instala MetaTrader5: pip install MetaTrader5")
     sys.exit(1)
 
+from position_sizing import calculate_lot_size
 
 load_dotenv()
 
@@ -41,7 +42,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 MT5_SYMBOL = os.getenv("MT5_SYMBOL", "GOLD")
 
 # ─── PARAMETROS DEL BOT ───────────────────────────────────────
-LOT_SIZE = 0.02
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # % del balance arriesgado por operacion
+LOT_SIZE_FALLBACK = 0.02  # solo se usa si el calculo dinamico falla (ver execute_order)
 MIN_SCORE = 75
 MAX_DAILY = 3
 SL_EXTRA_PTS = 20
@@ -272,10 +274,36 @@ def execute_order(signal):
     order_type = mt5.ORDER_TYPE_BUY if signal_type == "BUY" else mt5.ORDER_TYPE_SELL
     price = ask if signal_type == "BUY" else bid
 
+    # ── Lotaje dinamico segun balance real y % de riesgo ──
+    # Usa el SL YA ajustado (anti-hunt) para que el riesgo calculado
+    # sea el riesgo real de la operacion, no el de la señal original.
+    account = mt5.account_info()
+    lote, detalle = calculate_lot_size(
+        mt5=mt5,
+        symbol=MT5_SYMBOL,
+        entry_price=price,
+        stop_loss=sl,
+        balance=account.balance if account else 0,
+        risk_percent=RISK_PERCENT,
+    )
+
+    if lote is None:
+        print(f"  [RIESGO] No se pudo calcular lote dinamico: {detalle}")
+        print(f"  [RIESGO] Usando lote de respaldo: {LOT_SIZE_FALLBACK}")
+        lote = LOT_SIZE_FALLBACK
+    else:
+        print(
+            f"  [RIESGO] Balance: ${detalle['balance']} | "
+            f"Riesgo: {detalle['risk_percent']}% (${detalle['riesgo_dinero']}) | "
+            f"SL: {detalle['distancia_stop_pts']} pts | Lote: {lote}"
+        )
+        if "aviso" in detalle:
+            print(f"  [RIESGO] AVISO: {detalle['aviso']}")
+
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": MT5_SYMBOL,
-        "volume": LOT_SIZE,
+        "volume": lote,
         "type": order_type,
         "price": price,
         "sl": sl,
@@ -329,7 +357,7 @@ def main():
     print(f"  BOT ENGINE - TradingProEA - {now_str}")
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Simbolo MT5: {MT5_SYMBOL}")
-    print(f"  Lote: {LOT_SIZE} | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
+    print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
     print(f"{'=' * 55}")
 
@@ -397,7 +425,7 @@ def main():
         print(f"  Precio: {price}")
         print(f"  SL:     {sl} (anti-hunt +{SL_EXTRA_PTS} pts)")
         print(f"  TP1:    {tp1}")
-        print(f"  Lote:   {LOT_SIZE}")
+        print(f"  Lote:   {result.volume}")
         print(f"  Hoy:    {count}/{MAX_DAILY}")
 
         send_telegram(
@@ -406,7 +434,7 @@ def main():
             f"Precio entrada: {price}\n"
             f"Stop Loss: {sl} (anti-hunt)\n"
             f"Take Profit: {tp1}\n"
-            f"Lote: {LOT_SIZE}\n"
+            f"Lote: {result.volume} (riesgo: {RISK_PERCENT}% del balance)\n"
             f"Score: {score}/100\n"
             f"Estrategia: {strategy}\n"
             f"Operaciones hoy: {count}/{MAX_DAILY}\n"
