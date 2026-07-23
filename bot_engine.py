@@ -9,6 +9,7 @@ Reglas:
 - Score minimo: 75
 - Lotaje dinamico: se calcula segun balance real y % de riesgo (position_sizing.py)
 - Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
+- Maximo 2 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
 - Maximo 3 operaciones por dia
@@ -22,6 +23,7 @@ Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
 import os
 import sys
+import time
 import requests
 from datetime import datetime, date
 from dotenv import load_dotenv
@@ -47,10 +49,12 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # % del balance arriesga
 LOT_SIZE_FALLBACK = 0.02  # solo se usa si el calculo dinamico falla (ver execute_order)
 MIN_SCORE = 75
 MAX_DAILY = 3
+MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas
 SL_EXTRA_PTS = 20
 MAGIC_NUMBER = 20260601
 DEVIATION = 20
 DAILY_FILE = "bot_daily_count.txt"
+LOOP_INTERVAL = int(os.getenv("BOT_LOOP_INTERVAL", "60"))  # segundos entre cada chequeo
 
 # ── Filtro de vigencia (anti señal-vieja) ──
 # Si una señal PENDING lleva mas de esto sin ejecutarse (ej: porque el bot
@@ -151,6 +155,43 @@ def connect_mt5():
             raise RuntimeError(f"No se pudo activar el simbolo {MT5_SYMBOL}.")
 
     return account
+
+
+def get_daily_losses():
+    """
+    Cuenta perdidas reales de HOY para nuestras operaciones (magic number),
+    leyendo el historial de MT5 directamente — no depende de que
+    result_tracker.py haya corrido ni de la tabla signals de Supabase.
+    """
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    deals = mt5.history_deals_get(today_start, datetime.now())
+
+    if deals is None:
+        return 0
+
+    closing_deals = [
+        d for d in deals
+        if getattr(d, "magic", None) == MAGIC_NUMBER
+        and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT
+    ]
+
+    return sum(1 for d in closing_deals if d.profit < 0)
+
+
+def get_daily_wins():
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    deals = mt5.history_deals_get(today_start, datetime.now())
+
+    if deals is None:
+        return 0
+
+    closing_deals = [
+        d for d in deals
+        if getattr(d, "magic", None) == MAGIC_NUMBER
+        and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT
+    ]
+
+    return sum(1 for d in closing_deals if d.profit >= 0)
 
 
 def get_open_positions():
@@ -410,6 +451,107 @@ def update_signal_status(sig_id, status):
         return False
 
 
+# Evita mandar el aviso de "limite de perdidas" mas de una vez por dia.
+_loss_alert_sent_date = None
+
+
+def run_cycle():
+    """Un solo chequeo: busca señal vigente y ejecuta si corresponde. No conecta ni desconecta MT5."""
+    global _loss_alert_sent_date
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    daily_count = get_daily_count()
+    if daily_count >= MAX_DAILY:
+        print(f"  [{now_str}] Limite diario alcanzado ({daily_count}/{MAX_DAILY}). Esperando al dia siguiente.")
+        return
+
+    daily_losses = get_daily_losses()
+    if daily_losses >= MAX_LOSSES_PER_DAY:
+        print(
+            f"  [{now_str}] Limite de perdidas diarias alcanzado "
+            f"({daily_losses}/{MAX_LOSSES_PER_DAY}). Se detiene por hoy para proteger la cuenta."
+        )
+        if _loss_alert_sent_date != date.today():
+            send_telegram(
+                f"[BOT] Limite de perdidas alcanzado — {daily_losses}/{MAX_LOSSES_PER_DAY}\n"
+                f"El bot deja de operar por hoy para proteger la cuenta.\n"
+                f"Hora: {now_str}"
+            )
+            _loss_alert_sent_date = date.today()
+        return
+
+    open_positions = get_open_positions()
+    if open_positions:
+        pos = open_positions[0]
+        side = "BUY" if pos.type == 0 else "SELL"
+        print(
+            f"  [{now_str}] Posicion abierta: ticket {pos.ticket} | {side} | "
+            f"Profit: ${round(pos.profit, 2)}"
+        )
+        return
+
+    signals = get_pending_signals(current_price=get_current_price()[0])
+    if not signals:
+        print(f"  [{now_str}] Sin señales pendientes con score suficiente, estrategia permitida y vigentes.")
+        return
+
+    best = signals[0]
+    sig_id = best["id"]
+    sig_type = best["signal_type"]
+    score = best["confidence"]
+    strategy = best["strategy"]
+
+    print(f"\n  [{now_str}] Señal encontrada: {sig_type} | Score: {score}/100 | {strategy}")
+    print("  Ejecutando orden en MT5...")
+
+    result = execute_order(best)
+
+    if result is None:
+        print("  No se pudo ejecutar la orden.")
+        update_signal_status(sig_id, "FAILED")
+        return
+
+    count = increment_daily_count()
+    ask, bid = get_current_price()
+    price = ask if sig_type == "BUY" else bid
+    sl = calc_anti_hunt_sl(sig_type, float(best["stop_loss"]))
+    tp1 = float(best["take_profit_1"])
+
+    update_signal_status(sig_id, "EXECUTING")
+
+    print("\n  ORDEN EJECUTADA:")
+    print(f"    Ticket: {result.order}")
+    print(f"    Tipo:   {sig_type}")
+    print(f"    Precio: {price}")
+    print(f"    SL:     {sl} (anti-hunt +{SL_EXTRA_PTS} pts)")
+    print(f"    TP1:    {tp1}")
+    print(f"    Lote:   {result.volume}")
+    print(f"    Hoy:    {count}/{MAX_DAILY}")
+
+    send_telegram(
+        f"[BOT] ORDEN ABIERTA - {sig_type} XAUUSD\n"
+        f"Ticket: {result.order}\n"
+        f"Precio entrada: {price}\n"
+        f"Stop Loss: {sl} (anti-hunt)\n"
+        f"Take Profit: {tp1}\n"
+        f"Lote: {result.volume} (riesgo: {RISK_PERCENT}% del balance)\n"
+        f"Score: {score}/100\n"
+        f"Estrategia: {strategy}\n"
+        f"Operaciones hoy: {count}/{MAX_DAILY}\n"
+        f"Hora: {now_str}"
+    )
+
+
+def ensure_mt5_connected():
+    """Verifica que MT5 siga conectado; si se cayo, intenta reconectar."""
+    account = mt5.account_info()
+    if account is not None:
+        return account
+
+    print("  [MT5] Conexion perdida. Intentando reconectar...")
+    return connect_mt5()
+
+
 def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -418,8 +560,10 @@ def main():
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Simbolo MT5: {MT5_SYMBOL}")
     print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
+    print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
+    print(f"  Loop: cada {LOOP_INTERVAL}s — Ctrl+C para detener")
     print(f"{'=' * 55}")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -433,77 +577,24 @@ def main():
         print(f"Error MT5: {e}")
         return
 
-    try:
-        daily_count = get_daily_count()
-        print(f"Operaciones hoy: {daily_count}/{MAX_DAILY}")
-
-        if daily_count >= MAX_DAILY:
-            print("Limite diario alcanzado. No se abriran mas operaciones hoy.")
-            return
-
-        open_positions = get_open_positions()
-        if open_positions:
-            pos = open_positions[0]
-            side = "BUY" if pos.type == 0 else "SELL"
-            print(
-                f"Posicion abierta: ticket {pos.ticket} | {side} | "
-                f"Profit: ${round(pos.profit, 2)}"
-            )
-            return
-
-        signals = get_pending_signals(current_price=get_current_price()[0])
-        if not signals:
-            print("Sin señales pendientes con score suficiente, estrategia permitida y vigentes.")
-            return
-
-        best = signals[0]
-        sig_id = best["id"]
-        sig_type = best["signal_type"]
-        score = best["confidence"]
-        strategy = best["strategy"]
-
-        print(f"\nSeñal encontrada: {sig_type} | Score: {score}/100 | {strategy}")
-        print("Ejecutando orden en MT5...")
-
-        result = execute_order(best)
-
-        if result is None:
-            print("No se pudo ejecutar la orden.")
-            update_signal_status(sig_id, "FAILED")
-            return
-
-        count = increment_daily_count()
-        ask, bid = get_current_price()
-        price = ask if sig_type == "BUY" else bid
-        sl = calc_anti_hunt_sl(sig_type, float(best["stop_loss"]))
-        tp1 = float(best["take_profit_1"])
-
-        update_signal_status(sig_id, "EXECUTING")
-
-        print("\nORDEN EJECUTADA:")
-        print(f"  Ticket: {result.order}")
-        print(f"  Tipo:   {sig_type}")
-        print(f"  Precio: {price}")
-        print(f"  SL:     {sl} (anti-hunt +{SL_EXTRA_PTS} pts)")
-        print(f"  TP1:    {tp1}")
-        print(f"  Lote:   {result.volume}")
-        print(f"  Hoy:    {count}/{MAX_DAILY}")
-
+    if TELEGRAM_TOKEN:
         send_telegram(
-            f"[BOT] ORDEN ABIERTA - {sig_type} XAUUSD\n"
-            f"Ticket: {result.order}\n"
-            f"Precio entrada: {price}\n"
-            f"Stop Loss: {sl} (anti-hunt)\n"
-            f"Take Profit: {tp1}\n"
-            f"Lote: {result.volume} (riesgo: {RISK_PERCENT}% del balance)\n"
-            f"Score: {score}/100\n"
-            f"Estrategia: {strategy}\n"
-            f"Operaciones hoy: {count}/{MAX_DAILY}\n"
+            f"[BOT] bot_engine.py INICIADO\n"
+            f"Riesgo: {RISK_PERCENT}% | Score min: {MIN_SCORE} | Max diario: {MAX_DAILY}\n"
+            f"Loop: {LOOP_INTERVAL}s\n"
             f"Hora: {now_str}"
         )
 
-        print("\nBot engine completado.")
-
+    try:
+        while True:
+            try:
+                ensure_mt5_connected()
+                run_cycle()
+            except Exception as e:
+                print(f"  [ERROR] run_cycle: {e}")
+            time.sleep(LOOP_INTERVAL)
+    except KeyboardInterrupt:
+        print("\nDetenido manualmente (Ctrl+C).")
     finally:
         mt5.shutdown()
 
