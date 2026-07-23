@@ -8,6 +8,7 @@ TradingProEA - Execution Engine
 Reglas:
 - Score minimo: 75
 - Lotaje dinamico: se calcula segun balance real y % de riesgo (position_sizing.py)
+- Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
 - Maximo 3 operaciones por dia
@@ -50,6 +51,16 @@ SL_EXTRA_PTS = 20
 MAGIC_NUMBER = 20260601
 DEVIATION = 20
 DAILY_FILE = "bot_daily_count.txt"
+
+# ── Filtro de vigencia (anti señal-vieja) ──
+# Si una señal PENDING lleva mas de esto sin ejecutarse (ej: porque el bot
+# estuvo apagado, o result_tracker no la cerro a tiempo), se descarta en
+# vez de ejecutarla con SL/TP calculados para un precio que ya no existe.
+MAX_SIGNAL_AGE_MINUTES = 10
+# Si el precio actual se alejo mas de este % de la distancia original al SL,
+# la señal tambien se descarta aunque este "fresca" en minutos (movimiento
+# de mercado grande = el setup ya no es el mismo).
+MAX_PRICE_DRIFT_RATIO = 0.6
 # ──────────────────────────────────────────────────────────────
 
 # Estrategias autorizadas para ejecutar en MT5.
@@ -151,8 +162,46 @@ def get_open_positions():
     return [p for p in positions if getattr(p, "magic", None) == MAGIC_NUMBER]
 
 
-def get_pending_signals():
-    """Obtiene señales PENDING con confidence >= MIN_SCORE y estrategia permitida."""
+def is_signal_stale(signal, current_price):
+    """
+    Rechaza señales viejas o cuyo precio ya se movio demasiado.
+    Devuelve (True, razon) si la señal debe descartarse.
+    """
+    created_at_raw = signal.get("created_at")
+    if not created_at_raw:
+        return True, "sin created_at"
+
+    try:
+        created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+        now = datetime.now(created_at.tzinfo)
+        age_minutes = (now - created_at).total_seconds() / 60
+    except Exception:
+        return True, "created_at invalido"
+
+    if age_minutes > MAX_SIGNAL_AGE_MINUTES:
+        return True, f"tiene {age_minutes:.0f} min (max {MAX_SIGNAL_AGE_MINUTES})"
+
+    if current_price is not None:
+        try:
+            entry = float(signal["entry_price"])
+            sl = float(signal["stop_loss"])
+            riesgo_original = abs(entry - sl)
+            if riesgo_original > 0:
+                deriva = abs(current_price - entry)
+                ratio = deriva / riesgo_original
+                if ratio > MAX_PRICE_DRIFT_RATIO:
+                    return True, (
+                        f"precio se alejo {deriva:.2f} pts "
+                        f"({ratio:.1f}x el riesgo original de {riesgo_original:.2f} pts)"
+                    )
+        except (KeyError, ValueError, ZeroDivisionError):
+            pass
+
+    return False, "OK"
+
+
+def get_pending_signals(current_price=None):
+    """Obtiene señales PENDING con confidence >= MIN_SCORE, estrategia permitida y vigentes."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("ERROR: Faltan SUPABASE_URL o SUPABASE_KEY en .env")
         return []
@@ -181,13 +230,20 @@ def get_pending_signals():
 
     filtered = []
     excluded = []
+    stale = []
 
     for signal in all_signals:
         strategy = signal.get("strategy")
-        if strategy in ALLOWED_STRATEGIES:
-            filtered.append(signal)
-        else:
+        if strategy not in ALLOWED_STRATEGIES:
             excluded.append(strategy)
+            continue
+
+        is_stale, reason = is_signal_stale(signal, current_price)
+        if is_stale:
+            stale.append((signal.get("id", "")[:8], reason))
+            continue
+
+        filtered.append(signal)
 
     if excluded:
         unique_excluded = sorted(set(str(x) for x in excluded))
@@ -195,6 +251,10 @@ def get_pending_signals():
             f"  Filtradas {len(excluded)} señal(es) de estrategias no permitidas: "
             f"{', '.join(unique_excluded)}"
         )
+
+    if stale:
+        for sig_id, reason in stale:
+            print(f"  [VIGENCIA] Señal {sig_id} descartada — {reason}")
 
     return filtered
 
@@ -358,6 +418,7 @@ def main():
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Simbolo MT5: {MT5_SYMBOL}")
     print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
+    print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
     print(f"{'=' * 55}")
 
@@ -390,9 +451,9 @@ def main():
             )
             return
 
-        signals = get_pending_signals()
+        signals = get_pending_signals(current_price=get_current_price()[0])
         if not signals:
-            print("Sin señales pendientes con score suficiente y estrategia permitida.")
+            print("Sin señales pendientes con score suficiente, estrategia permitida y vigentes.")
             return
 
         best = signals[0]
