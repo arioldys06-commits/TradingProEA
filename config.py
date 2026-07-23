@@ -10,7 +10,7 @@ MIN_SCORE_TO_TRADE = 95
 MAX_TRADES_PER_DAY = 3
 MAX_LOSSES_PER_DAY = 2
 
-RISK_PER_TRADE_PERCENT = 1.0
+RISK_PER_TRADE_PERCENT = 0.5  # ahora se usa de verdad en bot_engine.py via position_sizing.py
 
 USE_NEWS_FILTER = False
 USE_SESSION_FILTER = True
