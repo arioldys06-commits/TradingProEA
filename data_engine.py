@@ -5,14 +5,19 @@ Descarga velas XAUUSD desde MT5 y las sube a Supabase.
 Proyecto: qilvrvnwdtpbkcfwktqs (proyecto activo del dashboard)
 """
 
-import MetaTrader5 as mt5
+import os
 import time
+import MetaTrader5 as mt5
 from datetime import datetime, timezone, timedelta
 from supabase import create_client
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── CONFIGURACIÓN ─────────────────────────────────────────────
-SUPA_URL = "https://qilvrvnwdtpbkcfwktqs.supabase.co"
-SUPA_KEY = "sb_secret_U_iPqRAky22ndAlDLUg0rg_X-_DHuEQ"
+# Las credenciales viven SOLO en el archivo .env local, nunca aqui.
+SUPA_URL = os.getenv("SUPABASE_URL")
+SUPA_KEY = os.getenv("SUPABASE_KEY")
 
 TIMEFRAMES = {
     "M1":  (mt5.TIMEFRAME_M1,  150),
@@ -24,11 +29,16 @@ TIMEFRAMES = {
     "H4":  (mt5.TIMEFRAME_H4,  150),
 }
 
-SYMBOL   = "GOLD"    # Nombre del símbolo en MT5 (XMGlobal)
+SYMBOL   = os.getenv("MT5_SYMBOL", "GOLD")  # Nombre del símbolo en MT5 (XMGlobal)
 INTERVAL = 60        # Segundos entre cada ciclo
 # ──────────────────────────────────────────────────────────────
 
 def get_supabase():
+    if not SUPA_URL or not SUPA_KEY:
+        raise RuntimeError(
+            "Faltan SUPABASE_URL o SUPABASE_KEY. "
+            "Revisa que el archivo .env exista en esta carpeta y tenga esas variables."
+        )
     return create_client(SUPA_URL, SUPA_KEY)
 
 def init_mt5():
@@ -72,6 +82,10 @@ def fetch_and_upload(sb):
             print(f"  [{tf_name}] Error Supabase: {e}")
 
 def main():
+    if not SUPA_URL or not SUPA_KEY:
+        print("ERROR: Faltan SUPABASE_URL o SUPABASE_KEY en .env")
+        return
+
     if not init_mt5():
         return
 
