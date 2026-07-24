@@ -108,13 +108,14 @@ def telegram_signal(sig):
     if vela_time != "N/A":
         try:
             vt_raw = datetime.fromisoformat(vela_time.replace("Z", "+00:00"))
-            # MT5 XMGlobal guarda en EET (UTC+2) pero sin offset en el timestamp
-            # Corregir restando 2h para obtener UTC real
-            MT5_OFFSET = timedelta(hours=2)
-            vt_utc = vt_raw - MT5_OFFSET
+            # candle_time ya viene en UTC real: data_engine.py ya hizo la
+            # correccion EET->UTC antes de guardarlo en Supabase. Restar
+            # el offset otra vez aqui duplicaba la correccion y producia
+            # un "Delay" inflado en ~1h que no reflejaba la demora real.
+            vt_utc = vt_raw if vt_raw.tzinfo else vt_raw.replace(tzinfo=timezone.utc)
             vt_rd  = vt_utc - timedelta(hours=4)  # UTC → RD (UTC-4)
             now_utc = datetime.now(timezone.utc)
-            diff = (now_utc - vt_utc.replace(tzinfo=timezone.utc)).total_seconds()
+            diff = (now_utc - vt_utc).total_seconds()
             latencia = f"Vela: {vt_rd.strftime('%H:%M:%S')} RD | Pub: {publish_time} | Delay: {int(diff)}s\n"
         except:
             latencia = f"Publicado: {publish_time}\n"
