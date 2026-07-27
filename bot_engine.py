@@ -19,6 +19,13 @@ Reglas:
 ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
+
+CAMBIOS EN ESTA VERSION (parche de diagnostico):
+- Cuando una orden falla (order_send devuelve None o retcode != DONE), ahora
+  se captura el motivo exacto (retcode, comment, last_error de MT5) y:
+    1. se guarda en bot_errors.log (no se pierde aunque cierres la consola)
+    2. se envia por Telegram
+  Antes ese detalle solo se imprimia en consola y se perdia.
 """
 
 import os
@@ -54,6 +61,7 @@ SL_EXTRA_PTS = 20
 MAGIC_NUMBER = 20260601
 DEVIATION = 20
 DAILY_FILE = "bot_daily_count.txt"
+ERROR_LOG_FILE = "bot_errors.log"  # NUEVO: guarda el motivo real de cada fallo de ejecucion
 LOOP_INTERVAL = int(os.getenv("BOT_LOOP_INTERVAL", "60"))  # segundos entre cada chequeo
 
 # ── Filtro de vigencia (anti señal-vieja) ──
@@ -111,6 +119,15 @@ def send_telegram(message):
     except Exception as e:
         print(f"  [TELEGRAM] Error: {e}")
         return False
+
+
+def log_error_to_file(message):
+    """NUEVO: guarda el error en disco para que no se pierda si se cierra la consola."""
+    try:
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception as e:
+        print(f"  [LOG] Error escribiendo {ERROR_LOG_FILE}: {e}")
 
 
 def get_daily_count():
@@ -357,15 +374,22 @@ def validate_signal(signal):
 
 
 def execute_order(signal):
+    """
+    Devuelve una tupla (result, error_detail):
+      - Si la orden se ejecuta bien: (result_de_mt5, None)
+      - Si falla en cualquier punto: (None, "descripcion exacta del motivo")
+    Antes esta funcion devolvia solo `result` (o None) y el motivo real del
+    fallo se perdia si no estabas viendo la consola en el momento exacto.
+    """
     is_valid, reason = validate_signal(signal)
     if not is_valid:
         print(f"  Señal invalida: {reason}")
-        return None
+        return None, f"Señal invalida: {reason}"
 
     ask, bid = get_current_price()
     if ask is None or bid is None:
         print("  Sin precio disponible en MT5.")
-        return None
+        return None, "Sin precio disponible en MT5 (symbol_info_tick devolvio None)"
 
     signal_type = signal["signal_type"]
     original_sl = float(signal["stop_loss"])
@@ -419,14 +443,25 @@ def execute_order(signal):
     result = mt5.order_send(request)
 
     if result is None:
-        print(f"  Error enviando orden: {mt5.last_error()}")
-        return None
+        error_code, error_desc = mt5.last_error()
+        detalle_error = (
+            f"order_send devolvio None. MT5 last_error: {error_code} - {error_desc} | "
+            f"volumen={lote}, precio={price}, sl={sl}, tp={tp1}, "
+            f"balance=${account.balance if account else '?'}"
+        )
+        print(f"  Error enviando orden: {detalle_error}")
+        return None, detalle_error
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"  Orden rechazada: {result.retcode} - {result.comment}")
-        return None
+        detalle_error = (
+            f"Orden rechazada. Retcode: {result.retcode} - {result.comment} | "
+            f"volumen={lote}, precio={price}, sl={sl}, tp={tp1}, "
+            f"balance=${account.balance if account else '?'}"
+        )
+        print(f"  {detalle_error}")
+        return None, detalle_error
 
-    return result
+    return result, None
 
 
 def update_signal_status(sig_id, status):
@@ -504,11 +539,18 @@ def run_cycle():
     print(f"\n  [{now_str}] Señal encontrada: {sig_type} | Score: {score}/100 | {strategy}")
     print("  Ejecutando orden en MT5...")
 
-    result = execute_order(best)
+    result, error_detail = execute_order(best)
 
     if result is None:
         print("  No se pudo ejecutar la orden.")
+        log_error_to_file(f"Señal {sig_id[:8]} ({sig_type}, score {score}, {strategy}): {error_detail}")
         update_signal_status(sig_id, "FAILED")
+        send_telegram(
+            f"[BOT] ORDEN FALLIDA - {sig_type} XAUUSD\n"
+            f"Score: {score}/100 | Estrategia: {strategy}\n"
+            f"Motivo: {error_detail}\n"
+            f"Hora: {now_str}"
+        )
         return
 
     count = increment_daily_count()
