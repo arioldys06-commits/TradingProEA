@@ -9,10 +9,10 @@ Reglas:
 - Score minimo: 75
 - Lotaje dinamico: se calcula segun balance real y % de riesgo (position_sizing.py)
 - Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
-- Maximo 2 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
+- Maximo 3 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
-- Maximo 3 operaciones por dia
+- Maximo 5 operaciones por dia
 - Solo ejecuta estrategias permitidas
 - Notifica a Telegram al abrir
 
