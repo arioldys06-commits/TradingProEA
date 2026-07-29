@@ -24,6 +24,23 @@ Bonus Morfología de Vela (probabilidad estadística):
   - Pin Bar (mecha >1.5x cuerpo): +10 pts  → 80% probabilidad
   - Mecha opuesta dominante:      -10 pts  → 50/50 penalizar
 
+Filtro de correlación con el dolar (DXY sintetico) — NUEVO:
+  - Este broker no expone un simbolo nativo de indice del dolar (DXY),
+    asi que se construye uno sintetico a partir de 4 pares que si estan
+    disponibles: EURUSD, GBPUSD, USDCHF, USDJPY.
+  - EURUSD/GBPUSD: USD es la moneda cotizada -> si el par SUBE, USD se debilita.
+  - USDCHF/USDJPY: USD es la moneda base    -> si el par SUBE, USD se fortalece.
+  - Se calcula tendencia EMA9/20 en M30 para cada par y se combinan en un
+    "voto" (0-4). 3-4 votos a favor del USD fuerte = "BUY" (dolar fuerte),
+    0-1 votos = "SELL" (dolar debil), 2 = "NEUTRAL" (sin consenso).
+  - Si la señal de XAUUSD esta a favor de la correlacion clasica
+    (oro SELL + dolar fuerte, u oro BUY + dolar debil) -> bono +10.
+  - Si la contradice -> penalizacion -10.
+  - Si el dolar esta en NEUTRAL -> no afecta el score.
+  - Esto es un bono/penalizacion adicional, no un filtro duro: una señal
+    puede seguir publicandose aunque el dolar no confirme, si el resto
+    de las condiciones ya le dan score suficiente.
+
 Validador de Vigencia (filtro anti-manipulación):
   - Compara precio actual vs entrada original antes de publicar
   - Si el precio se alejó más de 0.5x ATR → señal expirada, descarta
@@ -69,6 +86,14 @@ MIN_SCORE        = 70    # Score mínimo para publicar señal
 MAX_DAILY        = 20    # Máximo señales por día (filtro anti-spam)
 LOOP_INTERVAL    = 30    # Segundos entre cada análisis
 SIGNAL_COOLDOWN  = 120   # 2 min mínimo entre señales de la misma estrategia
+
+# NUEVO: pares usados para construir el indice sintetico de fuerza del dolar.
+# Deben coincidir con los que data_engine.py sube a ohlc_candles.
+DOLLAR_PAIRS = ["EURUSD", "GBPUSD", "USDCHF", "USDJPY"]
+# EURUSD y GBPUSD son inversos al USD (par sube = USD se debilita).
+# USDCHF y USDJPY son directos al USD (par sube = USD se fortalece).
+DOLLAR_PAIRS_INVERSOS = {"EURUSD", "GBPUSD"}
+DXY_SCORE_BONUS = 10  # puntos que suma/resta la confirmacion/contradiccion del dolar
 
 # ── ESTADO INTERNO ────────────────────────────────────────────
 last_signal_time = {}    # {strategy: datetime} — cooldown por estrategia
@@ -138,13 +163,13 @@ def telegram_signal(sig):
 
 # ── FETCH CANDLES ─────────────────────────────────────────────
 
-def get_candles(timeframe, limit=100):
+def get_candles(timeframe, limit=100, instrument="XAUUSD"):
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/ohlc_candles",
         headers=headers(),
         params={
             "select":     "candle_time,open,high,low,close,volume",
-            "instrument": "eq.XAUUSD",
+            "instrument": f"eq.{instrument}",
             "timeframe":  f"eq.{timeframe}",
             "order":      "candle_time.desc",
             "limit":      str(limit),
@@ -333,6 +358,87 @@ def score_morfologia_vela(candles, direccion):
             return -10, "Mecha inferior dominante (50/50)"
     return 0, ""
 
+# ── FILTRO DE CORRELACIÓN CON EL DOLAR (DXY sintetico) — NUEVO ───────
+# Este broker no expone un simbolo nativo de indice del dolar, asi que se
+# construye uno sintetico combinando la tendencia de 4 pares mayores.
+
+def get_pair_trend(par, timeframe="M30", limit=60):
+    """
+    Calcula la tendencia (BUY/SELL) de un par segun EMA9 vs EMA20,
+    igual que se hace para XAUUSD. Devuelve None si no hay datos
+    suficientes (ej. data_engine.py aun no ha subido velas de este par).
+    """
+    rows = get_candles(timeframe, limit, instrument=par)
+    if len(rows) < 20:
+        return None
+    closes = [float(r["close"]) for r in rows]
+    e9  = ema(closes, 9)
+    e20 = ema(closes, 20)
+    if not e9 or not e20:
+        return None
+    return "BUY" if e9 > e20 else "SELL"
+
+def get_dxy_trend():
+    """
+    Combina la tendencia de EURUSD, GBPUSD, USDCHF y USDJPY en un voto
+    de fuerza del dolar:
+      - EURUSD/GBPUSD en SELL (bajando) = voto a favor del dolar fuerte
+      - USDCHF/USDJPY en BUY  (subiendo) = voto a favor del dolar fuerte
+    Devuelve:
+      "BUY"     -> dolar fortaleciendose (3-4 votos de 4)
+      "SELL"    -> dolar debilitandose   (0-1 votos de 4)
+      "NEUTRAL" -> sin consenso claro (2 votos), o datos insuficientes
+    """
+    votos_dolar_fuerte = 0
+    pares_evaluados = 0
+
+    for par in DOLLAR_PAIRS:
+        trend = get_pair_trend(par)
+        if trend is None:
+            continue
+        pares_evaluados += 1
+
+        if par in DOLLAR_PAIRS_INVERSOS:
+            # EURUSD/GBPUSD: si el par SELL (bajando), el dolar se fortalece
+            if trend == "SELL":
+                votos_dolar_fuerte += 1
+        else:
+            # USDCHF/USDJPY: si el par BUY (subiendo), el dolar se fortalece
+            if trend == "BUY":
+                votos_dolar_fuerte += 1
+
+    if pares_evaluados < 3:
+        # Datos insuficientes (ej. data_engine.py recien desplegado, o
+        # aun no ha subido suficientes velas de los pares) -> no forzar opinion.
+        return "NEUTRAL"
+
+    if votos_dolar_fuerte >= 3:
+        return "BUY"    # dolar fortaleciendose
+    if votos_dolar_fuerte <= 1:
+        return "SELL"   # dolar debilitandose
+    return "NEUTRAL"    # 2 de 4 — sin consenso
+
+
+def dxy_score_bonus(signal_type, dxy_trend):
+    """
+    Bono/penalizacion segun la correlacion clasica oro-dolar:
+      oro SELL + dolar fuerte (BUY)  -> confirma  -> +DXY_SCORE_BONUS
+      oro BUY  + dolar debil (SELL)  -> confirma  -> +DXY_SCORE_BONUS
+      cualquier otra combinacion (que no sea NEUTRAL) -> contradice -> -DXY_SCORE_BONUS
+      dxy_trend NEUTRAL -> no afecta -> 0
+    Devuelve (puntos, razon_texto_o_None).
+    """
+    if dxy_trend == "NEUTRAL":
+        return 0, None
+
+    confirma = (signal_type == "SELL" and dxy_trend == "BUY") or \
+               (signal_type == "BUY" and dxy_trend == "SELL")
+
+    if confirma:
+        return DXY_SCORE_BONUS, f"USD {dxy_trend} confirma {signal_type} (+{DXY_SCORE_BONUS})"
+    else:
+        return -DXY_SCORE_BONUS, f"USD {dxy_trend} contradice {signal_type} (-{DXY_SCORE_BONUS})"
+
 # ── VALIDADOR DE VIGENCIA (filtro anti-manipulación) ──────────
 # Los ~90s de latencia del sistema filtran fakeouts naturalmente
 # Si el precio ya se alejó más de 0.5x ATR → señal expirada
@@ -473,7 +579,7 @@ def publish_signal(sig):
 # Sweep de liquidez + BOS/CHoCH + confluencia multi-TF
 # ════════════════════════════════════════════════════════════════
 
-def strategy_scalping_m5(c5, c30, ch1):
+def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not killzone_requerida("1-Scalping SMC"):
         return None
     if len(c5) < 30:
@@ -570,6 +676,14 @@ def strategy_scalping_m5(c5, c30, ch1):
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
+
+    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
     score = max(0, min(score, 100))
     if score < MIN_SCORE:
         return None
@@ -602,7 +716,7 @@ def strategy_scalping_m5(c5, c30, ch1):
 # Opera el primer movimiento fuerte al inicio de cada sesión
 # ════════════════════════════════════════════════════════════════
 
-def strategy_killzone_breakout(c5, ch1):
+def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
     if not is_killzone():
         return None
     if len(c5) < 20 or len(ch1) < 5:
@@ -663,6 +777,14 @@ def strategy_killzone_breakout(c5, ch1):
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
+
+    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
     score = max(0, min(score, 100))
     if score < MIN_SCORE:
         return None
@@ -689,7 +811,7 @@ def strategy_killzone_breakout(c5, ch1):
 # Detecta Fair Value Gaps recientes y espera que el precio regrese
 # ════════════════════════════════════════════════════════════════
 
-def strategy_fvg_fill(c5, c30):
+def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if not killzone_requerida("3-FVG Fill"):
         return None
     if len(c5) < 30:
@@ -762,6 +884,14 @@ def strategy_fvg_fill(c5, c30):
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
+
+    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
     score = max(0, min(score, 100))
     if score < MIN_SCORE:
         return None
@@ -788,7 +918,7 @@ def strategy_fvg_fill(c5, c30):
 # Pullback a EMA9/20 en tendencia clara con vela de confirmación
 # ════════════════════════════════════════════════════════════════
 
-def strategy_ema_pullback(c5, c30, ch1):
+def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not killzone_requerida("4-EMA Pullback"):
         return None
     if len(c5) < 30:
@@ -870,6 +1000,14 @@ def strategy_ema_pullback(c5, c30, ch1):
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
+
+    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
     score = max(0, min(score, 100))
     if score < MIN_SCORE:
         return None
@@ -910,10 +1048,15 @@ def analyze():
     c30 = to_candles(rows_m30)
     ch1 = to_candles(rows_h1)
 
+    # NUEVO: tendencia del dolar (indice sintetico), una sola vez por ciclo
+    # y se pasa a las 4 estrategias — evita recalcularla 4 veces por ronda.
+    dxy_trend = get_dxy_trend()
+
     last_price = c5[-1]["C"]
     session    = get_session()
     kz         = "KZ ACTIVA" if is_killzone() else "fuera de KZ"
     print(f"  Precio: {last_price:.2f} | Sesión: {session} | {kz} | Señales hoy: {daily_count}/{MAX_DAILY}")
+    print(f"  Dolar (DXY sintetico): {dxy_trend}")
 
     signals_found = 0
 
@@ -957,7 +1100,7 @@ def analyze():
 
     # ── Estrategia 1: Scalping M5 SMC
     try:
-        sig = strategy_scalping_m5(c5, c30, ch1)
+        sig = strategy_scalping_m5(c5, c30, ch1, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
@@ -970,7 +1113,7 @@ def analyze():
 
     # ── Estrategia 2: Killzone Breakout
     try:
-        sig = strategy_killzone_breakout(c5, ch1)
+        sig = strategy_killzone_breakout(c5, ch1, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
@@ -984,7 +1127,7 @@ def analyze():
 
     # ── Estrategia 3: FVG Fill
     try:
-        sig = strategy_fvg_fill(c5, c30)
+        sig = strategy_fvg_fill(c5, c30, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
@@ -997,7 +1140,7 @@ def analyze():
 
     # ── Estrategia 4: EMA Pullback
     try:
-        sig = strategy_ema_pullback(c5, c30, ch1)
+        sig = strategy_ema_pullback(c5, c30, ch1, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
@@ -1026,6 +1169,7 @@ def main():
     print(f"    3. FVG Fill M5")
     print(f"    4. EMA Pullback M5")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
+    print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1038,6 +1182,7 @@ def main():
             f"Trading Pro XAUUSD — Signal Engine INICIADO\n"
             f"Score min: {MIN_SCORE} | Max diario: {MAX_DAILY}\n"
             f"Cooldown: {SIGNAL_COOLDOWN}s | Loop: {LOOP_INTERVAL}s\n"
+            f"Filtro DXY sintetico activo ({', '.join(DOLLAR_PAIRS)})\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
