@@ -9,10 +9,10 @@ Reglas:
 - Score minimo: 75
 - Lotaje dinamico: se calcula segun balance real y % de riesgo (position_sizing.py)
 - Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
-- Maximo 3 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
+- Maximo 2 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
-- Maximo 5 operaciones por dia
+- Maximo 3 operaciones por dia
 - Solo ejecuta estrategias permitidas
 - Notifica a Telegram al abrir
 
@@ -20,12 +20,19 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
-CAMBIOS EN ESTA VERSION (parche de diagnostico):
+CAMBIOS EN ESTA VERSION (parche de diagnostico + robustez de notificaciones):
 - Cuando una orden falla (order_send devuelve None o retcode != DONE), ahora
   se captura el motivo exacto (retcode, comment, last_error de MT5) y:
     1. se guarda en bot_errors.log (no se pierde aunque cierres la consola)
     2. se envia por Telegram
   Antes ese detalle solo se imprimia en consola y se perdia.
+- send_telegram() y update_signal_status() ahora reintentan hasta 3 veces
+  ante fallos de red antes de rendirse. Si aun asi fallan las 3 veces, el
+  detalle completo (mensaje de Telegram, o señal + estado que no se pudo
+  guardar en Supabase) se registra en bot_errors.log. Antes, un solo corte
+  de red momentaneo hacia que un aviso de "ORDEN ABIERTA" desapareciera sin
+  dejar rastro, o que una señal ya ejecutada en MT5 se quedara marcada
+  PENDING en Supabase para siempre.
 """
 
 import os
@@ -55,8 +62,8 @@ MT5_SYMBOL = os.getenv("MT5_SYMBOL", "GOLD")
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # % del balance arriesgado por operacion
 LOT_SIZE_FALLBACK = 0.02  # solo se usa si el calculo dinamico falla (ver execute_order)
 MIN_SCORE = 75
-MAX_DAILY = 5
-MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "3"))  # corta el dia tras N perdidas
+MAX_DAILY = 3
+MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas
 SL_EXTRA_PTS = 20
 MAGIC_NUMBER = 20260601
 DEVIATION = 20
@@ -105,20 +112,40 @@ def headers():
     }
 
 
-def send_telegram(message):
+def send_telegram(message, intentos=3):
+    """
+    NUEVO: reintenta hasta `intentos` veces (con pequeña espera entre cada uno)
+    antes de rendirse. Si TODOS los intentos fallan, el mensaje completo se
+    guarda en bot_errors.log para que nunca se pierda en silencio — antes,
+    un solo fallo de red hacia que el aviso (ej. "ORDEN ABIERTA") desapareciera
+    para siempre sin dejar rastro.
+    """
     if not TELEGRAM_TOKEN:
         return False
 
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"  [TELEGRAM] Error: {e}")
-        return False
+    ultimo_error = None
+    for intento in range(1, intentos + 1):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                return True
+            ultimo_error = f"HTTP {r.status_code}: {r.text}"
+        except Exception as e:
+            ultimo_error = str(e)
+
+        print(f"  [TELEGRAM] Intento {intento}/{intentos} fallo: {ultimo_error}")
+        if intento < intentos:
+            time.sleep(2)
+
+    # Todos los intentos fallaron: no dejar que el mensaje se pierda en silencio.
+    log_error_to_file(
+        f"TELEGRAM NO ENVIADO tras {intentos} intentos. Error: {ultimo_error} | Mensaje: {message}"
+    )
+    return False
 
 
 def log_error_to_file(message):
@@ -464,26 +491,43 @@ def execute_order(signal):
     return result, None
 
 
-def update_signal_status(sig_id, status):
+def update_signal_status(sig_id, status, intentos=3):
+    """
+    NUEVO: reintenta hasta `intentos` veces antes de rendirse. Si TODOS los
+    intentos fallan (ej. corte de red momentaneo), el detalle se guarda en
+    bot_errors.log en vez de perderse — antes, una señal podia ejecutarse
+    de verdad en MT5 pero quedarse en PENDING para siempre en Supabase si
+    esta llamada fallaba justo en ese instante.
+    """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
 
-    try:
-        r = requests.patch(
-            f"{SUPABASE_URL}/rest/v1/signals?id=eq.{sig_id}",
-            headers=headers(),
-            json={"status": status},
-            timeout=15,
-        )
+    ultimo_error = None
+    for intento in range(1, intentos + 1):
+        try:
+            r = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/signals?id=eq.{sig_id}",
+                headers=headers(),
+                json={"status": status},
+                timeout=15,
+            )
 
-        if r.status_code >= 400:
-            print(f"  Error actualizando señal {sig_id}: {r.status_code} {r.text}")
-            return False
+            if r.status_code < 400:
+                return True
 
-        return True
-    except Exception as e:
-        print(f"  Error update_signal_status: {e}")
-        return False
+            ultimo_error = f"HTTP {r.status_code}: {r.text}"
+        except Exception as e:
+            ultimo_error = str(e)
+
+        print(f"  [SUPABASE] Intento {intento}/{intentos} fallo al actualizar señal {sig_id}: {ultimo_error}")
+        if intento < intentos:
+            time.sleep(2)
+
+    log_error_to_file(
+        f"NO SE PUDO ACTUALIZAR ESTADO tras {intentos} intentos. "
+        f"Señal: {sig_id} -> {status} | Error: {ultimo_error}"
+    )
+    return False
 
 
 # Evita mandar el aviso de "limite de perdidas" mas de una vez por dia.
