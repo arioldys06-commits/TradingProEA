@@ -1,18 +1,22 @@
 """
-result_tracker.py — V2
+result_tracker.py — V3
 ======================
 Revisa señales PENDING y actualiza WIN/LOSS comparando
 con las velas reales de Supabase.
 
 Proyecto: qilvrvnwdtpbkcfwktqs (activo en dashboard)
 
-Correcciones aplicadas:
-  - URL Supabase apunta al proyecto correcto (via .env)
-  - Usa timeframe M5 en lugar de M1 (M1 no siempre existe)
-  - Removido filtro "instrument" en get_daily_stats (columna no existe en signals)
-  - Trailing stop: cuando toca TP1 mueve SL a breakeven
-  - Alertas Telegram al cerrar (WIN/LOSS/BREAKEVEN)
-  - Reporte diario a las 20:00 UTC
+CAMBIOS EN ESTA VERSION (V3 — desglose por estrategia):
+  - get_daily_stats() ahora agrupa resultados por 'strategy', no solo
+    el total del dia. Antes: {total, wins, losses, pnl, avg_score}.
+    Ahora ademas incluye 'by_strategy': {nombre_estrategia: {...}}.
+  - Nueva funcion get_strategy_stats_range(days) para ver el
+    desempeño historico por estrategia (no solo el dia de hoy) —
+    util para decidir si alguna estrategia hay que apagar.
+  - telegram_daily_report() ahora imprime una tabla con el
+    desglose por estrategia, ademas del resumen general.
+  - Se mantiene 100% la logica original de cierre de señales
+    (breakeven, WIN/LOSS, velas M5) — no se toco esa parte.
 """
 
 import os
@@ -93,20 +97,60 @@ def telegram_daily_report(stats):
     winrate   = round(stats['wins'] / stats['total'] * 100, 1) if stats['total'] > 0 else 0
     emoji_wr  = "BIEN" if winrate >= 65 else "OK" if winrate >= 50 else "MAL"
     pnl_str   = f"+{stats['pnl']:.1f}" if stats['pnl'] >= 0 else f"{stats['pnl']:.1f}"
-    return (
-        f"REPORTE DIARIO — XAUUSD\n"
-        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
-        f"---\n"
-        f"Total senales: {stats['total']}\n"
-        f"Ganadoras: {stats['wins']}\n"
-        f"Perdedoras: {stats['losses']}\n"
-        f"Winrate: {winrate}% [{emoji_wr}]\n"
-        f"---\n"
-        f"PnL del dia: {pnl_str} pts\n"
-        f"Score promedio: {stats['avg_score']:.0f}/100\n"
-        f"---\n"
-        f"Trading Pro V2"
+
+    lines = [
+        f"REPORTE DIARIO — XAUUSD",
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+        f"---",
+        f"Total senales: {stats['total']}",
+        f"Ganadoras: {stats['wins']}",
+        f"Perdedoras: {stats['losses']}",
+        f"Winrate: {winrate}% [{emoji_wr}]",
+        f"---",
+        f"PnL del dia: {pnl_str} pts",
+        f"Score promedio: {stats['avg_score']:.0f}/100",
+        f"---",
+        f"POR ESTRATEGIA:",
+    ]
+
+    # NUEVO: desglose por estrategia, ordenado de mejor a peor winrate
+    by_strategy = stats.get("by_strategy", {})
+    ordered = sorted(
+        by_strategy.items(),
+        key=lambda kv: (kv[1]["wins"] / kv[1]["total"] if kv[1]["total"] else 0),
+        reverse=True,
     )
+    for strategy_name, s in ordered:
+        wr = round(s["wins"] / s["total"] * 100, 1) if s["total"] else 0
+        pnl_s = f"+{s['pnl']:.1f}" if s['pnl'] >= 0 else f"{s['pnl']:.1f}"
+        lines.append(
+            f"  {strategy_name}: {s['wins']}W/{s['losses']}L "
+            f"({wr}%) | {pnl_s} pts"
+        )
+
+    lines += ["---", "Trading Pro V3"]
+    return "\n".join(lines)
+
+def telegram_strategy_range_report(stats_by_strategy, days):
+    lines = [
+        f"DESEMPEÑO POR ESTRATEGIA — ultimos {days} dias",
+        f"---",
+    ]
+    ordered = sorted(
+        stats_by_strategy.items(),
+        key=lambda kv: (kv[1]["wins"] / kv[1]["total"] if kv[1]["total"] else 0),
+        reverse=True,
+    )
+    for strategy_name, s in ordered:
+        wr = round(s["wins"] / s["total"] * 100, 1) if s["total"] else 0
+        pnl_s = f"+{s['pnl']:.1f}" if s['pnl'] >= 0 else f"{s['pnl']:.1f}"
+        flag = "" if s["total"] < 5 else (" [REVISAR]" if wr < 45 else "")
+        lines.append(
+            f"{strategy_name}: {s['total']} señales | "
+            f"{s['wins']}W/{s['losses']}L ({wr}%) | {pnl_s} pts{flag}"
+        )
+    lines += ["---", "Menos de 5 señales = muestra insuficiente todavia"]
+    return "\n".join(lines)
 
 def get_pending_signals():
     r = requests.get(
@@ -134,7 +178,7 @@ def get_candles_after(created_at, limit=200):
         params={
             "select":      "candle_time,high,low,close",
             "instrument":  "eq.XAUUSD",
-            "timeframe":   "eq.M5",          # CORREGIDO: era M1, no existe siempre
+            "timeframe":   "eq.M5",
             "candle_time": f"gt.{created_at}",
             "order":       "candle_time.asc",
             "limit":       str(limit),
@@ -152,7 +196,7 @@ def get_current_price():
         params={
             "select":     "close",
             "instrument": "eq.XAUUSD",
-            "timeframe":  "eq.M5",           # CORREGIDO: era M1
+            "timeframe":  "eq.M5",
             "order":      "candle_time.desc",
             "limit":      "1",
         },
@@ -189,16 +233,57 @@ def update_signal_sl(sig_id, new_sl):
     except Exception as e:
         print(f"  Error update_signal_sl: {e}")
 
+def _empty_strategy_bucket():
+    return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+
+def _build_stats_from_signals(signals):
+    """
+    Toma una lista de señales CLOSED (con result, entry_price, take_profit_1,
+    stop_loss, confidence, strategy) y arma el resumen global + por estrategia.
+    Compartido por get_daily_stats() y get_strategy_stats_range().
+    """
+    wins   = sum(1 for s in signals if s.get("result") == "WIN")
+    losses = sum(1 for s in signals if s.get("result") == "LOSS")
+    total  = wins + losses
+
+    def pnl_of(s):
+        entry = float(s.get("entry_price", 0))
+        if s.get("result") == "WIN":
+            return float(s.get("take_profit_1", 0)) - entry
+        return float(s.get("stop_loss", 0)) - entry
+
+    pnl = sum(pnl_of(s) for s in signals if s.get("result") in ("WIN", "LOSS"))
+    avg_score = sum(s.get("confidence", 0) for s in signals) / len(signals) if signals else 0
+
+    # NUEVO: desglose por estrategia
+    by_strategy = {}
+    for s in signals:
+        if s.get("result") not in ("WIN", "LOSS"):
+            continue
+        name = s.get("strategy") or "sin_nombre"
+        bucket = by_strategy.setdefault(name, _empty_strategy_bucket())
+        bucket["total"] += 1
+        if s["result"] == "WIN":
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+        bucket["pnl"] += pnl_of(s)
+
+    return {
+        "total": total, "wins": wins, "losses": losses,
+        "pnl": pnl, "avg_score": avg_score,
+        "by_strategy": by_strategy,
+    }
+
 def get_daily_stats():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/signals",
         headers=headers(),
         params={
-            "select":     "result,entry_price,take_profit_1,stop_loss,confidence",
+            "select":     "result,entry_price,take_profit_1,stop_loss,confidence,strategy",
             "status":     "eq.CLOSED",
             "created_at": f"gte.{today}T00:00:00Z",
-            # CORREGIDO: removido filtro "instrument" — columna no existe en signals
         },
         timeout=20,
     )
@@ -208,23 +293,38 @@ def get_daily_stats():
     if not signals:
         return None
 
-    wins      = sum(1 for s in signals if s.get("result") == "WIN")
-    losses    = sum(1 for s in signals if s.get("result") == "LOSS")
-    total     = wins + losses
-    pnl       = sum(
-        (float(s.get("take_profit_1", 0)) - float(s.get("entry_price", 0)))
-        if s.get("result") == "WIN"
-        else (float(s.get("stop_loss", 0)) - float(s.get("entry_price", 0)))
-        for s in signals if s.get("result") in ("WIN", "LOSS")
-    )
-    avg_score = sum(s.get("confidence", 0) for s in signals) / len(signals) if signals else 0
+    return _build_stats_from_signals(signals)
 
-    return {"total": total, "wins": wins, "losses": losses, "pnl": pnl, "avg_score": avg_score}
+def get_strategy_stats_range(days=7):
+    """
+    NUEVO: desempeño por estrategia en los ultimos N dias (no solo hoy).
+    Util para decidir si una estrategia se debe desactivar de
+    ALLOWED_STRATEGIES en bot_engine.py.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/signals",
+        headers=headers(),
+        params={
+            "select":     "result,entry_price,take_profit_1,stop_loss,confidence,strategy",
+            "status":     "eq.CLOSED",
+            "created_at": f"gte.{since}",
+        },
+        timeout=20,
+    )
+    if r.status_code >= 400:
+        print(f"  Error get_strategy_stats_range: {r.status_code} {r.text}")
+        return None
+    signals = r.json()
+    if not signals:
+        return None
+
+    return _build_stats_from_signals(signals)["by_strategy"]
 
 def main():
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     print(f"\n{'='*50}")
-    print(f"  RESULT TRACKER V2 — {now_str}")
+    print(f"  RESULT TRACKER V3 — {now_str}")
     print(f"  URL: {SUPABASE_URL}")
     print(f"{'='*50}")
 
@@ -249,7 +349,6 @@ def main():
         tp2      = float(signal["take_profit_2"])
         created  = signal["created_at"]
 
-        # Ajustar SL si ya está en breakeven
         if sig_id in breakeven_set:
             sl = entry
 
@@ -325,7 +424,7 @@ def main():
             be_tag = "[BREAKEVEN activo]" if sig_id in breakeven_set else ""
             print(f"  [PEND] {sig_type} [{sig_id[:8]}] — En progreso ({age_min:.0f} min) {be_tag}")
 
-    # Reporte diario a las 20:00 UTC
+    # Reporte diario a las 20:00 UTC (ahora con desglose por estrategia)
     now_utc = datetime.now(timezone.utc)
     if now_utc.hour == 20 and now_utc.minute < 2:
         stats = get_daily_stats()
@@ -333,7 +432,14 @@ def main():
             send_telegram(telegram_daily_report(stats))
             print(f"\n  Reporte diario enviado: {stats['wins']}W/{stats['losses']}L")
 
-    print(f"\nResult tracker V2 completado.")
+    # NUEVO: reporte semanal por estrategia, domingos a las 20:00 UTC
+    if now_utc.weekday() == 6 and now_utc.hour == 20 and now_utc.minute < 2:
+        weekly = get_strategy_stats_range(days=7)
+        if weekly:
+            send_telegram(telegram_strategy_range_report(weekly, days=7))
+            print(f"\n  Reporte semanal por estrategia enviado.")
+
+    print(f"\nResult tracker V3 completado.")
 
 if __name__ == "__main__":
     try:
