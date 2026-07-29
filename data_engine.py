@@ -1,8 +1,18 @@
 """
 data_engine.py
 ==============
-Descarga velas XAUUSD desde MT5 y las sube a Supabase.
+Descarga velas XAUUSD (y pares del dolar, para el filtro DXY sintetico)
+desde MT5 y las sube a Supabase.
 Proyecto: qilvrvnwdtpbkcfwktqs (proyecto activo del dashboard)
+
+CAMBIOS EN ESTA VERSION (filtro de correlacion con el dolar):
+- Ademas de XAUUSD, ahora tambien descarga EURUSD, GBPUSD, USDCHF y USDJPY
+  (M5, M30, H1 — los mismos timeframes que signal_engine.py usa para
+  confluencia). Se guardan en la misma tabla ohlc_candles, cada uno con
+  su propio "instrument", exactamente igual que XAUUSD.
+- Estos 4 pares son la base para construir un indice sintetico de fuerza
+  del dolar en signal_engine.py (get_dxy_trend()), ya que este broker no
+  expone un simbolo nativo de DXY en el Market Watch.
 """
 
 import os
@@ -28,6 +38,20 @@ TIMEFRAMES = {
     "H2":  (mt5.TIMEFRAME_H2,  150),
     "H4":  (mt5.TIMEFRAME_H4,  150),
 }
+
+# NUEVO: timeframes reducidos para los pares del dolar — solo lo que
+# signal_engine.py necesita para calcular tendencia (EMA9/20), no hace
+# falta guardar M1/M15/H2/H4 de estos pares y ahorra llamadas/almacenamiento.
+DOLLAR_TIMEFRAMES = {
+    "M5":  (mt5.TIMEFRAME_M5,  150),
+    "M30": (mt5.TIMEFRAME_M30, 150),
+    "H1":  (mt5.TIMEFRAME_H1,  200),
+}
+
+# NUEVO: pares usados para construir el indice sintetico de fuerza del dolar.
+# EURUSD/GBPUSD: USD es la moneda cotizada -> si el par SUBE, el USD se debilita.
+# USDCHF/USDJPY: USD es la moneda base    -> si el par SUBE, el USD se fortalece.
+DOLLAR_SYMBOLS = ["EURUSD", "GBPUSD", "USDCHF", "USDJPY"]
 
 SYMBOL   = os.getenv("MT5_SYMBOL", "GOLD")  # Nombre del símbolo en MT5 (XMGlobal)
 INTERVAL = 60        # Segundos entre cada ciclo
@@ -79,11 +103,32 @@ def init_mt5():
     print(f"[OK] MT5 conectado — build {mt5.version()}")
     return True
 
-def fetch_and_upload(sb):
-    for tf_name, (tf_const, count) in TIMEFRAMES.items():
-        rates = mt5.copy_rates_from_pos(SYMBOL, tf_const, 0, count)
+
+def ensure_symbol_visible(symbol):
+    """Activa el simbolo en Market Watch si no esta visible (necesario para copy_rates)."""
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        print(f"  [{symbol}] No encontrado en MT5 — saltando.")
+        return False
+    if not info.visible:
+        if not mt5.symbol_select(symbol, True):
+            print(f"  [{symbol}] No se pudo activar en Market Watch — saltando.")
+            return False
+    return True
+
+
+def fetch_symbol_candles(symbol, instrument_label, timeframes):
+    """
+    Descarga velas de `symbol` en los timeframes indicados y devuelve
+    las filas listas para subir a Supabase, etiquetadas como `instrument_label`.
+    Reutilizada tanto para XAUUSD como para los pares del dolar.
+    """
+    rows_por_tf = {}
+
+    for tf_name, (tf_const, count) in timeframes.items():
+        rates = mt5.copy_rates_from_pos(symbol, tf_const, 0, count)
         if rates is None or len(rates) == 0:
-            print(f"  [{tf_name}] Sin datos")
+            print(f"  [{instrument_label} {tf_name}] Sin datos")
             continue
 
         rows = []
@@ -97,7 +142,7 @@ def fetch_and_upload(sb):
             offset = eet_offset_hours(dt_raw)
             dt     = dt_raw - timedelta(hours=offset)  # EET/EEST → UTC real
             rows.append({
-                "instrument":  "XAUUSD",
+                "instrument":  instrument_label,
                 "timeframe":   tf_name,
                 "candle_time": dt.isoformat(),
                 "open":        float(r["open"]),
@@ -107,14 +152,37 @@ def fetch_and_upload(sb):
                 "volume":      int(r["tick_volume"]),
             })
 
+        rows_por_tf[tf_name] = rows
+
+    return rows_por_tf
+
+
+def upload_rows(sb, instrument_label, rows_por_tf):
+    for tf_name, rows in rows_por_tf.items():
+        if not rows:
+            continue
         try:
             sb.table("ohlc_candles").upsert(
                 rows,
                 on_conflict="instrument,timeframe,candle_time"
             ).execute()
-            print(f"  [{tf_name}] {len(rows)} velas subidas")
+            print(f"  [{instrument_label} {tf_name}] {len(rows)} velas subidas")
         except Exception as e:
-            print(f"  [{tf_name}] Error Supabase: {e}")
+            print(f"  [{instrument_label} {tf_name}] Error Supabase: {e}")
+
+
+def fetch_and_upload(sb):
+    # ── XAUUSD (oro) — igual que siempre, todos los timeframes ──
+    rows_por_tf = fetch_symbol_candles(SYMBOL, "XAUUSD", TIMEFRAMES)
+    upload_rows(sb, "XAUUSD", rows_por_tf)
+
+    # ── NUEVO: pares del dolar para el indice sintetico DXY ──
+    for par in DOLLAR_SYMBOLS:
+        if not ensure_symbol_visible(par):
+            continue
+        rows_por_tf = fetch_symbol_candles(par, par, DOLLAR_TIMEFRAMES)
+        upload_rows(sb, par, rows_por_tf)
+
 
 def main():
     if not SUPA_URL or not SUPA_KEY:
@@ -127,7 +195,8 @@ def main():
     sb = get_supabase()
     print(f"[START] data_engine corriendo — interval {INTERVAL}s")
     print(f"[URL]   {SUPA_URL}")
-    print(f"[TFs]   {list(TIMEFRAMES.keys())}")
+    print(f"[TFs]   XAUUSD: {list(TIMEFRAMES.keys())}")
+    print(f"[TFs]   Pares dolar ({', '.join(DOLLAR_SYMBOLS)}): {list(DOLLAR_TIMEFRAMES.keys())}")
 
     while True:
         now = datetime.now().strftime("%H:%M:%S")
