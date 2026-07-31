@@ -350,6 +350,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       <div class="nav-divider"></div>
       <button class="nav-btn" id="nb-news" title="Noticias" onclick="switchPage('news')">📰</button>
       <button class="nav-btn" id="nb-risk" title="Gestión riesgo" onclick="switchPage('risk')">🧮</button>
+      <button class="nav-btn" id="nb-pnl" title="P&amp;L Real" onclick="switchPage('pnl')">💰</button>
     </nav>
 
     <!-- MAIN CONTENT -->
@@ -882,6 +883,33 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   </div>
 </div>
 
+      <div id="page-pnl" class="page" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <div class="page-title" style="margin:0">P&amp;L Real — Trades ejecutados</div>
+    <button onclick="loadPnlPage()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Actualizar</button>
+  </div>
+
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:18px;margin-bottom:16px">
+    <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">P&amp;L total acumulado</div>
+    <div id="pnl-total" style="font-family:var(--mono);font-size:36px;font-weight:700;color:var(--green)">-</div>
+    <div style="font-size:12px;color:var(--muted);margin-top:6px" id="pnl-today">-</div>
+    <div id="pnl-curve" style="margin-top:14px"></div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px">
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Win Rate</div><div style="font-size:22px;font-weight:600;font-family:var(--mono)" id="pnl-wr">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Profit Factor</div><div style="font-size:22px;font-weight:600;font-family:var(--mono)" id="pnl-pf">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Ganancia Prom.</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--green)" id="pnl-avgwin">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Pérdida Prom.</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--red)" id="pnl-avgloss">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Max Drawdown</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--gold)" id="pnl-dd">-</div></div>
+  </div>
+
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px">
+    <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Últimos trades</div>
+    <div id="pnl-table" style="font-size:12px;color:var(--muted)">Cargando...</div>
+  </div>
+</div>
+
     </div><!-- /mainContent -->
   </div><!-- /body -->
 </div><!-- /app -->
@@ -972,6 +1000,7 @@ function switchPage(id) {
     if (pg) pg.style.display = 'block';
   }
   if (id === 'signals') renderSignalsPage();
+  if (id === 'pnl') loadPnlPage();
 }
 
 function rpTab(id, btn) {
@@ -1197,6 +1226,53 @@ function signalCard(s) {
     </div>
     <div class="sc-bar"><div class="sc-bar-fill" style="width:${score}%"></div></div>
   </div>`;
+}
+
+async function loadPnlPage() {
+  const { data: trades, error } = await sb.from('trades_ejecutados').select('*').order('close_time', { ascending: true });
+  if (error) { document.getElementById('pnl-table').innerHTML = '<div style="color:var(--red)">Error: ' + error.message + '</div>'; return; }
+  if (!trades || !trades.length) { document.getElementById('pnl-table').innerHTML = '<div style="color:var(--dim)">Aún no hay trades sincronizados.</div>'; return; }
+
+  const wins = trades.filter(t => +t.profit_neto > 0);
+  const losses = trades.filter(t => +t.profit_neto <= 0);
+  const total = trades.reduce((s, t) => s + (+t.profit_neto), 0);
+  const grossWin = wins.reduce((s, t) => s + (+t.profit_neto), 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + (+t.profit_neto), 0));
+  const wr = (wins.length / trades.length) * 100;
+  const pf = grossLoss === 0 ? grossWin : grossWin / grossLoss;
+  const avgWin = wins.length ? grossWin / wins.length : 0;
+  const avgLoss = losses.length ? grossLoss / losses.length : 0;
+
+  let equity = 0, peak = 0, maxDD = 0;
+  const pts = trades.map(t => { equity += (+t.profit_neto); peak = Math.max(peak, equity); maxDD = Math.max(maxDD, peak - equity); return equity; });
+
+  document.getElementById('pnl-total').textContent = (total >= 0 ? '+$' : '-$') + Math.abs(total).toFixed(2);
+  document.getElementById('pnl-total').style.color = total >= 0 ? 'var(--green)' : 'var(--red)';
+  const todayStr = new Date().toDateString();
+  const todayTrades = trades.filter(t => new Date(t.close_time).toDateString() === todayStr);
+  const todayPnl = todayTrades.reduce((s, t) => s + (+t.profit_neto), 0);
+  document.getElementById('pnl-today').textContent = `Hoy: ${todayPnl >= 0 ? '+' : ''}$${todayPnl.toFixed(2)} (${todayTrades.length} trades) · Total: ${trades.length} trades`;
+  document.getElementById('pnl-wr').textContent = wr.toFixed(1) + '%';
+  document.getElementById('pnl-wr').style.color = wr >= 50 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('pnl-pf').textContent = pf.toFixed(2);
+  document.getElementById('pnl-avgwin').textContent = '$' + avgWin.toFixed(2);
+  document.getElementById('pnl-avgloss').textContent = '$' + avgLoss.toFixed(2);
+  document.getElementById('pnl-dd').textContent = '$' + maxDD.toFixed(2);
+
+  const w = 900, h = 120, min = Math.min(0, ...pts), max = Math.max(0, ...pts);
+  const range = (max - min) || 1;
+  const path = pts.map((v, i) => `${(i / (pts.length - 1 || 1)) * w},${h - ((v - min) / range) * h}`).join(' ');
+  document.getElementById('pnl-curve').innerHTML = `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:120px" preserveAspectRatio="none"><polyline points="${path}" fill="none" stroke="var(--green)" stroke-width="2"/></svg>`;
+
+  document.getElementById('pnl-table').innerHTML = trades.slice().reverse().slice(0, 25).map(t => {
+    const p = +t.profit_neto;
+    const time = new Date(t.close_time).toLocaleString('es-DO', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--b1)">
+      <div><span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:${t.tipo === 'BUY' ? 'rgba(34,197,94,.15)' : 'rgba(239,68,68,.15)'};color:${t.tipo === 'BUY' ? 'var(--green)' : 'var(--red)'}">${t.tipo}</span>
+      <span style="margin-left:8px;color:var(--muted)">${time}</span></div>
+      <div style="font-family:var(--mono);font-weight:600;color:${p >= 0 ? 'var(--green)' : 'var(--red)'}">${p >= 0 ? '+' : ''}$${p.toFixed(2)}</div>
+    </div>`;
+  }).join('');
 }
 
 // ── CHECKLIST ──
