@@ -7,12 +7,13 @@ TradingProEA - Execution Engine
 
 Reglas:
 - Score minimo: 75
-- Lotaje dinamico: se calcula segun balance real y % de riesgo (position_sizing.py)
+- Lotaje: FIJO por defecto (ver USE_FIXED_LOT/FIXED_LOT_SIZE), o dinamico
+  segun balance real y % de riesgo (position_sizing.py) si USE_FIXED_LOT=false
 - Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
 - Maximo 2 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
-- Maximo 3 operaciones por dia
+- Maximo 6 operaciones por dia (configurable via MAX_DAILY en .env)
 - Solo ejecuta estrategias permitidas
 - Notifica a Telegram al abrir
 
@@ -73,8 +74,15 @@ MT5_SYMBOL = os.getenv("MT5_SYMBOL", "GOLD")
 # ─── PARAMETROS DEL BOT ───────────────────────────────────────
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # % del balance arriesgado por operacion
 LOT_SIZE_FALLBACK = 0.02  # solo se usa si el calculo dinamico falla (ver execute_order)
+
+# ── Lote fijo (opcional) ──
+# Si USE_FIXED_LOT=true, el bot ignora el calculo dinamico por % de riesgo
+# y usa siempre FIXED_LOT_SIZE. Poner USE_FIXED_LOT=false para volver al
+# calculo dinamico basado en RISK_PERCENT.
+USE_FIXED_LOT = os.getenv("USE_FIXED_LOT", "false").lower() == "true"
+FIXED_LOT_SIZE = float(os.getenv("FIXED_LOT_SIZE", "0.02"))
 MIN_SCORE = 75
-MAX_DAILY = 3
+MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
 MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas
 SL_EXTRA_PTS = 20
 MAGIC_NUMBER = 20260601
@@ -404,27 +412,32 @@ def execute_order(signal):
     price = ask if signal_type == "BUY" else bid
 
     account = mt5.account_info()
-    lote, detalle = calculate_lot_size(
-        mt5=mt5,
-        symbol=MT5_SYMBOL,
-        entry_price=price,
-        stop_loss=sl,
-        balance=account.balance if account else 0,
-        risk_percent=RISK_PERCENT,
-    )
 
-    if lote is None:
-        print(f"  [RIESGO] No se pudo calcular lote dinamico: {detalle}")
-        print(f"  [RIESGO] Usando lote de respaldo: {LOT_SIZE_FALLBACK}")
-        lote = LOT_SIZE_FALLBACK
+    if USE_FIXED_LOT:
+        lote = FIXED_LOT_SIZE
+        print(f"  [RIESGO] Lote fijo activado: {lote} (USE_FIXED_LOT=true)")
     else:
-        print(
-            f"  [RIESGO] Balance: ${detalle['balance']} | "
-            f"Riesgo: {detalle['risk_percent']}% (${detalle['riesgo_dinero']}) | "
-            f"SL: {detalle['distancia_stop_pts']} pts | Lote: {lote}"
+        lote, detalle = calculate_lot_size(
+            mt5=mt5,
+            symbol=MT5_SYMBOL,
+            entry_price=price,
+            stop_loss=sl,
+            balance=account.balance if account else 0,
+            risk_percent=RISK_PERCENT,
         )
-        if "aviso" in detalle:
-            print(f"  [RIESGO] AVISO: {detalle['aviso']}")
+
+        if lote is None:
+            print(f"  [RIESGO] No se pudo calcular lote dinamico: {detalle}")
+            print(f"  [RIESGO] Usando lote de respaldo: {LOT_SIZE_FALLBACK}")
+            lote = LOT_SIZE_FALLBACK
+        else:
+            print(
+                f"  [RIESGO] Balance: ${detalle['balance']} | "
+                f"Riesgo: {detalle['risk_percent']}% (${detalle['riesgo_dinero']}) | "
+                f"SL: {detalle['distancia_stop_pts']} pts | Lote: {lote}"
+            )
+            if "aviso" in detalle:
+                print(f"  [RIESGO] AVISO: {detalle['aviso']}")
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -609,7 +622,10 @@ def main():
     print(f"  BOT ENGINE - TradingProEA - {now_str}")
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Simbolo MT5: {MT5_SYMBOL}")
-    print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
+    if USE_FIXED_LOT:
+        print(f"  Lote: FIJO {FIXED_LOT_SIZE} (USE_FIXED_LOT=true) | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
+    else:
+        print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
