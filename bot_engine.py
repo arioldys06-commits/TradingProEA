@@ -20,7 +20,19 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
-CAMBIOS EN ESTA VERSION (parche de diagnostico + robustez de notificaciones):
+CAMBIOS EN ESTA VERSION (fix: auto-limpieza de señales vencidas):
+- Antes, cuando una señal PENDING se descartaba por vigencia (mas de
+  MAX_SIGNAL_AGE_MINUTES o con el precio ya movido), el bot solo la
+  ignoraba EN MEMORIA (imprimia "[VIGENCIA] ... descartada" y seguia).
+  Nunca actualizaba su estado en Supabase, asi que la señal se quedaba
+  PENDING para siempre y se volvia a revisar (y descartar) en cada ciclo,
+  acumulandose sin limite.
+- Ahora, apenas se detecta que una señal esta vencida, se marca como
+  "EXPIRED" en Supabase de una vez (misma funcion update_signal_status
+  que ya se usaba para FAILED/EXECUTING). Asi la cola de PENDING se
+  autolimpia sola y no vuelve a aparecer en la siguiente consulta.
+
+CAMBIOS EN VERSION ANTERIOR (parche de diagnostico + robustez de notificaciones):
 - Cuando una orden falla (order_send devuelve None o retcode != DONE), ahora
   se captura el motivo exacto (retcode, comment, last_error de MT5) y:
     1. se guarda en bot_errors.log (no se pierde aunque cierres la consola)
@@ -72,18 +84,10 @@ ERROR_LOG_FILE = "bot_errors.log"  # NUEVO: guarda el motivo real de cada fallo 
 LOOP_INTERVAL = int(os.getenv("BOT_LOOP_INTERVAL", "60"))  # segundos entre cada chequeo
 
 # ── Filtro de vigencia (anti señal-vieja) ──
-# Si una señal PENDING lleva mas de esto sin ejecutarse (ej: porque el bot
-# estuvo apagado, o result_tracker no la cerro a tiempo), se descarta en
-# vez de ejecutarla con SL/TP calculados para un precio que ya no existe.
 MAX_SIGNAL_AGE_MINUTES = 10
-# Si el precio actual se alejo mas de este % de la distancia original al SL,
-# la señal tambien se descarta aunque este "fresca" en minutos (movimiento
-# de mercado grande = el setup ya no es el mismo).
 MAX_PRICE_DRIFT_RATIO = 0.6
 # ──────────────────────────────────────────────────────────────
 
-# Estrategias autorizadas para ejecutar en MT5.
-# Incluye las estrategias viejas y las nuevas que genera signal_engine.py.
 ALLOWED_STRATEGIES = [
     "Scalping M5",
     "Scalping M1",
@@ -91,14 +95,10 @@ ALLOWED_STRATEGIES = [
     "Ruptura y confirmación",
     "Scalping M5 Engine",
     "H1 Liquidity Engulfing CHOCH",
-
-    # Estrategias actuales del signal_engine.py
     "Scalping M5 SMC",
     "Killzone Breakout",
     "FVG Fill M5",
     "EMA Pullback M5",
-
-    # Nuevo motor AI
     "TradingPro AI Elite",
 ]
 
@@ -113,13 +113,6 @@ def headers():
 
 
 def send_telegram(message, intentos=3):
-    """
-    NUEVO: reintenta hasta `intentos` veces (con pequeña espera entre cada uno)
-    antes de rendirse. Si TODOS los intentos fallan, el mensaje completo se
-    guarda en bot_errors.log para que nunca se pierda en silencio — antes,
-    un solo fallo de red hacia que el aviso (ej. "ORDEN ABIERTA") desapareciera
-    para siempre sin dejar rastro.
-    """
     if not TELEGRAM_TOKEN:
         return False
 
@@ -141,7 +134,6 @@ def send_telegram(message, intentos=3):
         if intento < intentos:
             time.sleep(2)
 
-    # Todos los intentos fallaron: no dejar que el mensaje se pierda en silencio.
     log_error_to_file(
         f"TELEGRAM NO ENVIADO tras {intentos} intentos. Error: {ultimo_error} | Mensaje: {message}"
     )
@@ -149,7 +141,6 @@ def send_telegram(message, intentos=3):
 
 
 def log_error_to_file(message):
-    """NUEVO: guarda el error en disco para que no se pierda si se cierra la consola."""
     try:
         with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
@@ -202,11 +193,6 @@ def connect_mt5():
 
 
 def get_daily_losses():
-    """
-    Cuenta perdidas reales de HOY para nuestras operaciones (magic number),
-    leyendo el historial de MT5 directamente — no depende de que
-    result_tracker.py haya corrido ni de la tabla signals de Supabase.
-    """
     today_start = datetime.combine(date.today(), datetime.min.time())
     deals = mt5.history_deals_get(today_start, datetime.now())
 
@@ -248,10 +234,6 @@ def get_open_positions():
 
 
 def is_signal_stale(signal, current_price):
-    """
-    Rechaza señales viejas o cuyo precio ya se movio demasiado.
-    Devuelve (True, razon) si la señal debe descartarse.
-    """
     created_at_raw = signal.get("created_at")
     if not created_at_raw:
         return True, "sin created_at"
@@ -326,6 +308,10 @@ def get_pending_signals(current_price=None):
         is_stale, reason = is_signal_stale(signal, current_price)
         if is_stale:
             stale.append((signal.get("id", "")[:8], reason))
+            # FIX: antes esto solo se ignoraba en memoria y la señal se
+            # quedaba PENDING para siempre en Supabase. Ahora se marca
+            # EXPIRED de una vez para que la cola se autolimpie sola.
+            update_signal_status(signal["id"], "EXPIRED")
             continue
 
         filtered.append(signal)
@@ -339,7 +325,7 @@ def get_pending_signals(current_price=None):
 
     if stale:
         for sig_id, reason in stale:
-            print(f"  [VIGENCIA] Señal {sig_id} descartada — {reason}")
+            print(f"  [VIGENCIA] Señal {sig_id} descartada y marcada EXPIRED — {reason}")
 
     return filtered
 
@@ -359,8 +345,6 @@ def calc_anti_hunt_sl(signal_type, original_sl):
     if symbol is None:
         return round(original_sl, 2)
 
-    # En XAUUSD muchos brokers usan point = 0.01.
-    # Multiplicamos por 10 para mantener el comportamiento original.
     extra = SL_EXTRA_PTS * symbol.point * 10
 
     if signal_type == "BUY":
@@ -401,13 +385,6 @@ def validate_signal(signal):
 
 
 def execute_order(signal):
-    """
-    Devuelve una tupla (result, error_detail):
-      - Si la orden se ejecuta bien: (result_de_mt5, None)
-      - Si falla en cualquier punto: (None, "descripcion exacta del motivo")
-    Antes esta funcion devolvia solo `result` (o None) y el motivo real del
-    fallo se perdia si no estabas viendo la consola en el momento exacto.
-    """
     is_valid, reason = validate_signal(signal)
     if not is_valid:
         print(f"  Señal invalida: {reason}")
@@ -426,9 +403,6 @@ def execute_order(signal):
     order_type = mt5.ORDER_TYPE_BUY if signal_type == "BUY" else mt5.ORDER_TYPE_SELL
     price = ask if signal_type == "BUY" else bid
 
-    # ── Lotaje dinamico segun balance real y % de riesgo ──
-    # Usa el SL YA ajustado (anti-hunt) para que el riesgo calculado
-    # sea el riesgo real de la operacion, no el de la señal original.
     account = mt5.account_info()
     lote, detalle = calculate_lot_size(
         mt5=mt5,
@@ -492,13 +466,6 @@ def execute_order(signal):
 
 
 def update_signal_status(sig_id, status, intentos=3):
-    """
-    NUEVO: reintenta hasta `intentos` veces antes de rendirse. Si TODOS los
-    intentos fallan (ej. corte de red momentaneo), el detalle se guarda en
-    bot_errors.log en vez de perderse — antes, una señal podia ejecutarse
-    de verdad en MT5 pero quedarse en PENDING para siempre en Supabase si
-    esta llamada fallaba justo en ese instante.
-    """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
 
@@ -530,12 +497,10 @@ def update_signal_status(sig_id, status, intentos=3):
     return False
 
 
-# Evita mandar el aviso de "limite de perdidas" mas de una vez por dia.
 _loss_alert_sent_date = None
 
 
 def run_cycle():
-    """Un solo chequeo: busca señal vigente y ejecuta si corresponde. No conecta ni desconecta MT5."""
     global _loss_alert_sent_date
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -629,7 +594,6 @@ def run_cycle():
 
 
 def ensure_mt5_connected():
-    """Verifica que MT5 siga conectado; si se cayo, intenta reconectar."""
     account = mt5.account_info()
     if account is not None:
         return account
