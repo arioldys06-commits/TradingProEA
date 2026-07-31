@@ -884,9 +884,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 </div>
 
       <div id="page-pnl" class="page" style="display:none">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
     <div class="page-title" style="margin:0">P&amp;L Real — Trades ejecutados</div>
-    <button onclick="loadPnlPage()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Actualizar</button>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <div id="pnl-filters" style="display:flex;gap:6px"></div>
+      <button onclick="loadPnlPage()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Actualizar</button>
+    </div>
   </div>
 
   <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:18px;margin-bottom:16px">
@@ -1228,10 +1231,63 @@ function signalCard(s) {
   </div>`;
 }
 
+let pnlAllTrades = [];
+let pnlFilterDays = 0; // 0 = todos
+
 async function loadPnlPage() {
   const { data: trades, error } = await sb.from('trades_ejecutados').select('*').order('close_time', { ascending: true });
   if (error) { document.getElementById('pnl-table').innerHTML = '<div style="color:var(--red)">Error: ' + error.message + '</div>'; return; }
-  if (!trades || !trades.length) { document.getElementById('pnl-table').innerHTML = '<div style="color:var(--dim)">Aún no hay trades sincronizados.</div>'; return; }
+  pnlAllTrades = trades || [];
+  renderPnlFilters();
+  renderPnlPage();
+}
+
+function renderPnlFilters() {
+  const opts = [
+    { label: 'Hoy', days: 1 },
+    { label: 'Ayer', days: 'yesterday' },
+    { label: '7 días', days: 7 },
+    { label: '30 días', days: 30 },
+    { label: 'Todos', days: 0 },
+  ];
+  document.getElementById('pnl-filters').innerHTML = opts.map(o => `
+    <button onclick="setPnlFilter('${o.days}')" id="pnlf-${o.days}" style="background:${pnlFilterDays == o.days ? 'var(--gold)' : 'var(--bg1)'};color:${pnlFilterDays == o.days ? '#000' : 'var(--muted)'};border:1px solid var(--b1);border-radius:var(--r);padding:5px 11px;font-size:11px;font-weight:600;cursor:pointer">${o.label}</button>
+  `).join('');
+}
+
+function setPnlFilter(days) {
+  pnlFilterDays = days === 'yesterday' ? 'yesterday' : +days;
+  renderPnlFilters();
+  renderPnlPage();
+}
+
+function filterTradesByDays(trades, days) {
+  if (!days || days === 0) return trades;
+  const now = new Date();
+  if (days === 'yesterday') {
+    const y = new Date(now); y.setDate(y.getDate() - 1);
+    const yStr = y.toDateString();
+    return trades.filter(t => new Date(t.close_time).toDateString() === yStr);
+  }
+  const cutoff = new Date(now);
+  cutoff.setDate(cutoff.getDate() - days);
+  return trades.filter(t => new Date(t.close_time) >= cutoff);
+}
+
+function renderPnlPage() {
+  const trades = filterTradesByDays(pnlAllTrades, pnlFilterDays);
+  if (!trades.length) {
+    document.getElementById('pnl-total').textContent = '$0.00';
+    document.getElementById('pnl-today').textContent = 'Sin trades en este rango.';
+    document.getElementById('pnl-curve').innerHTML = '';
+    document.getElementById('pnl-wr').textContent = '-';
+    document.getElementById('pnl-pf').textContent = '-';
+    document.getElementById('pnl-avgwin').textContent = '-';
+    document.getElementById('pnl-avgloss').textContent = '-';
+    document.getElementById('pnl-dd').textContent = '-';
+    document.getElementById('pnl-table').innerHTML = '<div style="color:var(--dim)">Sin trades en este rango.</div>';
+    return;
+  }
 
   const wins = trades.filter(t => +t.profit_neto > 0);
   const losses = trades.filter(t => +t.profit_neto <= 0);
@@ -1248,10 +1304,7 @@ async function loadPnlPage() {
 
   document.getElementById('pnl-total').textContent = (total >= 0 ? '+$' : '-$') + Math.abs(total).toFixed(2);
   document.getElementById('pnl-total').style.color = total >= 0 ? 'var(--green)' : 'var(--red)';
-  const todayStr = new Date().toDateString();
-  const todayTrades = trades.filter(t => new Date(t.close_time).toDateString() === todayStr);
-  const todayPnl = todayTrades.reduce((s, t) => s + (+t.profit_neto), 0);
-  document.getElementById('pnl-today').textContent = `Hoy: ${todayPnl >= 0 ? '+' : ''}$${todayPnl.toFixed(2)} (${todayTrades.length} trades) · Total: ${trades.length} trades`;
+  document.getElementById('pnl-today').textContent = `${trades.length} trades en este rango`;
   document.getElementById('pnl-wr').textContent = wr.toFixed(1) + '%';
   document.getElementById('pnl-wr').style.color = wr >= 50 ? 'var(--green)' : 'var(--red)';
   document.getElementById('pnl-pf').textContent = pf.toFixed(2);
