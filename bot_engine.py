@@ -171,12 +171,37 @@ def get_daily_count():
     return 0
 
 
-def increment_daily_count():
+def increment_daily_count(intentos=3):
+    """
+    NUEVO: reintenta hasta `intentos` veces si el archivo esta bloqueado un
+    instante (ej. antivirus o OneDrive sincronizando la carpeta justo en ese
+    momento — error tipico en Windows: PermissionError / Errno 13).
+    Antes, un solo bloqueo pasajero tumbaba toda la funcion con una excepcion
+    sin capturar, cortando el ciclo ANTES de imprimir "ORDEN EJECUTADA" y
+    ANTES de enviar el aviso de Telegram — aunque la orden ya se hubiera
+    abierto bien en MT5.
+    Si tras todos los intentos sigue sin poder escribir, se registra en
+    bot_errors.log y se devuelve el conteo de todos modos (sin persistir),
+    para que el resto del ciclo (impresion + Telegram) siga su curso normal.
+    """
     count = get_daily_count() + 1
+    ultimo_error = None
 
-    with open(DAILY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"{date.today()},{count}")
+    for intento in range(1, intentos + 1):
+        try:
+            with open(DAILY_FILE, "w", encoding="utf-8") as f:
+                f.write(f"{date.today()},{count}")
+            return count
+        except Exception as e:
+            ultimo_error = str(e)
+            print(f"  [DAILY_COUNT] Intento {intento}/{intentos} fallo al escribir {DAILY_FILE}: {ultimo_error}")
+            if intento < intentos:
+                time.sleep(1)
 
+    log_error_to_file(
+        f"NO SE PUDO ESCRIBIR {DAILY_FILE} tras {intentos} intentos. "
+        f"Error: {ultimo_error} | Conteo no persistido (se uso {count} solo en memoria)."
+    )
     return count
 
 
