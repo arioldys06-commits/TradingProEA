@@ -68,16 +68,53 @@ def send_telegram(message):
     except:
         return False
 
+ERROR_LOG_FILE = "tracker_errors.log"
+
+def log_error_to_file(message):
+    try:
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception:
+        pass  # si tampoco se puede escribir el log, no hay mas remedio que seguir sin registrar
+
 def load_breakeven_signals():
     if os.path.exists(BREAKEVEN_FILE):
-        with open(BREAKEVEN_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
+        try:
+            with open(BREAKEVEN_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        except Exception as e:
+            print(f"  [BREAKEVEN] No se pudo leer {BREAKEVEN_FILE}: {e}")
+            return set()
     return set()
 
-def save_breakeven_signals(sig_set):
-    with open(BREAKEVEN_FILE, "w") as f:
-        for s in list(sig_set)[-500:]:
-            f.write(s + "\n")
+def save_breakeven_signals(sig_set, intentos=3):
+    """
+    Guarda la lista de señales en breakeven. Reintenta hasta `intentos`
+    veces si el archivo esta bloqueado momentaneamente (OneDrive/WPSDrive
+    sincronizando, antivirus, etc). Si aun asi falla, NO relanza la
+    excepcion: solo lo registra en tracker_errors.log y sigue el ciclo.
+    Antes, un fallo aqui interrumpia run_cycle() a mitad de camino y
+    dejaba sin revisar el resto de las señales pendientes de ese ciclo.
+    """
+    ultimo_error = None
+    for intento in range(1, intentos + 1):
+        try:
+            with open(BREAKEVEN_FILE, "w") as f:
+                for s in list(sig_set)[-500:]:
+                    f.write(s + "\n")
+            return True
+        except Exception as e:
+            ultimo_error = str(e)
+            print(f"  [BREAKEVEN] Intento {intento}/{intentos} fallo al escribir {BREAKEVEN_FILE}: {ultimo_error}")
+            if intento < intentos:
+                time.sleep(1)
+
+    log_error_to_file(
+        f"NO SE PUDO ESCRIBIR {BREAKEVEN_FILE} tras {intentos} intentos. "
+        f"Error: {ultimo_error} | El breakeven en Supabase SI se aplico, "
+        f"solo no quedo registrado localmente para el filtro de duplicados."
+    )
+    return False
 
 def telegram_result(signal, result, exit_price, pnl_pts):
     emoji   = "✅" if result == "WIN" else "❌"
