@@ -226,20 +226,36 @@ def get_current_price():
     return float(r.json()[0]["close"])
 
 def update_signal(sig_id, result, result_price):
+    """
+    Marca la señal como CLOSED con su resultado (WIN/LOSS).
+    NOTA: la tabla 'signals' no tiene columnas 'result_price' ni
+    'result_at' (solo existen id, created_at, instrument, timeframe,
+    signal_type, strategy, confidence, entry_price, stop_loss,
+    take_profit_1, take_profit_2, status, result). Antes se intentaba
+    escribir esas columnas inexistentes, Supabase rechazaba el PATCH
+    completo (400), y como no se revisaba el status code, el error
+    quedaba en silencio: la señal nunca pasaba a CLOSED de verdad,
+    aunque en consola pareciera que sí. result_price se recibe igual
+    (se usa en el mensaje de Telegram) pero ya no se intenta guardar
+    en una columna que no existe.
+    """
     try:
-        requests.patch(
+        r = requests.patch(
             f"{SUPABASE_URL}/rest/v1/signals?id=eq.{sig_id}",
             headers=headers(),
             json={
-                "result":       result,
-                "result_price": result_price,
-                "result_at":    datetime.now(timezone.utc).isoformat(),
-                "status":       "CLOSED",
+                "result": result,
+                "status": "CLOSED",
             },
             timeout=15,
         )
+        if r.status_code >= 400:
+            print(f"  [ERROR] update_signal {sig_id[:8]} -> {r.status_code}: {r.text}")
+            return False
+        return True
     except Exception as e:
         print(f"  Error update_signal: {e}")
+        return False
 
 def update_signal_sl(sig_id, new_sl):
     try:
