@@ -361,6 +361,126 @@ def retest_reacciono_o_atraveso(candles, fvg, max_velas=3):
             return False
     return True
 
+# ── CONFLUENCIAS PARA SCALPING M5 SMC — NUEVO ──────────────────
+# 5 criterios adicionales de confluencia para reforzar la estrategia 1
+# (Sweep + BOS/CHoCH): Order Block, FVG cercano, momentum del rechazo
+# en la vela de sweep, madurez de la tendencia en TFs superiores, y
+# zona de liquidez de sesion (rango asiatico/pre-London).
+
+def detect_last_order_block(candles, direction, lookback=30):
+    """
+    Encuentra el ultimo Order Block valido: la ultima vela opuesta a la
+    direccion buscada, justo antes de un movimiento impulsivo fuerte
+    (cuerpo >=60% del rango) que se produjo en esa direccion.
+    BUY  -> OB alcista: vela bajista antes de un impulso alcista fuerte.
+    SELL -> OB bajista: vela alcista antes de un impulso bajista fuerte.
+    Devuelve {"top", "bottom", "idx"} o None si no se encuentra.
+    """
+    start = max(0, len(candles) - lookback)
+    for i in range(len(candles) - 2, start, -1):
+        impulso = candles[i]
+        prev    = candles[i - 1]
+        rango   = impulso["H"] - impulso["L"]
+        if rango == 0:
+            continue
+        body_ratio = abs(impulso["C"] - impulso["O"]) / rango
+        if body_ratio < 0.60:
+            continue
+
+        if direction == "BUY" and impulso["C"] > impulso["O"] and prev["C"] < prev["O"]:
+            return {"top": prev["H"], "bottom": prev["L"], "idx": i - 1}
+        if direction == "SELL" and impulso["C"] < impulso["O"] and prev["C"] > prev["O"]:
+            return {"top": prev["H"], "bottom": prev["L"], "idx": i - 1}
+
+    return None
+
+
+def price_near_ob(price, ob, atr, tolerance_atr=0.3):
+    """Comprueba si el precio actual esta dentro (o cerca) de la zona del OB."""
+    if not ob or atr <= 0:
+        return False
+    buffer = atr * tolerance_atr
+    return (ob["bottom"] - buffer) <= price <= (ob["top"] + buffer)
+
+
+def fvg_confluencia_cercana(candles, direction, current_price, atr, lookback=15):
+    """
+    Busca si existe un FVG reciente en la misma direccion del setup,
+    cerca del precio actual. Es la secuencia clasica SMC: sweep -> BOS
+    -> FVG -> entrada. Si el FVG ya esta ahi, refuerza la confluencia.
+    """
+    if atr <= 0:
+        return False
+    recientes = candles[-lookback:]
+    fvgs = detect_fvgs(recientes)
+    for f in fvgs:
+        if f["type"] != direction:
+            continue
+        if abs(current_price - f["mid"]) <= atr * 1.5:
+            return True
+    return False
+
+
+def sweep_rejection_fuerte(vela, direction):
+    """
+    Valida que la vela que hizo el sweep tenga un rechazo fuerte: mecha
+    larga en la direccion barrida y cierre claramente alejado del
+    extremo. Un sweep con mecha corta es mas sospechoso de ser ruido.
+    BUY  -> sweep de un low -> se espera mecha inferior larga (>=35% del rango)
+    SELL -> sweep de un high -> se espera mecha superior larga (>=35% del rango)
+    """
+    rango = vela["H"] - vela["L"]
+    if rango == 0:
+        return False
+    if direction == "BUY":
+        mecha_inf = min(vela["C"], vela["O"]) - vela["L"]
+        return (mecha_inf / rango) >= 0.35
+    else:
+        mecha_sup = vela["H"] - max(vela["C"], vela["O"])
+        return (mecha_sup / rango) >= 0.35
+
+
+def tendencia_madura(candles, period_fast=9, period_slow=20):
+    """
+    Compara la separacion actual entre EMA9/EMA20 contra la separacion
+    de hace 3 velas. Si la separacion se mantiene o crece, la tendencia
+    de ese timeframe esta establecida (no es un cruce recien formado,
+    mas propenso a fakeout). Devuelve True/False, o None si faltan datos.
+    """
+    closes = [c["C"] for c in candles]
+    if len(closes) < period_slow + 5:
+        return None
+    e9_now  = ema(closes, period_fast)
+    e20_now = ema(closes, period_slow)
+    e9_prev  = ema(closes[:-3], period_fast)
+    e20_prev = ema(closes[:-3], period_slow)
+    if not all([e9_now, e20_now, e9_prev, e20_prev]):
+        return None
+    sep_now  = abs(e9_now - e20_now)
+    sep_prev = abs(e9_prev - e20_prev)
+    return sep_now >= sep_prev
+
+
+def liquidez_sesion_confluencia(candles, direction, current_price, lookback=40):
+    """
+    Compara el precio actual contra el rango reciente (aprox. sesion
+    asiatica / pre-London) como zona de liquidez de referencia. Los
+    sweeps que ocurren cerca del limite de ese rango suelen tener mas
+    peso, porque ahi es donde se acumulan stops de retail.
+    """
+    ventana = candles[-lookback:]
+    if len(ventana) < 10:
+        return False
+    rango_high = max(c["H"] for c in ventana)
+    rango_low  = min(c["L"] for c in ventana)
+    tolerancia = (rango_high - rango_low) * 0.15
+    if tolerancia <= 0:
+        return False
+    if direction == "BUY":
+        return abs(current_price - rango_low) <= tolerancia
+    else:
+        return abs(current_price - rango_high) <= tolerancia
+
 # ── OTE — OPTIMAL TRADE ENTRY (ICT Fibonacci) ─────────────────
 # El OTE es el retroceso del 62%-79% del ultimo swing
 # Es la zona donde los institucionales reentran despues de un BOS/CHoCH
@@ -772,7 +892,47 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
             if price_in_ote(last["C"], ote_sell):
                 reasons.append(f"OTE {ote_sell['golden']:.2f} (+{ote_bonus}pts)")
 
-    if not sig_type or score < MIN_SCORE:
+    if not sig_type:
+        return None
+
+    # ── NUEVO: confluencias adicionales para Scalping M5 SMC ──
+    ventana_scalp = c5[-40:]
+
+    # 1. Order Block — el sweep deberia ocurrir cerca de un OB de mayor jerarquia
+    ob = detect_last_order_block(ventana_scalp, sig_type)
+    if price_near_ob(last["C"], ob, atr):
+        score += 15
+        reasons.append("Order Block confirmado")
+
+    # 2. FVG cercano en la misma direccion (secuencia sweep -> BOS -> FVG)
+    if fvg_confluencia_cercana(ventana_scalp, sig_type, last["C"], atr):
+        score += 10
+        reasons.append("FVG cercano confluencia")
+
+    # 3. Momentum del rechazo en la vela de sweep
+    if sweep_rejection_fuerte(last, sig_type):
+        score += 10
+        reasons.append("Rechazo fuerte en sweep")
+    else:
+        score -= 10
+        reasons.append("Sweep debil (mecha corta)")
+
+    # 4. Madurez de la tendencia en M30/H1 — evita cruces de EMA recien formados
+    madura_m30 = tendencia_madura(c30)
+    madura_h1  = tendencia_madura(ch1)
+    if madura_m30:
+        score += 5
+        reasons.append("Tendencia M30 establecida")
+    if madura_h1:
+        score += 5
+        reasons.append("Tendencia H1 establecida")
+
+    # 5. Zona de liquidez de sesion (rango asiatico/pre-London)
+    if liquidez_sesion_confluencia(ventana_scalp, sig_type, last["C"]):
+        score += 10
+        reasons.append("Zona de liquidez de sesion")
+
+    if score < MIN_SCORE:
         return None
 
     # ── Filtro confirmación de vela (Imagen 1) ──
@@ -1296,7 +1456,7 @@ def main():
     print(f"  Cooldown por estrategia: {SIGNAL_COOLDOWN}s")
     print(f"  Estrategias activas:")
     print(f"    AI. TradingPro AI Elite (Confluence Engine)")
-    print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib)")
+    print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib + OB/FVG/liquidez)")
     print(f"    2. Killzone Breakout (London/NY)")
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
     print(f"    4. EMA Pullback M5")
