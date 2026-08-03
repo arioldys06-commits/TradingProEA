@@ -24,7 +24,7 @@ Bonus Morfología de Vela (probabilidad estadística):
   - Pin Bar (mecha >1.5x cuerpo): +10 pts  → 80% probabilidad
   - Mecha opuesta dominante:      -10 pts  → 50/50 penalizar
 
-Filtro de correlación con el dolar (DXY sintetico) — NUEVO:
+Filtro de correlación con el dolar (DXY sintetico):
   - Este broker no expone un simbolo nativo de indice del dolar (DXY),
     asi que se construye uno sintetico a partir de 4 pares que si estan
     disponibles: EURUSD, GBPUSD, USDCHF, USDJPY.
@@ -40,6 +40,20 @@ Filtro de correlación con el dolar (DXY sintetico) — NUEVO:
   - Esto es un bono/penalizacion adicional, no un filtro duro: una señal
     puede seguir publicandose aunque el dolar no confirme, si el resto
     de las condiciones ya le dan score suficiente.
+
+Filtro Anti-Trampa Institucional del FVG — NUEVO:
+  - Un FVG "trampa" es un gap que parece institucional pero en realidad
+    es ruido o manipulacion diseñada para atrapar retail.
+  - Se valida con 3 criterios sobre la estrategia FVG Fill M5:
+      1. Sweep de liquidez previo: ¿hubo un barrido de un swing high/low
+         justo antes de que se formara el FVG? (+15 si si, -10 si no)
+      2. Momentum de la vela de impulso: cuerpo dominante (>=70% del
+         rango) = flujo institucional real (+20). Cuerpo debil (<40%)
+         = sospechoso (-15). Tambien penaliza FVGs desproporcionados
+         vs el ATR (>2.5x ATR = posible spike de noticia, -15).
+      3. Reaccion al retest: si el precio, en las velas posteriores a
+         formarse el FVG, lo atraviesa por completo sin reaccionar,
+         la señal se descarta directamente (no solo resta puntos).
 
 Validador de Vigencia (filtro anti-manipulación):
   - Compara precio actual vs entrada original antes de publicar
@@ -87,7 +101,7 @@ MAX_DAILY        = 20    # Máximo señales por día (filtro anti-spam)
 LOOP_INTERVAL    = 30    # Segundos entre cada análisis
 SIGNAL_COOLDOWN  = 120   # 2 min mínimo entre señales de la misma estrategia
 
-# NUEVO: pares usados para construir el indice sintetico de fuerza del dolar.
+# Pares usados para construir el indice sintetico de fuerza del dolar.
 # Deben coincidir con los que data_engine.py sube a ohlc_candles.
 DOLLAR_PAIRS = ["EURUSD", "GBPUSD", "USDCHF", "USDJPY"]
 # EURUSD y GBPUSD son inversos al USD (par sube = USD se debilita).
@@ -251,6 +265,102 @@ def detect_fvgs(candles):
                           "mid": (a["L"] + c["H"]) / 2, "idx": i})
     return fvgs
 
+# ── FILTRO ANTI-TRAMPA INSTITUCIONAL DEL FVG — NUEVO ──────────
+# Un FVG "trampa" es un gap que parece institucional pero en realidad
+# es ruido o manipulacion. Se valida con 3 criterios: si hubo barrido
+# de liquidez antes de formarse, si la vela de impulso tiene cuerpo
+# dominante y tamano razonable vs ATR, y si el retest reacciona en vez
+# de atravesarlo de largo.
+
+def hubo_sweep_antes_del_fvg(candles, fvg, lookback=15):
+    """
+    Comprueba si, poco antes de formarse el FVG, hubo un barrido de
+    liquidez (mecha que rompe un swing high/low reciente y cierra de
+    vuelta adentro). Un FVG institucional real casi siempre viene
+    despues de cazar stops, no de la nada.
+    """
+    idx = fvg["idx"]
+    start = max(0, idx - lookback)
+    previas = candles[start:idx - 1]  # velas antes de la vela de impulso
+    if len(previas) < 5:
+        return False
+
+    highs, lows = detect_swing_hl(previas, lookback=2)
+    if not highs and not lows:
+        return False
+
+    impulso = candles[idx - 1]
+
+    if fvg["type"] == "BUY" and lows:
+        swing_l = min(l["price"] for l in lows[-2:])
+        if impulso["L"] < swing_l and impulso["C"] > swing_l:
+            return True
+
+    if fvg["type"] == "SELL" and highs:
+        swing_h = max(h["price"] for h in highs[-2:])
+        if impulso["H"] > swing_h and impulso["C"] < swing_h:
+            return True
+
+    return False
+
+
+def score_validez_fvg(candles, fvg, atr):
+    """
+    Evalua si un FVG parece institucional real o una trampa, mirando
+    la vela de impulso que lo creo (la del medio, indice fvg['idx']-1)
+    y el tamano del gap relativo al ATR.
+    Devuelve (score_ajuste, lista_de_razones).
+    """
+    score, reasons = 0, []
+    idx = fvg["idx"]
+    if idx < 1 or idx >= len(candles):
+        return 0, []
+
+    impulso = candles[idx - 1]
+    body    = abs(impulso["C"] - impulso["O"])
+    rango   = impulso["H"] - impulso["L"]
+    if rango == 0:
+        return 0, []
+    body_ratio = body / rango
+
+    # Vela de impulso con cuerpo dominante = flujo institucional real
+    if body_ratio >= 0.70:
+        score += 20; reasons.append(f"Impulso fuerte {body_ratio:.0%}")
+    elif body_ratio < 0.40:
+        score -= 15; reasons.append(f"Impulso debil {body_ratio:.0%} (sospechoso)")
+
+    # Tamano del FVG vs ATR — un gap gigante suele ser noticia/spike, no flujo ordenado
+    gap_size = fvg["top"] - fvg["bottom"]
+    if atr > 0:
+        ratio_atr = gap_size / atr
+        if ratio_atr > 2.5:
+            score -= 15; reasons.append(f"FVG anomalo {ratio_atr:.1f}x ATR")
+        elif 0.3 <= ratio_atr <= 1.5:
+            score += 10; reasons.append("FVG tamano normal")
+
+    return score, reasons
+
+
+def retest_reacciono_o_atraveso(candles, fvg, max_velas=3):
+    """
+    Desde que se formo el FVG, revisa las velas siguientes: si el
+    precio lo atraviesa por completo sin reaccion (cierre mas alla
+    del otro extremo) es trampa. Si rechaza dentro del gap, es valido.
+    Devuelve True (valido), False (trampa confirmada), o None (aun
+    sin suficientes velas para decidir).
+    """
+    idx = fvg["idx"]
+    posteriores = candles[idx:idx + max_velas + 1]
+    if not posteriores:
+        return None
+
+    for vela in posteriores:
+        if fvg["type"] == "BUY" and vela["C"] < fvg["bottom"]:
+            return False
+        if fvg["type"] == "SELL" and vela["C"] > fvg["top"]:
+            return False
+    return True
+
 # ── OTE — OPTIMAL TRADE ENTRY (ICT Fibonacci) ─────────────────
 # El OTE es el retroceso del 62%-79% del ultimo swing
 # Es la zona donde los institucionales reentran despues de un BOS/CHoCH
@@ -358,7 +468,7 @@ def score_morfologia_vela(candles, direccion):
             return -10, "Mecha inferior dominante (50/50)"
     return 0, ""
 
-# ── FILTRO DE CORRELACIÓN CON EL DOLAR (DXY sintetico) — NUEVO ───────
+# ── FILTRO DE CORRELACIÓN CON EL DOLAR (DXY sintetico) ────────
 # Este broker no expone un simbolo nativo de indice del dolar, asi que se
 # construye uno sintetico combinando la tendencia de 4 pares mayores.
 
@@ -677,7 +787,7 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -778,7 +888,7 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -809,6 +919,8 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
 # ════════════════════════════════════════════════════════════════
 # ESTRATEGIA 3 — FVG FILL M5
 # Detecta Fair Value Gaps recientes y espera que el precio regrese
+# Incluye filtro anti-trampa institucional (sweep previo, momentum
+# de la vela de impulso, tamano vs ATR, y reaccion en el retest)
 # ════════════════════════════════════════════════════════════════
 
 def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
@@ -830,7 +942,8 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     trend = "BUY" if e9 > e20 else "SELL"
 
     # Detectar FVGs en las últimas 40 velas
-    fvgs = detect_fvgs(c5[-40:])
+    ventana_fvg = c5[-40:]
+    fvgs = detect_fvgs(ventana_fvg)
     if not fvgs:
         return None
 
@@ -870,6 +983,25 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if trend == "SELL" and rsi > 40: score += 10; reasons.append(f"RSI {rsi}")
     score += 10; reasons.append("FVG institucional")
 
+    # ── Filtro anti-trampa institucional del FVG ──
+    fvg_sweep_ok  = hubo_sweep_antes_del_fvg(ventana_fvg, fvg)
+    fvg_bonus, fvg_reasons = score_validez_fvg(ventana_fvg, fvg, atr)
+    fvg_retest_ok = retest_reacciono_o_atraveso(ventana_fvg, fvg)
+
+    if fvg_retest_ok is False:
+        print(f"  [3] FVG Fill: {sig_type} descartado — precio atraveso el FVG sin reaccionar (trampa)")
+        return None
+
+    if fvg_sweep_ok:
+        score += 15
+        reasons.append("Sweep de liquidez previo al FVG")
+    else:
+        score -= 10
+        reasons.append("Sin sweep previo (FVG dudoso)")
+
+    score += fvg_bonus
+    reasons.extend(fvg_reasons)
+
     if score < MIN_SCORE:
         return None
 
@@ -885,7 +1017,7 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -1001,7 +1133,7 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── NUEVO: bono/penalizacion por correlacion con el dolar ──
+    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -1048,7 +1180,7 @@ def analyze():
     c30 = to_candles(rows_m30)
     ch1 = to_candles(rows_h1)
 
-    # NUEVO: tendencia del dolar (indice sintetico), una sola vez por ciclo
+    # Tendencia del dolar (indice sintetico), una sola vez por ciclo
     # y se pasa a las 4 estrategias — evita recalcularla 4 veces por ronda.
     dxy_trend = get_dxy_trend()
 
@@ -1166,10 +1298,11 @@ def main():
     print(f"    AI. TradingPro AI Elite (Confluence Engine)")
     print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib)")
     print(f"    2. Killzone Breakout (London/NY)")
-    print(f"    3. FVG Fill M5")
+    print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
     print(f"    4. EMA Pullback M5")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
+    print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1183,6 +1316,7 @@ def main():
             f"Score min: {MIN_SCORE} | Max diario: {MAX_DAILY}\n"
             f"Cooldown: {SIGNAL_COOLDOWN}s | Loop: {LOOP_INTERVAL}s\n"
             f"Filtro DXY sintetico activo ({', '.join(DOLLAR_PAIRS)})\n"
+            f"Filtro FVG anti-trampa activo\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
