@@ -1,7 +1,7 @@
 """
 result_tracker.py — V3
 ======================
-Revisa señales PENDING y actualiza WIN/LOSS comparando
+Revisa señales PENDING/EXECUTING y actualiza WIN/LOSS comparando
 con las velas reales de Supabase.
 
 Proyecto: qilvrvnwdtpbkcfwktqs (activo en dashboard)
@@ -17,10 +17,22 @@ CAMBIOS EN ESTA VERSION (V3 — desglose por estrategia):
     desglose por estrategia, ademas del resumen general.
   - Se mantiene 100% la logica original de cierre de señales
     (breakeven, WIN/LOSS, velas M5) — no se toco esa parte.
+
+FIX (esta version): get_pending_signals() solo buscaba señales con
+  status=PENDING. Pero bot_engine.py cambia el status a EXECUTING en
+  cuanto abre la orden real en MT5 — asi que, para cuando este script
+  corria, la señal ya habia dejado de ser PENDING y nunca se volvia a
+  revisar. Resultado: ninguna señal ejecutada llegaba jamas a CLOSED
+  con WIN/LOSS, y el desglose por estrategia se quedaba siempre vacio
+  aunque el codigo para calcularlo ya estuviera bien escrito.
+  Ahora el filtro incluye status en (PENDING, EXECUTING), asi que las
+  señales que ya se ejecutaron en MT5 tambien se siguen revisando
+  hasta que toquen SL o TP y puedan cerrarse correctamente.
 """
 
 import os
 import sys
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -33,6 +45,7 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 
 BREAKEVEN_FILE = "breakeven_signals.txt"
+LOOP_INTERVAL  = int(os.getenv("TRACKER_LOOP_INTERVAL", "60"))  # segundos entre cada revision
 
 def headers():
     return {
@@ -113,7 +126,7 @@ def telegram_daily_report(stats):
         f"POR ESTRATEGIA:",
     ]
 
-    # NUEVO: desglose por estrategia, ordenado de mejor a peor winrate
+    # Desglose por estrategia, ordenado de mejor a peor winrate
     by_strategy = stats.get("by_strategy", {})
     ordered = sorted(
         by_strategy.items(),
@@ -153,15 +166,21 @@ def telegram_strategy_range_report(stats_by_strategy, days):
     return "\n".join(lines)
 
 def get_pending_signals():
+    """
+    Trae señales que aun necesitan seguimiento: las recien publicadas
+    (PENDING) y las que bot_engine.py ya ejecuto en MT5 (EXECUTING).
+    Antes solo buscaba PENDING, asi que las señales ejecutadas nunca
+    volvian a revisarse ni a cerrarse — quedaban congeladas para siempre.
+    """
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/signals",
         headers=headers(),
         params={
-            "status": "eq.PENDING",
-            "result": "is.null",
-            "select": "id,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at",
-            "order":  "created_at.desc",
-            "limit":  "20",
+            "status":  "in.(PENDING,EXECUTING)",
+            "result":  "is.null",
+            "select":  "id,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at",
+            "order":   "created_at.desc",
+            "limit":   "20",
         },
         timeout=20,
     )
@@ -255,7 +274,7 @@ def _build_stats_from_signals(signals):
     pnl = sum(pnl_of(s) for s in signals if s.get("result") in ("WIN", "LOSS"))
     avg_score = sum(s.get("confidence", 0) for s in signals) / len(signals) if signals else 0
 
-    # NUEVO: desglose por estrategia
+    # Desglose por estrategia
     by_strategy = {}
     for s in signals:
         if s.get("result") not in ("WIN", "LOSS"):
@@ -297,7 +316,7 @@ def get_daily_stats():
 
 def get_strategy_stats_range(days=7):
     """
-    NUEVO: desempeño por estrategia en los ultimos N dias (no solo hoy).
+    Desempeño por estrategia en los ultimos N dias (no solo hoy).
     Util para decidir si una estrategia se debe desactivar de
     ALLOWED_STRATEGIES en bot_engine.py.
     """
@@ -321,24 +340,17 @@ def get_strategy_stats_range(days=7):
 
     return _build_stats_from_signals(signals)["by_strategy"]
 
-def main():
+def run_cycle():
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n{'='*50}")
-    print(f"  RESULT TRACKER V3 — {now_str}")
-    print(f"  URL: {SUPABASE_URL}")
-    print(f"{'='*50}")
-
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("ERROR: Faltan SUPABASE_URL o SUPABASE_KEY en .env")
-        sys.exit(1)
+    print(f"\n[{now_str}] Revisando señales...")
 
     breakeven_set = load_breakeven_signals()
     signals       = get_pending_signals()
 
     if not signals:
-        print("  Sin señales PENDING.")
+        print("  Sin señales PENDING/EXECUTING.")
     else:
-        print(f"  Revisando {len(signals)} señal(es) PENDING...")
+        print(f"  Revisando {len(signals)} señal(es) PENDING/EXECUTING...")
 
     for signal in signals:
         sig_id   = signal["id"]
@@ -424,7 +436,7 @@ def main():
             be_tag = "[BREAKEVEN activo]" if sig_id in breakeven_set else ""
             print(f"  [PEND] {sig_type} [{sig_id[:8]}] — En progreso ({age_min:.0f} min) {be_tag}")
 
-    # Reporte diario a las 20:00 UTC (ahora con desglose por estrategia)
+    # Reporte diario a las 20:00 UTC (con desglose por estrategia)
     now_utc = datetime.now(timezone.utc)
     if now_utc.hour == 20 and now_utc.minute < 2:
         stats = get_daily_stats()
@@ -432,14 +444,36 @@ def main():
             send_telegram(telegram_daily_report(stats))
             print(f"\n  Reporte diario enviado: {stats['wins']}W/{stats['losses']}L")
 
-    # NUEVO: reporte semanal por estrategia, domingos a las 20:00 UTC
+    # Reporte semanal por estrategia, domingos a las 20:00 UTC
     if now_utc.weekday() == 6 and now_utc.hour == 20 and now_utc.minute < 2:
         weekly = get_strategy_stats_range(days=7)
         if weekly:
             send_telegram(telegram_strategy_range_report(weekly, days=7))
             print(f"\n  Reporte semanal por estrategia enviado.")
 
-    print(f"\nResult tracker V3 completado.")
+    print(f"  Ciclo completado.")
+
+
+def main():
+    print(f"\n{'='*50}")
+    print(f"  RESULT TRACKER V3 — Loop continuo")
+    print(f"  URL: {SUPABASE_URL}")
+    print(f"  Revisa cada {LOOP_INTERVAL}s — Ctrl+C para detener")
+    print(f"{'='*50}")
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("ERROR: Faltan SUPABASE_URL o SUPABASE_KEY en .env")
+        sys.exit(1)
+
+    try:
+        while True:
+            try:
+                run_cycle()
+            except Exception as e:
+                print(f"  [ERROR] run_cycle: {e}")
+            time.sleep(LOOP_INTERVAL)
+    except KeyboardInterrupt:
+        print("\nDetenido manualmente (Ctrl+C).")
 
 if __name__ == "__main__":
     try:
