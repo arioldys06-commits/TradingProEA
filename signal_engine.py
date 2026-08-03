@@ -96,7 +96,7 @@ SUPABASE_KEY     = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 
-MIN_SCORE        = 70    # Score mínimo para publicar señal
+MIN_SCORE        = 75    # Score mínimo para publicar señal (igualado a bot_engine.py MIN_SCORE=75)
 MAX_DAILY        = 20    # Máximo señales por día (filtro anti-spam)
 LOOP_INTERVAL    = 30    # Segundos entre cada análisis
 SIGNAL_COOLDOWN  = 120   # 2 min mínimo entre señales de la misma estrategia
