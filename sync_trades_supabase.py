@@ -58,13 +58,53 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 COMMENT_PREFIX = "TradingPro_"
 
 
+_signals_cache = {}
+
+
+def cargar_signals_cache():
+    """
+    Trae (id, strategy) de las señales recientes UNA SOLA VEZ por ciclo
+    de sincronizacion, y arma un diccionario {primeros_8_chars_del_id:
+    {"id": id_completo, "strategy": strategy}} para hacer el vinculo en
+    memoria.
+
+    Se hace asi en vez de un LIKE por cada trade porque la columna `id`
+    en Supabase es de tipo uuid, y Postgres no permite comparar uuid con
+    LIKE sin conversion explicita de tipo (error 42883: "operator does
+    not exist: uuid ~~ unknown"). Cargar el lote completo una vez y
+    comparar en Python evita ese problema de tipos y ademas reduce las
+    llamadas a Supabase de "una por trade" a "una por ciclo".
+
+    Se guarda el id COMPLETO (no solo el prefijo) porque la columna
+    signal_id en trades_ejecutados tambien es tipo uuid — un string
+    parcial de 8 caracteres seria rechazado al hacer el upsert.
+    """
+    global _signals_cache
+    try:
+        r = (
+            supabase.table("signals")
+            .select("id,strategy")
+            .order("created_at", desc=True)
+            .limit(1000)
+            .execute()
+        )
+        _signals_cache = {
+            str(row["id"])[:8]: {"id": row["id"], "strategy": row.get("strategy")}
+            for row in (r.data or [])
+        }
+    except Exception as e:
+        print(f"[sync_trades] Error cargando cache de señales: {e}")
+        _signals_cache = {}
+
+
 def buscar_signal_por_comentario(comentario):
     """
-    A partir del comentario de la orden en MT5 (ej. "TradingPro_a1b2c3d4"),
-    extrae el prefijo del signal_id y busca en la tabla `signals` cual
-    señal completa empieza con ese prefijo. Devuelve (signal_id, strategy)
-    o (None, None) si no se encuentra o el comentario no tiene el formato
-    esperado (por ejemplo, ordenes abiertas manualmente sin pasar por el bot).
+    A partir del comentario del deal de APERTURA en MT5 (ej.
+    "TradingPro_0c256165"), extrae el prefijo del signal_id y lo busca
+    en _signals_cache (cargado una vez por ciclo con cargar_signals_cache()).
+    Devuelve (signal_id_completo, strategy) o (None, None) si no coincide
+    con ninguna señal conocida — por ejemplo, ordenes abiertas manualmente
+    sin pasar por el bot.
     """
     if not comentario or not comentario.startswith(COMMENT_PREFIX):
         return None, None
@@ -73,37 +113,45 @@ def buscar_signal_por_comentario(comentario):
     if len(prefijo) < 4:
         return None, None
 
-    try:
-        r = (
-            supabase.table("signals")
-            .select("id,strategy")
-            .like("id", f"{prefijo}%")
-            .limit(1)
-            .execute()
-        )
-        if r.data:
-            return r.data[0]["id"], r.data[0].get("strategy")
-    except Exception as e:
-        print(f"[sync_trades] Error buscando señal por comentario '{comentario}': {e}")
+    encontrado = _signals_cache.get(prefijo)
+    if encontrado:
+        return encontrado["id"], encontrado["strategy"]
 
     return None, None
 
 
 def sincronizar_trades_cerrados(dias_atras: int = 3):
     """
-    Lee los deals cerrados de MT5 de los últimos `dias_atras` días,
-    filtra por magic number, vincula cada uno a su señal original
-    (strategy + signal_id) via el comentario de la orden, y hace
-    upsert en Supabase (trades_ejecutados) usando el ticket como
-    llave única para evitar duplicados.
+    Lee los deals de MT5 de los últimos `dias_atras` días, separa los de
+    apertura (ENTRY_IN) de los de cierre (ENTRY_OUT), vincula cada cierre
+    con su señal original (strategy + signal_id) usando el comentario del
+    deal de APERTURA — no el de cierre — y hace upsert en Supabase
+    (trades_ejecutados) usando el ticket como llave única.
+
+    IMPORTANTE: MT5 sobreescribe automaticamente el comentario del deal
+    de cierre con la razon del cierre (ej. "[sl 4039.51]", "[tp 4031.86]"),
+    perdiendo el comentario original "TradingPro_xxxxxxxx" que puso
+    bot_engine.py al abrir la orden. Ese comentario original SI se
+    conserva en el deal de apertura (ENTRY_IN) de la misma posicion, asi
+    que hay que buscarlo ahi usando el position_id en comun.
     """
     desde = datetime.now() - timedelta(days=dias_atras)
     hasta = datetime.now()
+
+    cargar_signals_cache()
 
     deals = mt5.history_deals_get(desde, hasta)
     if deals is None or len(deals) == 0:
         print("[sync_trades] No hay deals en el rango consultado.")
         return
+
+    # Comentario original por position_id, tomado del deal de APERTURA
+    # (el unico que conserva el "TradingPro_xxxxxxxx" que puso bot_engine.py)
+    comentarios_apertura = {
+        d.position_id: d.comment
+        for d in deals
+        if d.magic == MAGIC and d.entry == mt5.DEAL_ENTRY_IN
+    }
 
     # Solo nos interesan los deals de SALIDA (cierre de posición) de nuestro bot
     # entry == 1 significa DEAL_ENTRY_OUT (cierre). entry == 0 es apertura.
@@ -121,7 +169,8 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     for d in deals_cierre:
         profit_neto = d.profit + d.swap + d.commission
 
-        signal_id, strategy = buscar_signal_por_comentario(d.comment)
+        comentario_apertura = comentarios_apertura.get(d.position_id)
+        signal_id, strategy = buscar_signal_por_comentario(comentario_apertura)
         if signal_id:
             vinculados += 1
 
@@ -137,7 +186,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
             "comision": d.commission,
             "profit_neto": profit_neto,
             "close_time": datetime.fromtimestamp(d.time).isoformat(),
-            "comentario": d.comment,
+            "comentario": d.comment,  # razon de cierre (sl/tp), se conserva tal cual
             "signal_id": signal_id,
             "strategy": strategy,
         })
