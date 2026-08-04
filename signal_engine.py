@@ -55,6 +55,16 @@ Filtro Anti-Trampa Institucional del FVG — NUEVO:
          formarse el FVG, lo atraviesa por completo sin reaccionar,
          la señal se descarta directamente (no solo resta puntos).
 
+Filtro de Volatilidad Minima (ATR) — NUEVO:
+  - Evita entrar cuando el mercado esta en rango muerto (pre-Londres,
+    almuerzo NY, fines de sesion) donde el spread se come el TP.
+  - Compara el ATR(14) actual de M5 contra un ATR historico promedio
+    de referencia (ATR_PROMEDIO_HISTORICO, calculado una vez sobre 30
+    dias y fijado en .env) multiplicado por ATR_MIN_MULTIPLIER.
+  - Si el ATR actual cae por debajo de ese umbral, la señal se descarta
+    directamente. Se aplica a las estrategias 1, 3 y 4 (la 2 ya exige
+    un rango pre-sesion minimo por diseño y no lo necesita).
+
 Validador de Vigencia (filtro anti-manipulación):
   - Compara precio actual vs entrada original antes de publicar
   - Si el precio se alejó más de 0.5x ATR → señal expirada, descarta
@@ -108,6 +118,12 @@ DOLLAR_PAIRS = ["EURUSD", "GBPUSD", "USDCHF", "USDJPY"]
 # USDCHF y USDJPY son directos al USD (par sube = USD se fortalece).
 DOLLAR_PAIRS_INVERSOS = {"EURUSD", "GBPUSD"}
 DXY_SCORE_BONUS = 10  # puntos que suma/resta la confirmacion/contradiccion del dolar
+
+# Filtro de volatilidad minima (ATR) — NUEVO
+# ATR_PROMEDIO_HISTORICO se calcula UNA SOLA VEZ (script aparte, 30 dias)
+# y se fija en .env. No se recalcula en vivo para no agregar carga al loop.
+ATR_PROMEDIO_HISTORICO = float(os.getenv("ATR_PROMEDIO_HISTORICO", "2.0"))
+ATR_MIN_MULTIPLIER     = float(os.getenv("ATR_MIN_MULTIPLIER", "0.8"))
 
 # ── ESTADO INTERNO ────────────────────────────────────────────
 last_signal_time = {}    # {strategy: datetime} — cooldown por estrategia
@@ -264,6 +280,21 @@ def detect_fvgs(candles):
             fvgs.append({"type": "SELL", "top": a["L"], "bottom": c["H"],
                           "mid": (a["L"] + c["H"]) / 2, "idx": i})
     return fvgs
+
+# ── FILTRO DE VOLATILIDAD MINIMA (ATR) — NUEVO ─────────────────
+# Rechaza señales cuando el mercado esta en rango muerto: el ATR(14)
+# actual de M5 (ya calculado en cada estrategia con calc_atr) cae por
+# debajo de un umbral relativo al ATR historico promedio (30 dias,
+# fijado en .env). No agrega llamadas nuevas ni cambia el resto del
+# pipeline — solo compara un numero ya calculado contra el umbral.
+
+def filtro_volatilidad_ok(atr_actual):
+    """
+    Retorna (ok, umbral). ok=True si el ATR actual esta por encima
+    del umbral minimo aceptable de volatilidad.
+    """
+    umbral = ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER
+    return atr_actual >= umbral, umbral
 
 # ── FILTRO ANTI-TRAMPA INSTITUCIONAL DEL FVG — NUEVO ──────────
 # Un FVG "trampa" es un gap que parece institucional pero en realidad
@@ -825,6 +856,12 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not e9 or not e20 or atr < 0.5:
         return None
 
+    # ── Filtro de volatilidad minima (ATR) — NUEVO ──
+    vol_ok, vol_umbral = filtro_volatilidad_ok(atr)
+    if not vol_ok:
+        print(f"  [1] Scalping M5 SMC: descartado — volatilidad insuficiente (ATR={atr:.2f} < umbral={vol_umbral:.2f})")
+        return None
+
     ema_dir = "BUY" if e9 > e20 else "SELL"
 
     # Confluencia TF superiores
@@ -1094,6 +1131,12 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if atr < 0.5:
         return None
 
+    # ── Filtro de volatilidad minima (ATR) — NUEVO ──
+    vol_ok, vol_umbral = filtro_volatilidad_ok(atr)
+    if not vol_ok:
+        print(f"  [3] FVG Fill: descartado — volatilidad insuficiente (ATR={atr:.2f} < umbral={vol_umbral:.2f})")
+        return None
+
     closes5 = [c["C"] for c in c5]
     e9  = ema(closes5, 9)
     e20 = ema(closes5, 20)
@@ -1224,6 +1267,12 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     rsi = calc_rsi(closes5[-20:])
 
     if not e9 or not e20 or atr < 0.5:
+        return None
+
+    # ── Filtro de volatilidad minima (ATR) — NUEVO ──
+    vol_ok, vol_umbral = filtro_volatilidad_ok(atr)
+    if not vol_ok:
+        print(f"  [4] EMA Pullback: descartado — volatilidad insuficiente (ATR={atr:.2f} < umbral={vol_umbral:.2f})")
         return None
 
     trend = "BUY" if e9 > e20 else "SELL"
@@ -1463,6 +1512,7 @@ def main():
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
+    print(f"  Filtro volatilidad ATR: umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f} (hist={ATR_PROMEDIO_HISTORICO} x mult={ATR_MIN_MULTIPLIER})")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1477,6 +1527,7 @@ def main():
             f"Cooldown: {SIGNAL_COOLDOWN}s | Loop: {LOOP_INTERVAL}s\n"
             f"Filtro DXY sintetico activo ({', '.join(DOLLAR_PAIRS)})\n"
             f"Filtro FVG anti-trampa activo\n"
+            f"Filtro volatilidad ATR activo (umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f})\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
