@@ -1,7 +1,7 @@
 """
 result_tracker.py — V3
 ======================
-Revisa señales PENDING/EXECUTING y actualiza WIN/LOSS comparando
+Revisa señales EXECUTING (ya abiertas de verdad en MT5) y actualiza WIN/LOSS comparando
 con las velas reales de Supabase.
 
 Proyecto: qilvrvnwdtpbkcfwktqs (activo en dashboard)
@@ -18,16 +18,37 @@ CAMBIOS EN ESTA VERSION (V3 — desglose por estrategia):
   - Se mantiene 100% la logica original de cierre de señales
     (breakeven, WIN/LOSS, velas M5) — no se toco esa parte.
 
-FIX (esta version): get_pending_signals() solo buscaba señales con
-  status=PENDING. Pero bot_engine.py cambia el status a EXECUTING en
-  cuanto abre la orden real en MT5 — asi que, para cuando este script
-  corria, la señal ya habia dejado de ser PENDING y nunca se volvia a
-  revisar. Resultado: ninguna señal ejecutada llegaba jamas a CLOSED
-  con WIN/LOSS, y el desglose por estrategia se quedaba siempre vacio
-  aunque el codigo para calcularlo ya estuviera bien escrito.
-  Ahora el filtro incluye status en (PENDING, EXECUTING), asi que las
-  señales que ya se ejecutaron en MT5 tambien se siguen revisando
-  hasta que toquen SL o TP y puedan cerrarse correctamente.
+FIX (version anterior, ya CORREGIDO otra vez en esta version — ver
+  abajo): en su momento se cambio get_pending_signals() para incluir
+  status en (PENDING, EXECUTING), porque bot_engine.py cambia el
+  status a EXECUTING en cuanto abre la orden real en MT5 y antes de
+  eso el tracker nunca volvia a revisar esas señales. Esa parte del
+  razonamiento seguia siendo correcta (las EXECUTING si hay que
+  revisarlas), pero incluir tambien PENDING introdujo un bug nuevo:
+  bot_engine.py respeta "maximo 1 operacion abierta a la vez", asi
+  que cuando llegan señales de score alto mientras ya hay una
+  posicion abierta, esas señales se QUEDAN en PENDING sin ejecutarse
+  nunca en MT5 — bot_engine ni las toca hasta que la posicion se
+  cierra. El tracker, en cambio, las tomaba igual (por estar en
+  PENDING) y les simulaba un resultado contra las velas de Supabase
+  como si hubieran sido trades reales, cerrandolas con WIN/LOSS
+  ficticio. Confirmado el 2026-08-04: de 8 señales que el tracker
+  cerro ese dia, solo 2 correspondian a operaciones reales en MT5
+  (confirmado por magic number 20260601 + comment); las otras 6
+  nunca se ejecutaron — el bot ya tenia posicion abierta.
+
+FIX (esta version — señales PENDING que nunca se ejecutaron ya NO
+  se evaluan): el filtro ahora solo trae señales con status=EXECUTING,
+  que es el unico status que bot_engine.py asigna DESPUES de confirmar
+  que la orden se abrio de verdad en MT5 (ver update_signal_status(
+  sig_id, "EXECUTING") en bot_engine.py, justo despues de que
+  execute_order() devuelve un resultado exitoso). Las señales que se
+  quedan en PENDING (nunca alcanzaron a ejecutarse porque ya habia una
+  posicion abierta, o porque no llegaron a tiempo) ya no se simulan ni
+  se cierran aqui — bot_engine.py las marca EXPIRED por su cuenta via
+  su propio filtro de vigencia (is_signal_stale) la proxima vez que
+  revisa pendientes sin posicion abierta. Asi el tracker solo reporta
+  WIN/LOSS de operaciones que de verdad ocurrieron en la cuenta real.
 
 FIX (esta version — SL anti-hunt desincronizado, causaba WIN reales
   reportados como LOSS): bot_engine.py NUNCA ejecuta la orden real en
@@ -237,16 +258,19 @@ def telegram_strategy_range_report(stats_by_strategy, days):
 
 def get_pending_signals():
     """
-    Trae señales que aun necesitan seguimiento: las recien publicadas
-    (PENDING) y las que bot_engine.py ya ejecuto en MT5 (EXECUTING).
-    Antes solo buscaba PENDING, asi que las señales ejecutadas nunca
-    volvian a revisarse ni a cerrarse — quedaban congeladas para siempre.
+    Trae SOLO señales que bot_engine.py ya ejecuto de verdad en MT5
+    (status=EXECUTING). Las que se quedan en PENDING nunca llegaron a
+    ser una operacion real (por ejemplo, el bot ya tenia una posicion
+    abierta y las salto por su regla de "maximo 1 operacion a la vez")
+    — evaluarlas aqui simularia un resultado ficticio para un trade que
+    nunca existio en la cuenta. bot_engine.py se encarga de marcar esas
+    PENDING como EXPIRED por su cuenta cuando quedan vencidas.
     """
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/signals",
         headers=headers(),
         params={
-            "status":  "in.(PENDING,EXECUTING)",
+            "status":  "eq.EXECUTING",
             "result":  "is.null",
             "select":  "id,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at",
             "order":   "created_at.desc",
@@ -434,9 +458,9 @@ def run_cycle():
     signals       = get_pending_signals()
 
     if not signals:
-        print("  Sin señales PENDING/EXECUTING.")
+        print("  Sin señales EXECUTING pendientes de cierre.")
     else:
-        print(f"  Revisando {len(signals)} señal(es) PENDING/EXECUTING...")
+        print(f"  Revisando {len(signals)} señal(es) EXECUTING...")
 
     for signal in signals:
         sig_id   = signal["id"]
