@@ -5,70 +5,6 @@ Revisa señales EXECUTING (ya abiertas de verdad en MT5) y actualiza WIN/LOSS co
 con las velas reales de Supabase.
 
 Proyecto: qilvrvnwdtpbkcfwktqs (activo en dashboard)
-
-CAMBIOS EN ESTA VERSION (V3 — desglose por estrategia):
-  - get_daily_stats() ahora agrupa resultados por 'strategy', no solo
-    el total del dia. Antes: {total, wins, losses, pnl, avg_score}.
-    Ahora ademas incluye 'by_strategy': {nombre_estrategia: {...}}.
-  - Nueva funcion get_strategy_stats_range(days) para ver el
-    desempeño historico por estrategia (no solo el dia de hoy) —
-    util para decidir si alguna estrategia hay que apagar.
-  - telegram_daily_report() ahora imprime una tabla con el
-    desglose por estrategia, ademas del resumen general.
-  - Se mantiene 100% la logica original de cierre de señales
-    (breakeven, WIN/LOSS, velas M5) — no se toco esa parte.
-
-FIX (version anterior, ya CORREGIDO otra vez en esta version — ver
-  abajo): en su momento se cambio get_pending_signals() para incluir
-  status en (PENDING, EXECUTING), porque bot_engine.py cambia el
-  status a EXECUTING en cuanto abre la orden real en MT5 y antes de
-  eso el tracker nunca volvia a revisar esas señales. Esa parte del
-  razonamiento seguia siendo correcta (las EXECUTING si hay que
-  revisarlas), pero incluir tambien PENDING introdujo un bug nuevo:
-  bot_engine.py respeta "maximo 1 operacion abierta a la vez", asi
-  que cuando llegan señales de score alto mientras ya hay una
-  posicion abierta, esas señales se QUEDAN en PENDING sin ejecutarse
-  nunca en MT5 — bot_engine ni las toca hasta que la posicion se
-  cierra. El tracker, en cambio, las tomaba igual (por estar en
-  PENDING) y les simulaba un resultado contra las velas de Supabase
-  como si hubieran sido trades reales, cerrandolas con WIN/LOSS
-  ficticio. Confirmado el 2026-08-04: de 8 señales que el tracker
-  cerro ese dia, solo 2 correspondian a operaciones reales en MT5
-  (confirmado por magic number 20260601 + comment); las otras 6
-  nunca se ejecutaron — el bot ya tenia posicion abierta.
-
-FIX (esta version — señales PENDING que nunca se ejecutaron ya NO
-  se evaluan): el filtro ahora solo trae señales con status=EXECUTING,
-  que es el unico status que bot_engine.py asigna DESPUES de confirmar
-  que la orden se abrio de verdad en MT5 (ver update_signal_status(
-  sig_id, "EXECUTING") en bot_engine.py, justo despues de que
-  execute_order() devuelve un resultado exitoso). Las señales que se
-  quedan en PENDING (nunca alcanzaron a ejecutarse porque ya habia una
-  posicion abierta, o porque no llegaron a tiempo) ya no se simulan ni
-  se cierran aqui — bot_engine.py las marca EXPIRED por su cuenta via
-  su propio filtro de vigencia (is_signal_stale) la proxima vez que
-  revisa pendientes sin posicion abierta. Asi el tracker solo reporta
-  WIN/LOSS de operaciones que de verdad ocurrieron en la cuenta real.
-
-FIX (esta version — SL anti-hunt desincronizado, causaba WIN reales
-  reportados como LOSS): bot_engine.py NUNCA ejecuta la orden real en
-  MT5 con el stop_loss tal cual viene en la señal de Supabase. Antes
-  de enviarla, le aplica calc_anti_hunt_sl(): un colchon extra de
-  SL_EXTRA_PTS (20 puntos * point del simbolo * 10) para que el SL
-  real quede mas lejos del precio de entrada y no lo cacen con un
-  spike corto. Ese SL ajustado es el que de verdad protege la cuenta
-  en MT5 — pero la tabla `signals` en Supabase solo guarda el SL
-  ORIGINAL (antes del colchon), y este tracker simulaba el cierre
-  contra ese SL angosto, no contra el real.
-  Efecto observado: el precio tocaba el SL angosto simulado por el
-  tracker (se marcaba LOSS) ANTES de llegar al SL real y mas amplio
-  que de verdad protegia la operacion — mientras en MT5 la operacion
-  seguia viva y terminaba tocando TP (WIN real). Confirmado con el
-  reporte del 2026-08-04 (8/8 marcadas LOSS por el tracker) contra el
-  historial real de MT5 (6 operaciones cerradas, las 6 en ganancia).
-  Ahora ANTI_HUNT_SL_EXTRA replica el mismo colchon que bot_engine.py
-  aplico al SL real, para que la simulacion cierre contra el mismo
-  nivel que de verdad protege la cuenta en MT5.
 """
 
 import os
@@ -88,13 +24,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 BREAKEVEN_FILE = "breakeven_signals.txt"
 LOOP_INTERVAL  = int(os.getenv("TRACKER_LOOP_INTERVAL", "60"))  # segundos entre cada revision
 
-# ── Colchon anti-hunt (NUEVO — replica el de bot_engine.py) ────
-# bot_engine.py abre la orden real en MT5 con un SL mas amplio que el
-# guardado en Supabase: calc_anti_hunt_sl() resta/suma
-# SL_EXTRA_PTS(20) * symbol.point * 10 al SL original. Para GOLD/XAUUSD
-# con point=0.01 eso da 20 * 0.01 * 10 = 2.0 en precio. Se deja
-# configurable via .env por si el simbolo/broker cambia de point.
 ANTI_HUNT_SL_EXTRA = float(os.getenv("ANTI_HUNT_SL_EXTRA", "2.0"))
+
+# ── Desfase Republica Dominicana (UTC-4, sin horario de verano) ──
+DR_OFFSET = timedelta(hours=-4)
 
 def headers():
     return {
@@ -124,7 +57,7 @@ def log_error_to_file(message):
         with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
     except Exception:
-        pass  # si tampoco se puede escribir el log, no hay mas remedio que seguir sin registrar
+        pass
 
 def load_breakeven_signals():
     if os.path.exists(BREAKEVEN_FILE):
@@ -137,16 +70,6 @@ def load_breakeven_signals():
     return set()
 
 def save_breakeven_signals(sig_set, intentos=3):
-    """
-    Guarda la lista de señales en breakeven usando escritura atomica:
-    escribe primero a un archivo temporal y luego lo renombra sobre el
-    archivo final (os.replace). Esto evita el bloqueo tipico que
-    servicios de sincronizacion en la nube (OneDrive, WPSDrive) hacen
-    sobre el archivo original mientras lo estan subiendo/revisando —
-    el archivo temporal no esta bajo ese mismo bloqueo.
-    Si aun asi falla tras varios intentos, NO relanza la excepcion:
-    solo lo registra en tracker_errors.log y el ciclo continua normal.
-    """
     ultimo_error = None
     tmp_file = BREAKEVEN_FILE + ".tmp"
 
@@ -200,24 +123,22 @@ def telegram_breakeven(signal, current_price):
 def telegram_daily_report(stats):
     winrate   = round(stats['wins'] / stats['total'] * 100, 1) if stats['total'] > 0 else 0
     emoji_wr  = "BIEN" if winrate >= 65 else "OK" if winrate >= 50 else "MAL"
-    pnl_str   = f"+{stats['pnl']:.1f}" if stats['pnl'] >= 0 else f"{stats['pnl']:.1f}"
+    pnl_str   = f"+{stats['pnl']:.2f}" if stats['pnl'] >= 0 else f"{stats['pnl']:.2f}"
 
     lines = [
-        f"REPORTE DIARIO — XAUUSD",
+        f"REPORTE DIARIO — XAUUSD (trades reales)",
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
         f"---",
-        f"Total senales: {stats['total']}",
+        f"Total trades ejecutados: {stats['total']}",
         f"Ganadoras: {stats['wins']}",
         f"Perdedoras: {stats['losses']}",
         f"Winrate: {winrate}% [{emoji_wr}]",
         f"---",
-        f"PnL del dia: {pnl_str} pts",
-        f"Score promedio: {stats['avg_score']:.0f}/100",
+        f"PnL del dia: {pnl_str}",
         f"---",
         f"POR ESTRATEGIA:",
     ]
 
-    # Desglose por estrategia, ordenado de mejor a peor winrate
     by_strategy = stats.get("by_strategy", {})
     ordered = sorted(
         by_strategy.items(),
@@ -226,10 +147,10 @@ def telegram_daily_report(stats):
     )
     for strategy_name, s in ordered:
         wr = round(s["wins"] / s["total"] * 100, 1) if s["total"] else 0
-        pnl_s = f"+{s['pnl']:.1f}" if s['pnl'] >= 0 else f"{s['pnl']:.1f}"
+        pnl_s = f"+{s['pnl']:.2f}" if s['pnl'] >= 0 else f"{s['pnl']:.2f}"
         lines.append(
             f"  {strategy_name}: {s['wins']}W/{s['losses']}L "
-            f"({wr}%) | {pnl_s} pts"
+            f"({wr}%) | {pnl_s}"
         )
 
     lines += ["---", "Trading Pro V3"]
@@ -237,7 +158,7 @@ def telegram_daily_report(stats):
 
 def telegram_strategy_range_report(stats_by_strategy, days):
     lines = [
-        f"DESEMPEÑO POR ESTRATEGIA — ultimos {days} dias",
+        f"DESEMPEÑO POR ESTRATEGIA (trades reales) — ultimos {days} dias",
         f"---",
     ]
     ordered = sorted(
@@ -247,25 +168,16 @@ def telegram_strategy_range_report(stats_by_strategy, days):
     )
     for strategy_name, s in ordered:
         wr = round(s["wins"] / s["total"] * 100, 1) if s["total"] else 0
-        pnl_s = f"+{s['pnl']:.1f}" if s['pnl'] >= 0 else f"{s['pnl']:.1f}"
+        pnl_s = f"+{s['pnl']:.2f}" if s['pnl'] >= 0 else f"{s['pnl']:.2f}"
         flag = "" if s["total"] < 5 else (" [REVISAR]" if wr < 45 else "")
         lines.append(
-            f"{strategy_name}: {s['total']} señales | "
-            f"{s['wins']}W/{s['losses']}L ({wr}%) | {pnl_s} pts{flag}"
+            f"{strategy_name}: {s['total']} trades | "
+            f"{s['wins']}W/{s['losses']}L ({wr}%) | {pnl_s}{flag}"
         )
-    lines += ["---", "Menos de 5 señales = muestra insuficiente todavia"]
+    lines += ["---", "Menos de 5 trades = muestra insuficiente todavia"]
     return "\n".join(lines)
 
 def get_pending_signals():
-    """
-    Trae SOLO señales que bot_engine.py ya ejecuto de verdad en MT5
-    (status=EXECUTING). Las que se quedan en PENDING nunca llegaron a
-    ser una operacion real (por ejemplo, el bot ya tenia una posicion
-    abierta y las salto por su regla de "maximo 1 operacion a la vez")
-    — evaluarlas aqui simularia un resultado ficticio para un trade que
-    nunca existio en la cuenta. bot_engine.py se encarga de marcar esas
-    PENDING como EXPIRED por su cuenta cuando quedan vencidas.
-    """
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/signals",
         headers=headers(),
@@ -284,7 +196,6 @@ def get_pending_signals():
     return r.json()
 
 def get_candles_after(created_at, limit=200):
-    """Usa M5 — es el timeframe mínimo garantizado en Supabase."""
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/ohlc_candles",
         headers=headers(),
@@ -320,19 +231,6 @@ def get_current_price():
     return float(r.json()[0]["close"])
 
 def update_signal(sig_id, result, result_price):
-    """
-    Marca la señal como CLOSED con su resultado (WIN/LOSS).
-    NOTA: la tabla 'signals' no tiene columnas 'result_price' ni
-    'result_at' (solo existen id, created_at, instrument, timeframe,
-    signal_type, strategy, confidence, entry_price, stop_loss,
-    take_profit_1, take_profit_2, status, result). Antes se intentaba
-    escribir esas columnas inexistentes, Supabase rechazaba el PATCH
-    completo (400), y como no se revisaba el status code, el error
-    quedaba en silencio: la señal nunca pasaba a CLOSED de verdad,
-    aunque en consola pareciera que sí. result_price se recibe igual
-    (se usa en el mensaje de Telegram) pero ya no se intenta guardar
-    en una columna que no existe.
-    """
     try:
         r = requests.patch(
             f"{SUPABASE_URL}/rest/v1/signals?id=eq.{sig_id}",
@@ -352,118 +250,108 @@ def update_signal(sig_id, result, result_price):
         return False
 
 def update_signal_sl(sig_id, new_sl):
-    """
-    DESACTIVADA (esta version) — antes esta funcion sobreescribia la
-    columna 'stop_loss' de Supabase con el precio de entrada cuando se
-    activaba breakeven. Esa columna es la MISMA que se usa como base
-    para calcular el SL anti-hunt real (ANTI_HUNT_SL_EXTRA). Al
-    sobreescribirla, el SL original se perdia para siempre: en la
-    siguiente revision, el tracker leia 'entry_price' donde deberia
-    haber leido el SL original, le restaba/sumaba el colchon anti-hunt
-    sobre ese valor corrupto, y quedaba simulando un SL falso muy
-    pegado a la entrada — muy distinto del SL real y mas amplio que de
-    verdad protegia la operacion en MT5. Confirmado con la señal
-    5e2cd221 el 2026-08-05: quedo con stop_loss=entry_price en
-    Supabase, el tracker la cerro como LOSS a -2.0 pts, mientras el
-    trade real en MT5 (SL real 4182.51, muy lejos de la entrada) siguio
-    vivo y cerro en TP con +$23.52 de ganancia real.
-    El estado de breakeven ya se maneja localmente via breakeven_set /
-    breakeven_signals.txt (que ajusta la variable 'sl' EN MEMORIA en
-    cada corrida) — no hace falta persistir el cambio en la misma
-    columna que sirve de base para el calculo anti-hunt. Si en el
-    futuro se necesita ver el SL de breakeven desde fuera de este
-    script, debe guardarse en una columna NUEVA y separada (ej.
-    'breakeven_sl'), nunca sobre 'stop_loss'.
-    """
     pass
 
 def _empty_strategy_bucket():
     return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
 
-def _build_stats_from_signals(signals):
+def _dr_day_bounds_utc(days_ago=0):
     """
-    Toma una lista de señales CLOSED (con result, entry_price, take_profit_1,
-    stop_loss, confidence, strategy) y arma el resumen global + por estrategia.
-    Compartido por get_daily_stats() y get_strategy_stats_range().
+    Devuelve (inicio_utc_iso, fin_utc_iso) del dia calendario en zona
+    Republica Dominicana (UTC-4, fijo, sin DST) que corresponde a
+    'hoy - days_ago'. Se usa para filtrar trades_ejecutados por
+    close_time y que el reporte cuadre con el dia de trading real.
     """
-    wins   = sum(1 for s in signals if s.get("result") == "WIN")
-    losses = sum(1 for s in signals if s.get("result") == "LOSS")
+    now_dr    = datetime.now(timezone.utc) + DR_OFFSET
+    target_dr = (now_dr - timedelta(days=days_ago)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start_utc = target_dr - DR_OFFSET
+    end_utc   = start_utc + timedelta(days=1)
+    return start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _build_stats_from_trades(trades):
+    """
+    Toma una lista de filas de trades_ejecutados (con profit_neto y
+    strategy) y arma el resumen global + por estrategia. Reemplaza a
+    _build_stats_from_signals(): el reporte ahora se basa en
+    operaciones REALES ejecutadas en MT5, no en señales.
+    """
+    wins   = sum(1 for t in trades if float(t.get("profit_neto") or 0) > 0)
+    losses = sum(1 for t in trades if float(t.get("profit_neto") or 0) <= 0)
     total  = wins + losses
+    pnl    = sum(float(t.get("profit_neto") or 0) for t in trades)
 
-    def pnl_of(s):
-        entry = float(s.get("entry_price", 0))
-        if s.get("result") == "WIN":
-            return float(s.get("take_profit_1", 0)) - entry
-        return float(s.get("stop_loss", 0)) - entry
-
-    pnl = sum(pnl_of(s) for s in signals if s.get("result") in ("WIN", "LOSS"))
-    avg_score = sum(s.get("confidence", 0) for s in signals) / len(signals) if signals else 0
-
-    # Desglose por estrategia
     by_strategy = {}
-    for s in signals:
-        if s.get("result") not in ("WIN", "LOSS"):
-            continue
-        name = s.get("strategy") or "sin_nombre"
+    for t in trades:
+        name = t.get("strategy") or "sin_nombre"
         bucket = by_strategy.setdefault(name, _empty_strategy_bucket())
+        p = float(t.get("profit_neto") or 0)
         bucket["total"] += 1
-        if s["result"] == "WIN":
+        if p > 0:
             bucket["wins"] += 1
         else:
             bucket["losses"] += 1
-        bucket["pnl"] += pnl_of(s)
+        bucket["pnl"] += p
 
     return {
         "total": total, "wins": wins, "losses": losses,
-        "pnl": pnl, "avg_score": avg_score,
-        "by_strategy": by_strategy,
+        "pnl": pnl, "by_strategy": by_strategy,
     }
 
 def get_daily_stats():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """
+    Reporte diario basado en trades_ejecutados (operaciones reales en
+    MT5), no en la tabla 'signals'. 'signals' incluye señales que
+    llegan a CLOSED sin haberse ejecutado nunca como orden real —
+    contarlas infla las perdedoras del dia. Ver conversacion del
+    2026-08-05: reporte via 'signals' mostro 9 senales / 8 perdedoras,
+    cuando en trades_ejecutados solo hubo 4 trades reales / 3 perdedoras.
+    """
+    start_utc, end_utc = _dr_day_bounds_utc(days_ago=0)
     r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/signals",
+        f"{SUPABASE_URL}/rest/v1/trades_ejecutados",
         headers=headers(),
         params={
-            "select":     "result,entry_price,take_profit_1,stop_loss,confidence,strategy",
-            "status":     "eq.CLOSED",
-            "created_at": f"gte.{today}T00:00:00Z",
+            "select":     "profit_neto,strategy,close_time",
+            "close_time": [f"gte.{start_utc}", f"lt.{end_utc}"],
         },
         timeout=20,
     )
     if r.status_code >= 400:
+        print(f"  Error get_daily_stats: {r.status_code} {r.text}")
         return None
-    signals = r.json()
-    if not signals:
+    trades = r.json()
+    if not trades:
         return None
 
-    return _build_stats_from_signals(signals)
+    return _build_stats_from_trades(trades)
 
 def get_strategy_stats_range(days=7):
     """
-    Desempeño por estrategia en los ultimos N dias (no solo hoy).
+    Desempeño por estrategia en los ultimos N dias, basado en
+    trades_ejecutados (operaciones reales), no en 'signals'.
     Util para decidir si una estrategia se debe desactivar de
     ALLOWED_STRATEGIES en bot_engine.py.
     """
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+    start_utc, _ = _dr_day_bounds_utc(days_ago=days - 1)
     r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/signals",
+        f"{SUPABASE_URL}/rest/v1/trades_ejecutados",
         headers=headers(),
         params={
-            "select":     "result,entry_price,take_profit_1,stop_loss,confidence,strategy",
-            "status":     "eq.CLOSED",
-            "created_at": f"gte.{since}",
+            "select":     "profit_neto,strategy,close_time",
+            "close_time": f"gte.{start_utc}",
         },
         timeout=20,
     )
     if r.status_code >= 400:
         print(f"  Error get_strategy_stats_range: {r.status_code} {r.text}")
         return None
-    signals = r.json()
-    if not signals:
+    trades = r.json()
+    if not trades:
         return None
 
-    return _build_stats_from_signals(signals)["by_strategy"]
+    return _build_stats_from_trades(trades)["by_strategy"]
 
 def run_cycle():
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -486,13 +374,6 @@ def run_cycle():
         tp2      = float(signal["take_profit_2"])
         created  = signal["created_at"]
 
-        # ── Colchon anti-hunt (NUEVO) ──
-        # Replica el mismo ajuste que bot_engine.py aplico al SL real en
-        # MT5 antes de enviar la orden (calc_anti_hunt_sl). Sin esto, el
-        # tracker simulaba el cierre contra el SL angosto original de
-        # Supabase, mas cerca del precio de entrada que el SL real que
-        # de verdad protege la operacion — marcando LOSS en trades que
-        # en la cuenta real seguian abiertos y terminaban en WIN.
         if sig_type == "BUY":
             sl = sl - ANTI_HUNT_SL_EXTRA
         else:
@@ -573,7 +454,7 @@ def run_cycle():
             be_tag = "[BREAKEVEN activo]" if sig_id in breakeven_set else ""
             print(f"  [PEND] {sig_type} [{sig_id[:8]}] — En progreso ({age_min:.0f} min) {be_tag}")
 
-    # Reporte diario a las 20:00 UTC (con desglose por estrategia)
+    # Reporte diario a las 20:00 UTC (basado en trades_ejecutados)
     now_utc = datetime.now(timezone.utc)
     if now_utc.hour == 20 and now_utc.minute < 2:
         stats = get_daily_stats()
