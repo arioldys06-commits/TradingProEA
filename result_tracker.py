@@ -352,15 +352,30 @@ def update_signal(sig_id, result, result_price):
         return False
 
 def update_signal_sl(sig_id, new_sl):
-    try:
-        requests.patch(
-            f"{SUPABASE_URL}/rest/v1/signals?id=eq.{sig_id}",
-            headers=headers(),
-            json={"stop_loss": new_sl},
-            timeout=15,
-        )
-    except Exception as e:
-        print(f"  Error update_signal_sl: {e}")
+    """
+    DESACTIVADA (esta version) — antes esta funcion sobreescribia la
+    columna 'stop_loss' de Supabase con el precio de entrada cuando se
+    activaba breakeven. Esa columna es la MISMA que se usa como base
+    para calcular el SL anti-hunt real (ANTI_HUNT_SL_EXTRA). Al
+    sobreescribirla, el SL original se perdia para siempre: en la
+    siguiente revision, el tracker leia 'entry_price' donde deberia
+    haber leido el SL original, le restaba/sumaba el colchon anti-hunt
+    sobre ese valor corrupto, y quedaba simulando un SL falso muy
+    pegado a la entrada — muy distinto del SL real y mas amplio que de
+    verdad protegia la operacion en MT5. Confirmado con la señal
+    5e2cd221 el 2026-08-05: quedo con stop_loss=entry_price en
+    Supabase, el tracker la cerro como LOSS a -2.0 pts, mientras el
+    trade real en MT5 (SL real 4182.51, muy lejos de la entrada) siguio
+    vivo y cerro en TP con +$23.52 de ganancia real.
+    El estado de breakeven ya se maneja localmente via breakeven_set /
+    breakeven_signals.txt (que ajusta la variable 'sl' EN MEMORIA en
+    cada corrida) — no hace falta persistir el cambio en la misma
+    columna que sirve de base para el calculo anti-hunt. Si en el
+    futuro se necesita ver el SL de breakeven desde fuera de este
+    script, debe guardarse en una columna NUEVA y separada (ej.
+    'breakeven_sl'), nunca sobre 'stop_loss'.
+    """
+    pass
 
 def _empty_strategy_bucket():
     return {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
