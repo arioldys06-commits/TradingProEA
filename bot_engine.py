@@ -10,7 +10,10 @@ Reglas:
 - Lotaje: FIJO por defecto (ver USE_FIXED_LOT/FIXED_LOT_SIZE), o dinamico
   segun balance real y % de riesgo (position_sizing.py) si USE_FIXED_LOT=false
 - Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
-- Maximo 2 perdidas por dia (real, leido del historial de MT5) — protege la cuenta si se deja corriendo sin supervision
+- Maximo N perdidas por dia (MAX_LOSSES_PER_DAY, real, leido del historial de MT5)
+  — protege la cuenta si se deja corriendo sin supervision
+- NUEVO: Maximo 2 perdidas POR KILLZONE (Londres 3-6 AM RD / NYC 9-12 PM RD),
+  independiente del limite diario general — protege cada sesion por separado
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
 - Maximo 6 operaciones por dia (configurable via MAX_DAILY en .env)
@@ -21,7 +24,21 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
-CAMBIOS EN ESTA VERSION (fix: auto-limpieza de señales vencidas):
+CAMBIOS EN ESTA VERSION (limite de perdidas por killzone):
+- Antes MAX_LOSSES_PER_DAY paraba el bot para TODO el dia apenas se
+  alcanzaban N perdidas, sin distinguir si esas perdidas fueron todas
+  en una sola sesion (ej. Londres de madrugada) o repartidas.
+- Ahora, ademas del limite diario general (que se mantiene igual, como
+  red de seguridad de todo el dia), se agrega un limite independiente
+  de MAX_LOSSES_PER_KILLZONE (2 por defecto) que solo se evalua cuando
+  la hora actual cae dentro de la killzone de Londres (3:00-6:00 RD) o
+  la de NYC (9:00-12:00 RD). Si una killzone llega a su limite, el bot
+  deja de operar SOLO durante esa ventana — si luego entra la otra
+  killzone, se evalua por separado desde cero.
+- Fuera de ambas killzones sigue rigiendo unicamente el limite diario
+  general (MAX_LOSSES_PER_DAY).
+
+CAMBIOS EN VERSION ANTERIOR (fix: auto-limpieza de señales vencidas):
 - Antes, cuando una señal PENDING se descartaba por vigencia (mas de
   MAX_SIGNAL_AGE_MINUTES o con el precio ya movido), el bot solo la
   ignoraba EN MEMORIA (imprimia "[VIGENCIA] ... descartada" y seguia).
@@ -52,7 +69,7 @@ import os
 import sys
 import time
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, time as dtime
 from dotenv import load_dotenv
 
 try:
@@ -83,7 +100,7 @@ USE_FIXED_LOT = os.getenv("USE_FIXED_LOT", "false").lower() == "true"
 FIXED_LOT_SIZE = float(os.getenv("FIXED_LOT_SIZE", "0.02"))
 MIN_SCORE = 75
 MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
-MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas
+MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas (limite general)
 SL_EXTRA_PTS = 20
 MAGIC_NUMBER = 20260601
 DEVIATION = 20
@@ -94,6 +111,16 @@ LOOP_INTERVAL = int(os.getenv("BOT_LOOP_INTERVAL", "60"))  # segundos entre cada
 # ── Filtro de vigencia (anti señal-vieja) ──
 MAX_SIGNAL_AGE_MINUTES = 10
 MAX_PRICE_DRIFT_RATIO = 0.6
+
+# ── Killzones (hora local RD, la misma que usa datetime.now() en esta PC) ──
+KILLZONE_LONDON = ("LONDON", dtime(3, 0), dtime(6, 0))
+KILLZONE_NYC    = ("NYC", dtime(9, 0), dtime(12, 0))
+KILLZONES = [KILLZONE_LONDON, KILLZONE_NYC]
+
+# Limite de perdidas POR KILLZONE, independiente de MAX_LOSSES_PER_DAY.
+# Si se alcanza dentro de una ventana, el bot pausa SOLO esa ventana —
+# la otra killzone se evalua por separado, desde cero.
+MAX_LOSSES_PER_KILLZONE = int(os.getenv("MAX_LOSSES_PER_KILLZONE", "2"))
 # ──────────────────────────────────────────────────────────────
 
 ALLOWED_STRATEGIES = [
@@ -225,36 +252,55 @@ def connect_mt5():
     return account
 
 
-def get_daily_losses():
-    today_start = datetime.combine(date.today(), datetime.min.time())
-    deals = mt5.history_deals_get(today_start, datetime.now())
-
+def _closing_deals_between(start_dt, end_dt):
+    """Deals de cierre (MAGIC_NUMBER, DEAL_ENTRY_OUT) entre dos datetime locales."""
+    deals = mt5.history_deals_get(start_dt, end_dt)
     if deals is None:
-        return 0
-
-    closing_deals = [
+        return []
+    return [
         d for d in deals
         if getattr(d, "magic", None) == MAGIC_NUMBER
         and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT
     ]
 
+
+def get_daily_losses():
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    closing_deals = _closing_deals_between(today_start, datetime.now())
     return sum(1 for d in closing_deals if d.profit < 0)
 
 
 def get_daily_wins():
     today_start = datetime.combine(date.today(), datetime.min.time())
-    deals = mt5.history_deals_get(today_start, datetime.now())
-
-    if deals is None:
-        return 0
-
-    closing_deals = [
-        d for d in deals
-        if getattr(d, "magic", None) == MAGIC_NUMBER
-        and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT
-    ]
-
+    closing_deals = _closing_deals_between(today_start, datetime.now())
     return sum(1 for d in closing_deals if d.profit >= 0)
+
+
+def get_current_killzone(now=None):
+    """
+    Devuelve (nombre, hora_inicio, hora_fin) de la killzone en la que cae
+    `now` (hora local RD), o None si esta fuera de ambas ventanas.
+    """
+    now = now or datetime.now()
+    t = now.time()
+    for name, start, end in KILLZONES:
+        if start <= t < end:
+            return name, start, end
+    return None
+
+
+def get_killzone_losses(start_time, end_time):
+    """
+    Cuenta perdidas reales (magic number, deal de cierre, profit<0) cuyo
+    cierre cayo dentro de la ventana horaria [start_time, end_time) de HOY.
+    Se usa para el limite MAX_LOSSES_PER_KILLZONE, independiente del
+    limite diario general.
+    """
+    today = date.today()
+    window_start = datetime.combine(today, start_time)
+    window_end = datetime.combine(today, end_time)
+    closing_deals = _closing_deals_between(window_start, window_end)
+    return sum(1 for d in closing_deals if d.profit < 0)
 
 
 def get_open_positions():
@@ -536,11 +582,13 @@ def update_signal_status(sig_id, status, intentos=3):
 
 
 _loss_alert_sent_date = None
+_kz_loss_alert_sent = {}  # {(date, killzone_name): True} — evita spamear Telegram cada ciclo
 
 
 def run_cycle():
     global _loss_alert_sent_date
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
     daily_count = get_daily_count()
     if daily_count >= MAX_DAILY:
@@ -561,6 +609,28 @@ def run_cycle():
             )
             _loss_alert_sent_date = date.today()
         return
+
+    # ── NUEVO: limite de perdidas POR KILLZONE (independiente del diario) ──
+    kz = get_current_killzone(now)
+    if kz is not None:
+        kz_name, kz_start, kz_end = kz
+        kz_losses = get_killzone_losses(kz_start, kz_end)
+        if kz_losses >= MAX_LOSSES_PER_KILLZONE:
+            print(
+                f"  [{now_str}] Limite de perdidas de killzone {kz_name} alcanzado "
+                f"({kz_losses}/{MAX_LOSSES_PER_KILLZONE}). Se pausa esta ventana."
+            )
+            alert_key = (date.today(), kz_name)
+            if _kz_loss_alert_sent.get(alert_key) is not True:
+                send_telegram(
+                    f"[BOT] Limite de perdidas en killzone {kz_name} — "
+                    f"{kz_losses}/{MAX_LOSSES_PER_KILLZONE}\n"
+                    f"El bot pausa esta ventana ({kz_start.strftime('%H:%M')}-"
+                    f"{kz_end.strftime('%H:%M')} RD). Se reactiva en la siguiente killzone.\n"
+                    f"Hora: {now_str}"
+                )
+                _kz_loss_alert_sent[alert_key] = True
+            return
 
     open_positions = get_open_positions()
     if open_positions:
@@ -652,6 +722,7 @@ def main():
     else:
         print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
+    print(f"  Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} (Londres 03:00-06:00 RD / NYC 09:00-12:00 RD)")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
     print(f"  Loop: cada {LOOP_INTERVAL}s — Ctrl+C para detener")
@@ -672,6 +743,7 @@ def main():
         send_telegram(
             f"[BOT] bot_engine.py INICIADO\n"
             f"Riesgo: {RISK_PERCENT}% | Score min: {MIN_SCORE} | Max diario: {MAX_DAILY}\n"
+            f"Max perdidas/dia: {MAX_LOSSES_PER_DAY} | Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE}\n"
             f"Loop: {LOOP_INTERVAL}s\n"
             f"Hora: {now_str}"
         )
