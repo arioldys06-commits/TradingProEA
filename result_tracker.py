@@ -28,6 +28,26 @@ FIX (esta version): get_pending_signals() solo buscaba señales con
   Ahora el filtro incluye status en (PENDING, EXECUTING), asi que las
   señales que ya se ejecutaron en MT5 tambien se siguen revisando
   hasta que toquen SL o TP y puedan cerrarse correctamente.
+
+FIX (esta version — SL anti-hunt desincronizado, causaba WIN reales
+  reportados como LOSS): bot_engine.py NUNCA ejecuta la orden real en
+  MT5 con el stop_loss tal cual viene en la señal de Supabase. Antes
+  de enviarla, le aplica calc_anti_hunt_sl(): un colchon extra de
+  SL_EXTRA_PTS (20 puntos * point del simbolo * 10) para que el SL
+  real quede mas lejos del precio de entrada y no lo cacen con un
+  spike corto. Ese SL ajustado es el que de verdad protege la cuenta
+  en MT5 — pero la tabla `signals` en Supabase solo guarda el SL
+  ORIGINAL (antes del colchon), y este tracker simulaba el cierre
+  contra ese SL angosto, no contra el real.
+  Efecto observado: el precio tocaba el SL angosto simulado por el
+  tracker (se marcaba LOSS) ANTES de llegar al SL real y mas amplio
+  que de verdad protegia la operacion — mientras en MT5 la operacion
+  seguia viva y terminaba tocando TP (WIN real). Confirmado con el
+  reporte del 2026-08-04 (8/8 marcadas LOSS por el tracker) contra el
+  historial real de MT5 (6 operaciones cerradas, las 6 en ganancia).
+  Ahora ANTI_HUNT_SL_EXTRA replica el mismo colchon que bot_engine.py
+  aplico al SL real, para que la simulacion cierre contra el mismo
+  nivel que de verdad protege la cuenta en MT5.
 """
 
 import os
@@ -46,6 +66,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 
 BREAKEVEN_FILE = "breakeven_signals.txt"
 LOOP_INTERVAL  = int(os.getenv("TRACKER_LOOP_INTERVAL", "60"))  # segundos entre cada revision
+
+# ── Colchon anti-hunt (NUEVO — replica el de bot_engine.py) ────
+# bot_engine.py abre la orden real en MT5 con un SL mas amplio que el
+# guardado en Supabase: calc_anti_hunt_sl() resta/suma
+# SL_EXTRA_PTS(20) * symbol.point * 10 al SL original. Para GOLD/XAUUSD
+# con point=0.01 eso da 20 * 0.01 * 10 = 2.0 en precio. Se deja
+# configurable via .env por si el simbolo/broker cambia de point.
+ANTI_HUNT_SL_EXTRA = float(os.getenv("ANTI_HUNT_SL_EXTRA", "2.0"))
 
 def headers():
     return {
@@ -89,19 +117,24 @@ def load_breakeven_signals():
 
 def save_breakeven_signals(sig_set, intentos=3):
     """
-    Guarda la lista de señales en breakeven. Reintenta hasta `intentos`
-    veces si el archivo esta bloqueado momentaneamente (OneDrive/WPSDrive
-    sincronizando, antivirus, etc). Si aun asi falla, NO relanza la
-    excepcion: solo lo registra en tracker_errors.log y sigue el ciclo.
-    Antes, un fallo aqui interrumpia run_cycle() a mitad de camino y
-    dejaba sin revisar el resto de las señales pendientes de ese ciclo.
+    Guarda la lista de señales en breakeven usando escritura atomica:
+    escribe primero a un archivo temporal y luego lo renombra sobre el
+    archivo final (os.replace). Esto evita el bloqueo tipico que
+    servicios de sincronizacion en la nube (OneDrive, WPSDrive) hacen
+    sobre el archivo original mientras lo estan subiendo/revisando —
+    el archivo temporal no esta bajo ese mismo bloqueo.
+    Si aun asi falla tras varios intentos, NO relanza la excepcion:
+    solo lo registra en tracker_errors.log y el ciclo continua normal.
     """
     ultimo_error = None
+    tmp_file = BREAKEVEN_FILE + ".tmp"
+
     for intento in range(1, intentos + 1):
         try:
-            with open(BREAKEVEN_FILE, "w") as f:
+            with open(tmp_file, "w") as f:
                 for s in list(sig_set)[-500:]:
                     f.write(s + "\n")
+            os.replace(tmp_file, BREAKEVEN_FILE)
             return True
         except Exception as e:
             ultimo_error = str(e)
@@ -110,7 +143,7 @@ def save_breakeven_signals(sig_set, intentos=3):
                 time.sleep(1)
 
     log_error_to_file(
-        f"NO SE PUDO ESCRIBIR {BREAKEVEN_FILE} tras {intentos} intentos. "
+        f"NO SE PUDO ESCRIBIR {BREAKEVEN_FILE} tras {intentos} intentos (incluso con escritura atomica). "
         f"Error: {ultimo_error} | El breakeven en Supabase SI se aplico, "
         f"solo no quedo registrado localmente para el filtro de duplicados."
     )
@@ -414,6 +447,18 @@ def run_cycle():
         tp2      = float(signal["take_profit_2"])
         created  = signal["created_at"]
 
+        # ── Colchon anti-hunt (NUEVO) ──
+        # Replica el mismo ajuste que bot_engine.py aplico al SL real en
+        # MT5 antes de enviar la orden (calc_anti_hunt_sl). Sin esto, el
+        # tracker simulaba el cierre contra el SL angosto original de
+        # Supabase, mas cerca del precio de entrada que el SL real que
+        # de verdad protege la operacion — marcando LOSS en trades que
+        # en la cuenta real seguian abiertos y terminaban en WIN.
+        if sig_type == "BUY":
+            sl = sl - ANTI_HUNT_SL_EXTRA
+        else:
+            sl = sl + ANTI_HUNT_SL_EXTRA
+
         if sig_id in breakeven_set:
             sl = entry
 
@@ -511,6 +556,7 @@ def main():
     print(f"\n{'='*50}")
     print(f"  RESULT TRACKER V3 — Loop continuo")
     print(f"  URL: {SUPABASE_URL}")
+    print(f"  Colchon anti-hunt SL: {ANTI_HUNT_SL_EXTRA} pts (replica bot_engine.py)")
     print(f"  Revisa cada {LOOP_INTERVAL}s — Ctrl+C para detener")
     print(f"{'='*50}")
 
