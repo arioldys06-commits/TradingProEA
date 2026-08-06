@@ -24,6 +24,23 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
+CAMBIOS EN ESTA VERSION (gestion de salida por cambio de estructura):
+- NUEVO: mientras hay una posicion real abierta de una estrategia marcada
+  en EARLY_EXIT_STRATEGIES (por ahora solo "EMA Pullback M5"), cada ciclo
+  el bot revisa las velas M5 recientes de Supabase buscando un CHoCH
+  (cambio de estructura) en contra de la direccion de la posicion abierta.
+  Si lo detecta, cierra la posicion completa a mercado de inmediato en vez
+  de esperar a que toque SL o TP1, y avisa por Telegram con el motivo y el
+  profit con el que cerro.
+- La deteccion de CHoCH es la MISMA logica que ya usa signal_engine.py en
+  la Estrategia 1 (Scalping M5 SMC): compara maximos/minimos de las
+  ultimas 5 velas M5 contra las 5 anteriores, sobre una ventana de 20
+  velas. Se replica aqui tal cual (ver detect_choch) para que el criterio
+  de salida no contradiga el criterio con el que se genero la señal.
+- Esto vive dentro de bot_engine.py (no en un proceso aparte) porque
+  run_cycle() ya revisa posiciones abiertas en cada ciclo — es el punto
+  natural para engancharlo, sin abrir una segunda conexion a MT5.
+
 CAMBIOS EN ESTA VERSION (limite de perdidas por killzone):
 - Antes MAX_LOSSES_PER_DAY paraba el bot para TODO el dia apenas se
   alcanzaban N perdidas, sin distinguir si esas perdidas fueron todas
@@ -121,6 +138,14 @@ KILLZONES = [KILLZONE_LONDON, KILLZONE_NYC]
 # Si se alcanza dentro de una ventana, el bot pausa SOLO esa ventana —
 # la otra killzone se evalua por separado, desde cero.
 MAX_LOSSES_PER_KILLZONE = int(os.getenv("MAX_LOSSES_PER_KILLZONE", "2"))
+
+# ── Gestion de salida por cambio de estructura (CHoCH) ──
+# Estrategias que, mientras tienen una posicion real abierta, se
+# monitorean en cada ciclo por si aparece un CHoCH en contra — de ser
+# asi, se cierra la posicion completa antes de esperar SL/TP1.
+EARLY_EXIT_STRATEGIES = ["EMA Pullback M5"]
+# Misma ventana que usa signal_engine.py para detectar CHoCH (20 velas M5).
+CHOCH_WINDOW = 20
 # ──────────────────────────────────────────────────────────────
 
 ALLOWED_STRATEGIES = [
@@ -310,6 +335,173 @@ def get_open_positions():
         return []
 
     return [p for p in positions if getattr(p, "magic", None) == MAGIC_NUMBER]
+
+
+# ── Gestion de salida por cambio de estructura (CHoCH) ─────────
+
+def get_recent_m5_candles(limit=30):
+    """Trae las ultimas velas M5 de Supabase (mismo origen que usa
+    signal_engine.py) para poder evaluar CHoCH sobre una posicion
+    ya abierta."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/ohlc_candles",
+            headers=headers(),
+            params={
+                "select":     "candle_time,high,low,close",
+                "instrument": "eq.XAUUSD",
+                "timeframe":  "eq.M5",
+                "order":      "candle_time.desc",
+                "limit":      str(limit),
+            },
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            return []
+        return list(reversed(r.json()))  # orden cronologico
+    except Exception:
+        return []
+
+
+def detect_choch(candles):
+    """
+    Replica EXACTA de la deteccion de CHoCH que usa signal_engine.py
+    en la Estrategia 1 (Scalping M5 SMC): compara el maximo/minimo de
+    las ultimas 5 velas contra el maximo/minimo de las 5 anteriores,
+    dentro de una ventana de CHOCH_WINDOW velas M5.
+    Devuelve "BUY", "SELL" o None.
+    """
+    if len(candles) < CHOCH_WINDOW:
+        return None
+
+    r = candles[-CHOCH_WINDOW:]
+    rH = max(float(c["high"]) for c in r[-5:])
+    pH = max(float(c["high"]) for c in r[-10:-5])
+    rL = min(float(c["low"]) for c in r[-5:])
+    pL = min(float(c["low"]) for c in r[-10:-5])
+
+    if rH > pH and rL < pL:
+        return "BUY"
+    if rH < pH and rL > pL:
+        return "SELL"
+    return None
+
+
+def get_strategy_by_position_comment(comment):
+    """
+    El comment de la orden real en MT5 es 'TradingPro_{signal_id[:8]}'
+    (ver execute_order). Busca en Supabase la señal cuyo id empieza
+    con ese prefijo para saber de que estrategia es la posicion
+    abierta — asi la gestion de salida por CHoCH solo se aplica a las
+    estrategias listadas en EARLY_EXIT_STRATEGIES.
+    """
+    if not comment or not comment.startswith("TradingPro_"):
+        return None
+    prefix = comment.replace("TradingPro_", "").strip()
+    if not prefix:
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/signals",
+            headers=headers(),
+            params={
+                "id":     f"like.{prefix}*",
+                "select": "strategy",
+                "limit":  "1",
+            },
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+        return data[0]["strategy"] if data else None
+    except Exception:
+        return None
+
+
+def close_position_market(position, motivo=""):
+    """
+    Cierra a mercado el 100% de una posicion abierta (orden inversa
+    sobre el mismo ticket). Se usa para el cierre anticipado por CHoCH
+    en contra — no espera a que el precio toque SL o TP1.
+    """
+    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    if tick is None:
+        return False, None, "Sin precio disponible en MT5 para cerrar la posicion"
+
+    is_buy = position.type == mt5.POSITION_TYPE_BUY
+    close_price = tick.bid if is_buy else tick.ask
+
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       MT5_SYMBOL,
+        "volume":       position.volume,
+        "type":         mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+        "position":     position.ticket,
+        "price":        close_price,
+        "deviation":    DEVIATION,
+        "magic":        MAGIC_NUMBER,
+        "comment":      "CHoCH_exit",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+
+    if result is None:
+        error_code, error_desc = mt5.last_error()
+        detalle = f"order_send devolvio None al cerrar. last_error: {error_code} - {error_desc}"
+        return False, None, detalle
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        detalle = f"Cierre rechazado. Retcode: {result.retcode} - {result.comment}"
+        return False, None, detalle
+
+    return True, close_price, None
+
+
+def check_choch_exit(position, side, strategy, now_str):
+    """
+    Si la posicion abierta pertenece a una estrategia con gestion de
+    salida temprana (EARLY_EXIT_STRATEGIES) y aparece un CHoCH en
+    contra de su direccion, la cierra de inmediato. Devuelve True si
+    cerro la posicion (para que run_cycle no siga evaluando nada mas
+    ese ciclo), False si no hizo nada.
+    """
+    if strategy not in EARLY_EXIT_STRATEGIES:
+        return False
+
+    candles = get_recent_m5_candles(30)
+    choch = detect_choch(candles)
+
+    if not choch or choch == side:
+        return False
+
+    profit_antes = round(position.profit, 2)
+    ok, close_price, error_detail = close_position_market(position)
+
+    if not ok:
+        print(f"  [CHoCH EXIT] Error cerrando ticket {position.ticket}: {error_detail}")
+        log_error_to_file(
+            f"CHoCH exit fallo — ticket {position.ticket} ({strategy}, {side}): {error_detail}"
+        )
+        return False
+
+    print(
+        f"  [CHoCH EXIT] {strategy} — CHoCH {choch} detectado en contra de {side}. "
+        f"Posicion {position.ticket} cerrada @ {close_price} | Profit aprox: ${profit_antes}"
+    )
+    send_telegram(
+        f"[BOT] CIERRE ANTICIPADO — {strategy}\n"
+        f"Motivo: cambio de estructura (CHoCH {choch}) en contra de {side}\n"
+        f"Ticket: {position.ticket}\n"
+        f"Precio de cierre: {close_price}\n"
+        f"Profit aprox.: ${profit_antes}\n"
+        f"Hora: {now_str}"
+    )
+    return True
 
 
 def is_signal_stale(signal, current_price):
@@ -640,6 +832,12 @@ def run_cycle():
             f"  [{now_str}] Posicion abierta: ticket {pos.ticket} | {side} | "
             f"Profit: ${round(pos.profit, 2)}"
         )
+
+        # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
+        strategy = get_strategy_by_position_comment(getattr(pos, "comment", None))
+        if strategy in EARLY_EXIT_STRATEGIES:
+            check_choch_exit(pos, side, strategy, now_str)
+
         return
 
     signals = get_pending_signals(current_price=get_current_price()[0])
@@ -723,6 +921,7 @@ def main():
         print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} (Londres 03:00-06:00 RD / NYC 09:00-12:00 RD)")
+    print(f"  Salida por CHoCH activa para: {', '.join(EARLY_EXIT_STRATEGIES)}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
     print(f"  Loop: cada {LOOP_INTERVAL}s — Ctrl+C para detener")
