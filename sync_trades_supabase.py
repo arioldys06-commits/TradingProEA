@@ -8,7 +8,23 @@ REQUISITOS:
 - Variables de entorno ya existentes: SUPABASE_URL, SUPABASE_KEY (o SERVICE_ROLE_KEY),
   MT5_MAGIC (20260601), MT5_SYMBOL (GOLD)
 
-FIX EN ESTA VERSION (vinculo strategy/signal_id + loop por defecto):
+FIX EN ESTA VERSION (timezone de close_time + open_time/precio_apertura):
+  - close_time se guardaba con datetime.fromtimestamp(d.time), que convierte
+    el timestamp Unix (UTC real) a la hora LOCAL de la PC (RD, UTC-4) y
+    luego lo guarda sin indicar zona horaria. Supabase, al no ver zona,
+    lo interpreta como si ya fuera UTC — restando 4 horas de mas a la
+    hora real de cierre. Confirmado el 2026-08-07: los trades de esa
+    mañana quedaron con close_time ANTERIOR a la hora en que se creo la
+    señal que los origino, lo cual es imposible.
+    Fix: datetime.fromtimestamp(d.time, tz=timezone.utc) — convierte el
+    epoch directamente a UTC real, sin pasar por la zona local de la PC.
+  - open_time y precio_apertura estaban SIEMPRE en null: el diccionario
+    comentarios_apertura solo guardaba el comentario del deal de
+    apertura, nunca su tiempo ni su precio, aunque ambos ya estaban
+    disponibles en ese mismo deal. Ahora se guardan los tres juntos
+    (comment, time, price) y se escriben en el registro final.
+
+FIX (version anterior, vinculo strategy/signal_id + loop por defecto):
   - Antes, cada registro subido a `trades_ejecutados` nunca incluia `strategy`
     ni `signal_id`, aunque el dato SI estaba disponible: bot_engine.py pone
     en el comentario de cada orden "TradingPro_{signal_id[:8]}" (los primeros
@@ -32,7 +48,7 @@ import os
 import sys
 import time
 import MetaTrader5 as mt5
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -133,7 +149,14 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     perdiendo el comentario original "TradingPro_xxxxxxxx" que puso
     bot_engine.py al abrir la orden. Ese comentario original SI se
     conserva en el deal de apertura (ENTRY_IN) de la misma posicion, asi
-    que hay que buscarlo ahi usando el position_id en comun.
+    que hay que buscarlo ahi usando el position_id en comun — y de paso
+    se aprovecha ese mismo deal para tomar open_time y precio_apertura.
+
+    Todos los timestamps de MT5 (d.time) son epoch Unix en UTC real, asi
+    que se convierten con datetime.fromtimestamp(d.time, tz=timezone.utc)
+    — NUNCA sin tz, porque eso los convierte a la hora local de la PC
+    (RD, UTC-4) sin decirlo, y Supabase termina interpretandolos como si
+    ya fueran UTC (le resta 4 horas de mas a la hora real de cierre).
     """
     desde = datetime.now() - timedelta(days=dias_atras)
     hasta = datetime.now()
@@ -145,10 +168,11 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         print("[sync_trades] No hay deals en el rango consultado.")
         return
 
-    # Comentario original por position_id, tomado del deal de APERTURA
-    # (el unico que conserva el "TradingPro_xxxxxxxx" que puso bot_engine.py)
-    comentarios_apertura = {
-        d.position_id: d.comment
+    # Info del deal de APERTURA por position_id (comment, time, price) —
+    # es el unico que conserva el "TradingPro_xxxxxxxx" que puso
+    # bot_engine.py, y de donde sale open_time/precio_apertura.
+    aperturas = {
+        d.position_id: {"comment": d.comment, "time": d.time, "price": d.price}
         for d in deals
         if d.magic == MAGIC and d.entry == mt5.DEAL_ENTRY_IN
     }
@@ -169,10 +193,17 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     for d in deals_cierre:
         profit_neto = d.profit + d.swap + d.commission
 
-        comentario_apertura = comentarios_apertura.get(d.position_id)
+        apertura = aperturas.get(d.position_id)
+        comentario_apertura = apertura.get("comment") if apertura else None
         signal_id, strategy = buscar_signal_por_comentario(comentario_apertura)
         if signal_id:
             vinculados += 1
+
+        open_time = (
+            datetime.fromtimestamp(apertura["time"], tz=timezone.utc).isoformat()
+            if apertura else None
+        )
+        precio_apertura = apertura["price"] if apertura else None
 
         registros.append({
             "ticket": d.ticket,
@@ -180,12 +211,14 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
             "symbol": d.symbol or SYMBOL,
             "tipo": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
             "volumen": d.volume,
+            "precio_apertura": precio_apertura,
             "precio_cierre": d.price,
             "profit": d.profit,
             "swap": d.swap,
             "comision": d.commission,
             "profit_neto": profit_neto,
-            "close_time": datetime.fromtimestamp(d.time).isoformat(),
+            "open_time": open_time,
+            "close_time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat(),
             "comentario": d.comment,  # razon de cierre (sl/tp), se conserva tal cual
             "signal_id": signal_id,
             "strategy": strategy,
