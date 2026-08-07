@@ -24,6 +24,21 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
+CAMBIOS EN ESTA VERSION (breakeven real al 70% del camino a TP1):
+- NUEVO: mientras hay una posicion real abierta, si el precio ya
+  recorrio BREAKEVEN_TRIGGER_PCT (70% por defecto) de la distancia
+  entre la entrada y el TP1, el bot mueve el SL real en MT5 al precio
+  de entrada (TRADE_ACTION_SLTP). A partir de ahi, lo peor que puede
+  pasar en esa posicion es cerrar en $0 — nunca convierte una
+  operacion que iba ganando en perdida.
+- Se aplica una sola vez por posicion (rastreado en memoria via
+  _breakeven_applied) para no reenviar la misma modificacion en cada
+  ciclo. Se aplica a TODAS las estrategias, no solo a las que tienen
+  gestion de salida por CHoCH — es proteccion de riesgo general.
+- Antes de este cambio, el breakeven SOLO existia en la simulacion de
+  result_tracker.py (para estimar resultados de señales), nunca se
+  aplicaba de verdad sobre la posicion real en la cuenta.
+
 CAMBIOS EN ESTA VERSION (gestion de salida por cambio de estructura):
 - NUEVO: mientras hay una posicion real abierta de una estrategia marcada
   en EARLY_EXIT_STRATEGIES (por ahora solo "EMA Pullback M5"), cada ciclo
@@ -146,6 +161,11 @@ MAX_LOSSES_PER_KILLZONE = int(os.getenv("MAX_LOSSES_PER_KILLZONE", "2"))
 EARLY_EXIT_STRATEGIES = ["EMA Pullback M5"]
 # Misma ventana que usa signal_engine.py para detectar CHoCH (20 velas M5).
 CHOCH_WINDOW = 20
+
+# ── Breakeven real al 80% del camino a TP1 ──
+# Se aplica a TODAS las estrategias (no solo a las de EARLY_EXIT_STRATEGIES):
+# es proteccion de riesgo general, independiente de la gestion por CHoCH.
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.7"))
 # ──────────────────────────────────────────────────────────────
 
 ALLOWED_STRATEGIES = [
@@ -460,6 +480,94 @@ def close_position_market(position, motivo=""):
         return False, None, detalle
 
     return True, close_price, None
+
+
+# ── Breakeven real al 80% del camino a TP1 ──────────────────────
+
+_breakeven_applied = set()  # tickets ya movidos a breakeven en esta sesion
+
+
+def modify_position_sltp(position, new_sl, new_tp=None):
+    """Modifica el SL (y opcionalmente TP) de una posicion real ya
+    abierta en MT5, sin cerrarla."""
+    request = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "symbol":   MT5_SYMBOL,
+        "position": position.ticket,
+        "sl":       round(new_sl, 2),
+        "tp":       round(new_tp if new_tp is not None else position.tp, 2),
+    }
+    result = mt5.order_send(request)
+
+    if result is None:
+        error_code, error_desc = mt5.last_error()
+        return False, f"order_send devolvio None. last_error: {error_code} - {error_desc}"
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return False, f"Modificacion rechazada. Retcode: {result.retcode} - {result.comment}"
+
+    return True, None
+
+
+def check_breakeven(position, side, now_str):
+    """
+    Si el precio ya recorrio BREAKEVEN_TRIGGER_PCT (80% por defecto)
+    de la distancia entre la entrada y el TP1 (position.tp, el mismo
+    TP1 que se fijo al abrir la orden), mueve el SL real a la entrada.
+    Se aplica una sola vez por ticket. Independiente de la estrategia
+    y de la gestion por CHoCH.
+    """
+    if position.ticket in _breakeven_applied:
+        return False
+
+    entry = position.price_open
+    tp1 = position.tp
+
+    if position.sl and abs(position.sl - entry) < 0.01:
+        # Ya esta en breakeven (ej. si el bot se reinicio despues de aplicarlo)
+        _breakeven_applied.add(position.ticket)
+        return False
+
+    if not tp1:
+        return False
+
+    distancia_total = abs(tp1 - entry)
+    if distancia_total <= 0:
+        return False
+
+    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    if tick is None:
+        return False
+
+    # Precio conservador: el que realmente obtendrias si cerraras ahora
+    precio_actual = tick.bid if side == "BUY" else tick.ask
+    recorrido = (precio_actual - entry) if side == "BUY" else (entry - precio_actual)
+    progreso = recorrido / distancia_total
+
+    if progreso < BREAKEVEN_TRIGGER_PCT:
+        return False
+
+    ok, error_detail = modify_position_sltp(position, new_sl=entry)
+
+    if not ok:
+        print(f"  [BREAKEVEN] Error moviendo SL a breakeven en ticket {position.ticket}: {error_detail}")
+        log_error_to_file(f"Breakeven fallo — ticket {position.ticket}: {error_detail}")
+        return False
+
+    _breakeven_applied.add(position.ticket)
+    print(
+        f"  [BREAKEVEN] Ticket {position.ticket} — SL movido a entrada ({entry}) "
+        f"al {progreso*100:.0f}% del camino a TP1"
+    )
+    send_telegram(
+        f"[BOT] BREAKEVEN ACTIVADO\n"
+        f"Ticket: {position.ticket}\n"
+        f"SL movido a precio de entrada: {entry}\n"
+        f"Progreso hacia TP1: {progreso*100:.0f}%\n"
+        f"Riesgo restante en esta operacion: $0\n"
+        f"Hora: {now_str}"
+    )
+    return True
 
 
 def check_choch_exit(position, side, strategy, now_str):
@@ -833,6 +941,9 @@ def run_cycle():
             f"Profit: ${round(pos.profit, 2)}"
         )
 
+        # ── NUEVO: breakeven real al 80% del camino a TP1 (todas las estrategias) ──
+        check_breakeven(pos, side, now_str)
+
         # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
         strategy = get_strategy_by_position_comment(getattr(pos, "comment", None))
         if strategy in EARLY_EXIT_STRATEGIES:
@@ -921,6 +1032,7 @@ def main():
         print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} (Londres 03:00-06:00 RD / NYC 09:00-12:00 RD)")
+    print(f"  Breakeven real al {BREAKEVEN_TRIGGER_PCT*100:.0f}% del camino a TP1 (todas las estrategias)")
     print(f"  Salida por CHoCH activa para: {', '.join(EARLY_EXIT_STRATEGIES)}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
