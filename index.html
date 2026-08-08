@@ -888,6 +888,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <div class="page-title" style="margin:0">P&amp;L Real — Trades ejecutados</div>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <div id="pnl-filters" style="display:flex;gap:6px"></div>
+      <div style="display:flex;align-items:center;gap:6px;background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r);padding:4px 8px">
+        <input type="date" id="pnl-date-start" style="background:var(--bg);border:1px solid var(--b1);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px;font-family:var(--mono);outline:none;color-scheme:dark">
+        <span style="color:var(--dim);font-size:11px">→</span>
+        <input type="date" id="pnl-date-end" style="background:var(--bg);border:1px solid var(--b1);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px;font-family:var(--mono);outline:none;color-scheme:dark">
+        <button onclick="applyPnlCustomRange()" style="background:var(--bg2);color:var(--muted);border:1px solid var(--b1);border-radius:4px;padding:5px 10px;font-size:11px;font-weight:600;cursor:pointer">Aplicar</button>
+      </div>
       <button onclick="loadPnlPage()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Actualizar</button>
     </div>
   </div>
@@ -1232,7 +1238,8 @@ function signalCard(s) {
 }
 
 let pnlAllTrades = [];
-let pnlFilterDays = 0; // 0 = todos
+let pnlFilterDays = 0; // 0 = todos, 'custom' = rango manual
+let pnlCustomRange = null; // {start: Date, end: Date} cuando pnlFilterDays === 'custom'
 
 async function loadPnlPage() {
   const { data: trades, error } = await sb.from('trades_ejecutados').select('*').order('close_time', { ascending: true });
@@ -1257,11 +1264,49 @@ function renderPnlFilters() {
 
 function setPnlFilter(days) {
   pnlFilterDays = days === 'yesterday' ? 'yesterday' : +days;
+  pnlCustomRange = null;
+  // Limpia visualmente los inputs de fecha manual al usar un filtro rápido
+  const startEl = document.getElementById('pnl-date-start');
+  const endEl = document.getElementById('pnl-date-end');
+  if (startEl) startEl.value = '';
+  if (endEl) endEl.value = '';
   renderPnlFilters();
   renderPnlPage();
 }
 
+// ── NUEVO: rango de fechas manual ──
+function applyPnlCustomRange() {
+  const startEl = document.getElementById('pnl-date-start');
+  const endEl = document.getElementById('pnl-date-end');
+  const startVal = startEl?.value;
+  const endVal = endEl?.value;
+
+  if (!startVal || !endVal) {
+    alert('Selecciona una fecha de inicio y una de fin.');
+    return;
+  }
+
+  const start = new Date(startVal + 'T00:00:00');
+  const end = new Date(endVal + 'T23:59:59');
+
+  if (start > end) {
+    alert('La fecha de inicio no puede ser posterior a la fecha de fin.');
+    return;
+  }
+
+  pnlFilterDays = 'custom';
+  pnlCustomRange = { start, end };
+  renderPnlFilters(); // ningun boton rapido queda marcado como activo
+  renderPnlPage();
+}
+
 function filterTradesByDays(trades, days) {
+  if (days === 'custom' && pnlCustomRange) {
+    return trades.filter(t => {
+      const ct = new Date(t.close_time);
+      return ct >= pnlCustomRange.start && ct <= pnlCustomRange.end;
+    });
+  }
   if (!days || days === 0) return trades;
   const now = new Date();
   if (days === 'yesterday') {
