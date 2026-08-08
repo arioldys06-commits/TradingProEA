@@ -24,6 +24,29 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
+CAMBIOS EN ESTA VERSION (trailing stop por ATR despues del breakeven):
+- NUEVO: una vez que el breakeven ya se activo en una posicion (SL en
+  la entrada), el bot empieza a "arrastrar" el SL detrás del precio
+  usando una distancia = ATR(14) de M5 x TRAILING_ATR_MULTIPLIER (1.2
+  por defecto — mismo multiplicador que ya usa strategy_ema_pullback()
+  en signal_engine.py para su SL original, por consistencia).
+- La distancia se adapta sola a la volatilidad del momento: en oro,
+  con velas de rango muy variable, un trailing de puntos fijos o
+  atrapa al precio con cualquier mecha normal (si es corto) o deja
+  ganancia enorme sin proteger (si es largo). Con ATR, un dia tranquilo
+  el trailing va mas pegado; un dia volatil (como el 2026-08-07,
+  reversion en V que dejo un trade en breakeven sin capturar nada de
+  los +$29 flotantes que llego a tener) se amplia solo.
+- Regla dura: el SL SOLO se mueve hacia adelante (a favor del trade),
+  nunca hacia atras — si el ATR crece y "sugeriria" alejar el stop, se
+  ignora esa actualizacion en vez de darle mas espacio del ya ganado.
+- Se aplica exclusivamente a posiciones que YA tienen el breakeven
+  activo (no antes) — antes de eso el SL sigue siendo el anti-hunt
+  original. Aplica a todas las estrategias, igual que el breakeven.
+- Aviso por Telegram solo la PRIMERA vez que el trailing mueve el SL
+  por ticket (para no saturar el canal); los ajustes siguientes solo
+  quedan en el log de consola.
+
 CAMBIOS EN ESTA VERSION (breakeven real al 70% del camino a TP1):
 - NUEVO: mientras hay una posicion real abierta, si el precio ya
   recorrio BREAKEVEN_TRIGGER_PCT (70% por defecto) de la distancia
@@ -162,10 +185,16 @@ EARLY_EXIT_STRATEGIES = ["EMA Pullback M5"]
 # Misma ventana que usa signal_engine.py para detectar CHoCH (20 velas M5).
 CHOCH_WINDOW = 20
 
-# ── Breakeven real al 80% del camino a TP1 ──
+# ── Breakeven real al 70% del camino a TP1 ──
 # Se aplica a TODAS las estrategias (no solo a las de EARLY_EXIT_STRATEGIES):
 # es proteccion de riesgo general, independiente de la gestion por CHoCH.
 BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.7"))
+
+# ── Trailing stop por ATR, activo solo despues del breakeven ──
+# Distancia = ATR(14) de M5 x este multiplicador. 1.2 es el mismo que
+# usa strategy_ema_pullback() en signal_engine.py para su SL original.
+TRAILING_ATR_MULTIPLIER = float(os.getenv("TRAILING_ATR_MULTIPLIER", "1.2"))
+TRAILING_ATR_PERIOD = 14
 # ──────────────────────────────────────────────────────────────
 
 ALLOWED_STRATEGIES = [
@@ -482,9 +511,27 @@ def close_position_market(position, motivo=""):
     return True, close_price, None
 
 
-# ── Breakeven real al 80% del camino a TP1 ──────────────────────
+# ── Breakeven real al 70% del camino a TP1 ──────────────────────
 
 _breakeven_applied = set()  # tickets ya movidos a breakeven en esta sesion
+_trailing_activated = set()  # tickets donde ya se aviso el primer trailing
+
+
+def calc_atr_m5(candles, period=14):
+    """
+    ATR(period) sobre velas M5 (mismo calculo que usa signal_engine.py
+    en calc_atr). candles debe traer high/low/close en orden
+    cronologico — get_recent_m5_candles() ya las devuelve asi.
+    """
+    if len(candles) < period + 1:
+        return 0
+    trs = []
+    for i in range(1, len(candles)):
+        h = float(candles[i]["high"])
+        l = float(candles[i]["low"])
+        pc = float(candles[i - 1]["close"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / period
 
 
 def modify_position_sltp(position, new_sl, new_tp=None):
@@ -511,7 +558,7 @@ def modify_position_sltp(position, new_sl, new_tp=None):
 
 def check_breakeven(position, side, now_str):
     """
-    Si el precio ya recorrio BREAKEVEN_TRIGGER_PCT (80% por defecto)
+    Si el precio ya recorrio BREAKEVEN_TRIGGER_PCT (70% por defecto)
     de la distancia entre la entrada y el TP1 (position.tp, el mismo
     TP1 que se fijo al abrir la orden), mueve el SL real a la entrada.
     Se aplica una sola vez por ticket. Independiente de la estrategia
@@ -567,6 +614,69 @@ def check_breakeven(position, side, now_str):
         f"Riesgo restante en esta operacion: $0\n"
         f"Hora: {now_str}"
     )
+    return True
+
+
+def check_trailing_stop(position, side, now_str):
+    """
+    Una vez que el breakeven ya esta activo en esta posicion (ticket en
+    _breakeven_applied), arrastra el SL detras del precio a una
+    distancia de ATR(14) de M5 x TRAILING_ATR_MULTIPLIER. Nunca antes
+    del breakeven — hasta ese punto el SL sigue siendo el anti-hunt
+    original.
+    Regla dura: el SL SOLO se mueve a favor del trade, nunca hacia
+    atras (no le da mas espacio del que ya se gano).
+    Devuelve True si movio el SL, False si no hizo nada.
+    """
+    if position.ticket not in _breakeven_applied:
+        return False
+
+    candles = get_recent_m5_candles(30)
+    atr = calc_atr_m5(candles, TRAILING_ATR_PERIOD)
+    if atr <= 0:
+        return False
+
+    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    if tick is None:
+        return False
+
+    precio_actual = tick.bid if side == "BUY" else tick.ask
+    distancia = atr * TRAILING_ATR_MULTIPLIER
+
+    if side == "BUY":
+        nuevo_sl = round(precio_actual - distancia, 2)
+        # Solo mejora si el nuevo SL queda mas arriba que el actual
+        if position.sl is None or nuevo_sl <= position.sl:
+            return False
+    else:
+        nuevo_sl = round(precio_actual + distancia, 2)
+        # Solo mejora si el nuevo SL queda mas abajo que el actual
+        if position.sl is None or nuevo_sl >= position.sl:
+            return False
+
+    ok, error_detail = modify_position_sltp(position, new_sl=nuevo_sl)
+
+    if not ok:
+        print(f"  [TRAILING] Error moviendo SL en ticket {position.ticket}: {error_detail}")
+        log_error_to_file(f"Trailing ATR fallo — ticket {position.ticket}: {error_detail}")
+        return False
+
+    print(
+        f"  [TRAILING] Ticket {position.ticket} — SL movido a {nuevo_sl} "
+        f"(ATR={atr:.2f} x {TRAILING_ATR_MULTIPLIER})"
+    )
+
+    if position.ticket not in _trailing_activated:
+        _trailing_activated.add(position.ticket)
+        send_telegram(
+            f"[BOT] TRAILING STOP ACTIVADO\n"
+            f"Ticket: {position.ticket}\n"
+            f"SL ahora en: {nuevo_sl}\n"
+            f"Distancia: ATR {atr:.2f} x {TRAILING_ATR_MULTIPLIER}\n"
+            f"El SL seguira moviendose a favor del trade mientras siga ganando.\n"
+            f"Hora: {now_str}"
+        )
+
     return True
 
 
@@ -941,8 +1051,11 @@ def run_cycle():
             f"Profit: ${round(pos.profit, 2)}"
         )
 
-        # ── NUEVO: breakeven real al 80% del camino a TP1 (todas las estrategias) ──
+        # ── NUEVO: breakeven real al 70% del camino a TP1 (todas las estrategias) ──
         check_breakeven(pos, side, now_str)
+
+        # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
+        check_trailing_stop(pos, side, now_str)
 
         # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
         strategy = get_strategy_by_position_comment(getattr(pos, "comment", None))
@@ -1033,6 +1146,7 @@ def main():
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} (Londres 03:00-06:00 RD / NYC 09:00-12:00 RD)")
     print(f"  Breakeven real al {BREAKEVEN_TRIGGER_PCT*100:.0f}% del camino a TP1 (todas las estrategias)")
+    print(f"  Trailing stop por ATR x{TRAILING_ATR_MULTIPLIER} despues del breakeven (todas las estrategias)")
     print(f"  Salida por CHoCH activa para: {', '.join(EARLY_EXIT_STRATEGIES)}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
