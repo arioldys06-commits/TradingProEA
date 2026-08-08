@@ -8,6 +8,56 @@ REQUISITOS:
 - Variables de entorno ya existentes: SUPABASE_URL, SUPABASE_KEY (o SERVICE_ROLE_KEY),
   MT5_MAGIC (20260601), MT5_SYMBOL (GOLD)
 
+FIX EN ESTA VERSION (perdida de vinculo strategy/signal_id en re-sincronizaciones):
+  - BUG ENCONTRADO el 2026-08-07: si cargar_signals_cache() fallaba por
+    cualquier motivo (timeout, corte de red), el codigo anterior dejaba
+    _signals_cache = {} y SEGUIA con la sincronizacion igual. Con el
+    cache vacio, ningun trade de ese ciclo encontraba su señal — y como
+    el script hace upsert escribiendo signal_id/strategy explicitamente
+    (incluso como None), sobreescribia con null datos que YA estaban
+    correctamente vinculados de un ciclo anterior. Confirmado: 4 trades
+    de EMA Pullback M5 del 2026-08-05 que ya tenian su estrategia bien
+    vinculada aparecieron en null tras una resincronizacion posterior.
+    Se repararon manualmente cruzando precio_cierre contra la señal
+    original, pero el codigo tenia que corregirse para que no vuelva a
+    pasar.
+  - Dos cambios:
+    1. Si cargar_signals_cache() falla, sincronizar_trades_cerrados()
+       AHORA ABORTA el ciclo completo (no sube nada) en vez de seguir
+       con el cache vacio. Es preferible perder un ciclo de
+       sincronizacion (90s) que corromper datos ya buenos.
+    2. Aunque el cache cargue bien, si un trade puntual no encuentra
+       coincidencia (señal muy vieja, orden abierta manualmente sin
+       pasar por el bot, etc.), las claves "signal_id" y "strategy" ya
+       NO se incluyen en el registro que se manda a Supabase — en vez
+       de mandarlas como None. Un upsert que omite una clave no toca
+       esa columna en la fila existente, mientras que mandarla como
+       None SI la sobreescribe. Asi un trade que ya tenia vinculo
+       correcto nunca se puede corromper por un fallo de match en un
+       ciclo posterior.
+
+FIX EN ESTA VERSION (offset de zona horaria del servidor del broker):
+  - Los timestamps de los deals en MT5 (d.time) vienen en hora del
+    SERVIDOR del broker (XMGlobal, EEST = UTC+3 en verano / EET = UTC+2
+    en invierno), NO en UTC real — aunque se entreguen como epoch Unix.
+    Confirmado el 2026-08-07 comparando open_time contra el created_at
+    de la señal que origino cada trade: sin corregir este offset, el
+    open_time quedaba 3 horas adelantado respecto a la señal.
+  - Se intento detectar el offset dinamicamente comparando la hora del
+    ultimo TICK en vivo de MT5 contra datetime.now(timezone.utc) real
+    del sistema. NO funciono: el feed de precios en vivo (ticks) SI
+    viene sincronizado a UTC real en este broker, pero el HISTORIAL de
+    deals cerrados guarda la hora del servidor al momento de la
+    ejecucion — son dos relojes distintos dentro del mismo MT5.
+    Comparar contra el tick daba offset 0 y no corregia nada.
+  - Por eso el offset queda como variable fija en .env
+    (BROKER_UTC_OFFSET_HOURS, por defecto 3 = EEST). Hay que
+    actualizarla a mano 2 veces al año cuando cambia el horario de
+    verano europeo (a 2 en otoño/invierno, de vuelta a 3 en primavera).
+    Menos elegante que la deteccion automatica, pero es lo confiable
+    dado que este MT5 no expone un reloj de referencia consistente
+    entre ticks en vivo e historial de deals.
+
 FIX EN ESTA VERSION (timezone de close_time + open_time/precio_apertura):
   - close_time se guardaba con datetime.fromtimestamp(d.time), que convierte
     el timestamp Unix (UTC real) a la hora LOCAL de la PC (RD, UTC-4) y
@@ -47,6 +97,7 @@ FIX (version anterior, vinculo strategy/signal_id + loop por defecto):
 import os
 import sys
 import time
+from collections import defaultdict
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
@@ -59,6 +110,11 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # usa service_role si vas a hacer upse
 MAGIC = int(os.getenv("MT5_MAGIC", "20260601"))
 SYMBOL = os.getenv("MT5_SYMBOL", "GOLD")
 LOOP_INTERVAL = int(os.getenv("SYNC_LOOP_INTERVAL", "90"))  # segundos entre cada sincronizacion
+# Offset del servidor del broker respecto a UTC real, en horas. XMGlobal
+# corre en EEST (UTC+3) en horario de verano europeo, EET (UTC+2) en
+# invierno. Ver docstring arriba (FIX offset de zona horaria) sobre por
+# que esto NO se puede detectar automaticamente en este broker.
+BROKER_UTC_OFFSET_HOURS = float(os.getenv("BROKER_UTC_OFFSET_HOURS", "3"))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise SystemExit(
@@ -94,6 +150,14 @@ def cargar_signals_cache():
     Se guarda el id COMPLETO (no solo el prefijo) porque la columna
     signal_id en trades_ejecutados tambien es tipo uuid — un string
     parcial de 8 caracteres seria rechazado al hacer el upsert.
+
+    Devuelve True si la carga fue exitosa, False si fallo. Es
+    responsabilidad de quien llama a esta funcion NO continuar con la
+    sincronizacion si devuelve False — ver el FIX en el docstring del
+    modulo (perdida de vinculo strategy/signal_id) sobre por que
+    seguir con el cache vacio es peligroso: causaria que CADA trade
+    de ese ciclo se re-suba con signal_id/strategy en null, incluso
+    los que ya estaban correctamente vinculados de un ciclo anterior.
     """
     global _signals_cache
     try:
@@ -108,9 +172,19 @@ def cargar_signals_cache():
             str(row["id"])[:8]: {"id": row["id"], "strategy": row.get("strategy")}
             for row in (r.data or [])
         }
+        return True
     except Exception as e:
         print(f"[sync_trades] Error cargando cache de señales: {e}")
         _signals_cache = {}
+        return False
+
+
+def epoch_broker_to_utc_iso(epoch_broker_time):
+    """Convierte un epoch en hora del broker a UTC real (ISO), restando
+    BROKER_UTC_OFFSET_HOURS (configurable en .env — ver nota arriba)."""
+    return datetime.fromtimestamp(
+        epoch_broker_time - BROKER_UTC_OFFSET_HOURS * 3600, tz=timezone.utc
+    ).isoformat()
 
 
 def buscar_signal_por_comentario(comentario):
@@ -152,16 +226,24 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     que hay que buscarlo ahi usando el position_id en comun — y de paso
     se aprovecha ese mismo deal para tomar open_time y precio_apertura.
 
-    Todos los timestamps de MT5 (d.time) son epoch Unix en UTC real, asi
-    que se convierten con datetime.fromtimestamp(d.time, tz=timezone.utc)
-    — NUNCA sin tz, porque eso los convierte a la hora local de la PC
-    (RD, UTC-4) sin decirlo, y Supabase termina interpretandolos como si
-    ya fueran UTC (le resta 4 horas de mas a la hora real de cierre).
+    Todos los timestamps de MT5 (d.time) vienen en hora del SERVIDOR
+    del broker (XMGlobal, EEST/EET), no en UTC real, aunque se
+    entreguen como epoch Unix. Se corrige restando
+    BROKER_UTC_OFFSET_HOURS (configurable en .env, ver nota arriba
+    sobre por que no se puede detectar automaticamente en este broker).
     """
     desde = datetime.now() - timedelta(days=dias_atras)
     hasta = datetime.now()
 
-    cargar_signals_cache()
+    cache_ok = cargar_signals_cache()
+    if not cache_ok:
+        print(
+            "[sync_trades] ABORTADO este ciclo — no se pudo cargar el cache de señales. "
+            "Se prefiere saltar una sincronizacion (90s) antes que subir trades sin "
+            "vincular y arriesgar sobreescribir datos ya correctos."
+        )
+        return
+    print(f"[sync_trades] Offset del broker configurado: +{BROKER_UTC_OFFSET_HOURS:.0f}h respecto a UTC (BROKER_UTC_OFFSET_HOURS en .env)")
 
     deals = mt5.history_deals_get(desde, hasta)
     if deals is None or len(deals) == 0:
@@ -199,41 +281,60 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         if signal_id:
             vinculados += 1
 
-        open_time = (
-            datetime.fromtimestamp(apertura["time"], tz=timezone.utc).isoformat()
-            if apertura else None
-        )
-        precio_apertura = apertura["price"] if apertura else None
-
-        registros.append({
+        registro = {
             "ticket": d.ticket,
             "magic": d.magic,
             "symbol": d.symbol or SYMBOL,
             "tipo": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
             "volumen": d.volume,
-            "precio_apertura": precio_apertura,
             "precio_cierre": d.price,
             "profit": d.profit,
             "swap": d.swap,
             "comision": d.commission,
             "profit_neto": profit_neto,
-            "open_time": open_time,
-            "close_time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat(),
+            "close_time": epoch_broker_to_utc_iso(d.time),
             "comentario": d.comment,  # razon de cierre (sl/tp), se conserva tal cual
-            "signal_id": signal_id,
-            "strategy": strategy,
-        })
+        }
+
+        # IMPORTANTE: estas 4 claves solo se incluyen si hay dato real.
+        # Un upsert que OMITE una clave no toca esa columna en la fila
+        # existente; mandarla explicitamente como None SI la
+        # sobreescribe. Asi un trade ya vinculado/con datos correctos
+        # de un ciclo anterior nunca se corrompe por un fallo de match
+        # (deal de apertura fuera de ventana, señal no encontrada, etc.)
+        # en un ciclo posterior — ver FIX en el docstring del modulo.
+        if apertura:
+            registro["open_time"] = epoch_broker_to_utc_iso(apertura["time"])
+            registro["precio_apertura"] = apertura["price"]
+        if signal_id:
+            registro["signal_id"] = signal_id
+            registro["strategy"] = strategy
+
+        registros.append(registro)
 
     # Upsert: si el ticket ya existe, no lo duplica (requiere el UNIQUE en `ticket`)
-    result = supabase.table("trades_ejecutados").upsert(
-        registros, on_conflict="ticket"
-    ).execute()
+    #
+    # IMPORTANTE: PostgREST exige que TODAS las filas de un mismo upsert
+    # en lote tengan exactamente las mismas columnas ("All object keys
+    # must match" si no). Como algunas filas de este ciclo pueden traer
+    # signal_id/strategy/open_time/precio_apertura y otras no (ver mas
+    # arriba, se omiten a proposito cuando no hay dato), se agrupan por
+    # su set exacto de columnas y se hace un upsert por grupo — asi cada
+    # llamada es homogenea y ninguna fila termina escribiendo None en
+    # una columna que no debia tocar.
+    grupos = defaultdict(list)
+    for registro in registros:
+        clave = tuple(sorted(registro.keys()))
+        grupos[clave].append(registro)
+
+    for clave, filas in grupos.items():
+        supabase.table("trades_ejecutados").upsert(filas, on_conflict="ticket").execute()
 
     print(
         f"[sync_trades] {len(registros)} trades sincronizados hacia Supabase "
         f"({vinculados} vinculados a su señal/estrategia original)."
     )
-    return result
+    return len(registros)
 
 
 def loop_continuo(intervalo_segundos: int = None):
