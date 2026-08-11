@@ -24,6 +24,31 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
+CAMBIOS EN ESTA VERSION (fix critico: zona horaria en conteo de perdidas):
+- BUG ENCONTRADO 2026-08-11: en un solo dia hubo 5 perdidas reales
+  ejecutadas (4 EMA Pullback M5 + 1 FVG Fill M5) cuando MAX_LOSSES_PER_DAY=4
+  y MAX_LOSSES_PER_KILLZONE=2 (default) deberian haber bloqueado la 5ta
+  operacion — habia 4 perdidas ya cerradas (2 en Londres, 2 en NYC) antes
+  de que abriera la 5ta a las 11:01 AM RD, dentro de la misma killzone NYC
+  donde ya se habian alcanzado 2 perdidas.
+- CAUSA: get_daily_losses(), get_daily_wins() y get_killzone_losses()
+  armaban la ventana horaria con date.today()/datetime.now() (hora LOCAL
+  de RD, UTC-4) y se la pasaban directo a mt5.history_deals_get(). Pero
+  los timestamps de deals en MT5 vienen en hora del SERVIDOR del broker
+  (XMGlobal, horario europeo EET/EEST — mismo problema que ya existia en
+  data_engine.py y que motivo la funcion eet_offset_hours() ahi). Al no
+  convertir la ventana de RD a hora de servidor antes de consultar, el
+  rango horario real consultado no coincidia con el dia/killzone que se
+  creia estar contando, dejando pasar perdidas que ya debian contar.
+- FIX: se replican aqui las mismas funciones eu_dst_active()/
+  eet_offset_hours() que ya usa data_engine.py, mas una nueva
+  rd_to_broker_time() que convierte un datetime naive en hora RD a hora
+  de servidor del broker. get_daily_losses(), get_daily_wins() y
+  get_killzone_losses() ahora convierten sus limites de ventana con esta
+  funcion ANTES de llamar a mt5.history_deals_get(), para que el conteo
+  de perdidas realmente refleje el dia/killzone en hora RD, no un rango
+  desfasado por la diferencia horaria con el servidor.
+
 CAMBIOS EN ESTA VERSION (trailing stop por ATR despues del breakeven):
 - NUEVO: una vez que el breakeven ya se activo en una posicion (SL en
   la entrada), el bot empieza a "arrastrar" el SL detrás del precio
@@ -124,7 +149,7 @@ import os
 import sys
 import time
 import requests
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timezone, timedelta
 from dotenv import load_dotenv
 
 try:
@@ -257,6 +282,57 @@ def log_error_to_file(message):
         print(f"  [LOG] Error escribiendo {ERROR_LOG_FILE}: {e}")
 
 
+# ── FIX 2026-08-11: conversion de hora RD -> hora de servidor del broker ──
+# Mismo problema y misma solucion que ya existe en data_engine.py: XMGlobal
+# usa horario europeo (EET invierno UTC+2 / EEST verano UTC+3), y los
+# timestamps que devuelve mt5.history_deals_get() vienen en esa hora de
+# servidor, no en hora local de RD (UTC-4 fijo, sin horario de verano).
+# Sin esta conversion, get_daily_losses()/get_killzone_losses() consultaban
+# una ventana horaria desfasada y dejaban pasar perdidas que ya debian
+# contar para los limites de proteccion — bug confirmado el 2026-08-11
+# (5ta operacion del dia ejecutada cuando ya debian estar 4/4 y 2/2 killzone).
+
+def eu_dst_active(dt_utc):
+    """
+    Determina si, en la fecha dada, el horario de verano europeo (EEST,
+    UTC+3) esta activo en vez del horario de invierno (EET, UTC+2).
+    Regla de la UE: DST va desde el ultimo domingo de marzo (01:00 UTC)
+    hasta el ultimo domingo de octubre (01:00 UTC).
+    """
+    year = dt_utc.year
+
+    def last_sunday(month):
+        if month == 12:
+            d = datetime(year, 12, 31, tzinfo=timezone.utc)
+        else:
+            d = datetime(year, month + 1, 1, tzinfo=timezone.utc) - timedelta(days=1)
+        while d.weekday() != 6:
+            d -= timedelta(days=1)
+        return d
+
+    dst_start = last_sunday(3).replace(hour=1)
+    dst_end = last_sunday(10).replace(hour=1)
+    return dst_start <= dt_utc < dst_end
+
+
+def eet_offset_hours(dt_utc):
+    """Offset correcto (2h invierno EET, 3h verano EEST) segun la fecha."""
+    return 3 if eu_dst_active(dt_utc) else 2
+
+
+def rd_to_broker_time(dt_rd_naive):
+    """
+    Convierte un datetime naive en hora local RD (UTC-4 fijo) a la hora
+    de servidor del broker (EET/EEST), que es la que interpreta
+    mt5.history_deals_get(). Devuelve un datetime naive listo para pasar
+    directo a la API de MT5.
+    """
+    dt_utc = (dt_rd_naive + timedelta(hours=4)).replace(tzinfo=timezone.utc)
+    offset = eet_offset_hours(dt_utc)
+    dt_broker = dt_utc + timedelta(hours=offset)
+    return dt_broker.replace(tzinfo=None)
+
+
 def get_daily_count():
     try:
         if os.path.exists(DAILY_FILE):
@@ -339,14 +415,24 @@ def _closing_deals_between(start_dt, end_dt):
 
 
 def get_daily_losses():
-    today_start = datetime.combine(date.today(), datetime.min.time())
-    closing_deals = _closing_deals_between(today_start, datetime.now())
+    # FIX 2026-08-11: convertir el rango de hora RD a hora de servidor
+    # del broker antes de consultar — antes se pasaba hora local RD
+    # directo y la ventana quedaba desfasada frente a los deals reales.
+    today_start_rd = datetime.combine(date.today(), datetime.min.time())
+    now_rd = datetime.now()
+    start_broker = rd_to_broker_time(today_start_rd)
+    end_broker = rd_to_broker_time(now_rd)
+    closing_deals = _closing_deals_between(start_broker, end_broker)
     return sum(1 for d in closing_deals if d.profit < 0)
 
 
 def get_daily_wins():
-    today_start = datetime.combine(date.today(), datetime.min.time())
-    closing_deals = _closing_deals_between(today_start, datetime.now())
+    # FIX 2026-08-11: mismo ajuste de zona horaria que get_daily_losses().
+    today_start_rd = datetime.combine(date.today(), datetime.min.time())
+    now_rd = datetime.now()
+    start_broker = rd_to_broker_time(today_start_rd)
+    end_broker = rd_to_broker_time(now_rd)
+    closing_deals = _closing_deals_between(start_broker, end_broker)
     return sum(1 for d in closing_deals if d.profit >= 0)
 
 
@@ -366,14 +452,19 @@ def get_current_killzone(now=None):
 def get_killzone_losses(start_time, end_time):
     """
     Cuenta perdidas reales (magic number, deal de cierre, profit<0) cuyo
-    cierre cayo dentro de la ventana horaria [start_time, end_time) de HOY.
-    Se usa para el limite MAX_LOSSES_PER_KILLZONE, independiente del
-    limite diario general.
+    cierre cayo dentro de la ventana horaria [start_time, end_time) de HOY,
+    en hora RD. Se usa para el limite MAX_LOSSES_PER_KILLZONE, independiente
+    del limite diario general.
+    FIX 2026-08-11: la ventana se define en hora RD (igual que siempre)
+    pero se convierte a hora de servidor del broker antes de consultar a
+    MT5 — mismo bug y misma correccion que get_daily_losses().
     """
     today = date.today()
-    window_start = datetime.combine(today, start_time)
-    window_end = datetime.combine(today, end_time)
-    closing_deals = _closing_deals_between(window_start, window_end)
+    window_start_rd = datetime.combine(today, start_time)
+    window_end_rd = datetime.combine(today, end_time)
+    start_broker = rd_to_broker_time(window_start_rd)
+    end_broker = rd_to_broker_time(window_end_rd)
+    closing_deals = _closing_deals_between(start_broker, end_broker)
     return sum(1 for d in closing_deals if d.profit < 0)
 
 
@@ -570,10 +661,22 @@ def check_breakeven(position, side, now_str):
     entry = position.price_open
     tp1 = position.tp
 
-    if position.sl and abs(position.sl - entry) < 0.01:
-        # Ya esta en breakeven (ej. si el bot se reinicio despues de aplicarlo)
-        _breakeven_applied.add(position.ticket)
-        return False
+    # FIX 2026-08-11: antes solo detectaba "ya en breakeven" si el SL
+    # estaba CASI EXACTO en la entrada. Si el trailing ya lo habia
+    # movido bien por delante (mas protegido) y el bot se reinicia
+    # (se pierde _breakeven_applied en memoria), esa condicion no
+    # reconocia el avance y volvia a mandar el SL A LA ENTRADA — un
+    # retroceso real de proteccion. Ahora se reconoce "ya protegido"
+    # si el SL esta EN O MAS ALLA de la entrada (a favor del trade),
+    # sin importar cuanto haya avanzado el trailing.
+    if position.sl:
+        ya_protegido = (
+            (side == "BUY" and position.sl >= entry - 0.01) or
+            (side == "SELL" and position.sl <= entry + 0.01)
+        )
+        if ya_protegido:
+            _breakeven_applied.add(position.ticket)
+            return False
 
     if not tp1:
         return False
@@ -640,18 +743,34 @@ def check_trailing_stop(position, side, now_str):
     if tick is None:
         return False
 
+    entry = position.price_open
     precio_actual = tick.bid if side == "BUY" else tick.ask
     distancia = atr * TRAILING_ATR_MULTIPLIER
 
+    # FIX 2026-08-11: el objeto `position` que llega aqui se obtuvo UNA
+    # sola vez al inicio del ciclo, ANTES de que check_breakeven() (que
+    # corre justo antes en run_cycle) pudiera haber modificado el SL
+    # real en MT5 este mismo ciclo. Comparar directo contra
+    # `position.sl` en ese caso usa un valor desactualizado (el
+    # anti-hunt viejo, muy por debajo de la entrada) y puede dejar
+    # pasar un candidato de trailing PEOR que la entrada — rompiendo la
+    # garantia de "peor caso = $0" que el breakeven acaba de fijar.
+    # Se corrige con dos medidas independientes:
+    #   1. nuevo_sl nunca puede ser peor que la entrada, sin importar
+    #      lo que diga el ATR (piso/techo duro).
+    #   2. la base de comparacion tambien se corrige a "al menos la
+    #      entrada", para no comparar contra el SL viejo desactualizado.
     if side == "BUY":
         nuevo_sl = round(precio_actual - distancia, 2)
-        # Solo mejora si el nuevo SL queda mas arriba que el actual
-        if position.sl is None or nuevo_sl <= position.sl:
+        nuevo_sl = max(nuevo_sl, entry)  # nunca peor que breakeven
+        sl_base = max(position.sl, entry) if position.sl else entry
+        if nuevo_sl <= sl_base:
             return False
     else:
         nuevo_sl = round(precio_actual + distancia, 2)
-        # Solo mejora si el nuevo SL queda mas abajo que el actual
-        if position.sl is None or nuevo_sl >= position.sl:
+        nuevo_sl = min(nuevo_sl, entry)  # nunca peor que breakeven
+        sl_base = min(position.sl, entry) if position.sl else entry
+        if nuevo_sl >= sl_base:
             return False
 
     ok, error_detail = modify_position_sltp(position, new_sl=nuevo_sl)
@@ -1145,6 +1264,7 @@ def main():
         print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} (Londres 03:00-06:00 RD / NYC 09:00-12:00 RD)")
+    print(f"  [FIX 2026-08-11] Conteo de perdidas ahora corrige offset horario RD -> servidor broker (EET/EEST)")
     print(f"  Breakeven real al {BREAKEVEN_TRIGGER_PCT*100:.0f}% del camino a TP1 (todas las estrategias)")
     print(f"  Trailing stop por ATR x{TRAILING_ATR_MULTIPLIER} despues del breakeven (todas las estrategias)")
     print(f"  Salida por CHoCH activa para: {', '.join(EARLY_EXIT_STRATEGIES)}")
