@@ -1,10 +1,33 @@
 """
-result_tracker.py — V3
+result_tracker.py — V3.1
 ======================
 Revisa señales EXECUTING (ya abiertas de verdad en MT5) y actualiza WIN/LOSS comparando
 con las velas reales de Supabase.
 
 Proyecto: qilvrvnwdtpbkcfwktqs (activo en dashboard)
+
+CAMBIOS EN ESTA VERSION (trailing stop por ATR — fix de simulacion):
+- ANTES: una vez que la simulacion detectaba breakeven (precio toco TP1),
+  el SL simulado se congelaba para siempre en el precio de entrada. Si el
+  precio hacia CUALQUIER pullback normal de vuelta a la entrada despues de
+  eso, la señal se marcaba "LOSS +0.0 pts" (cierre en breakeven) — aunque
+  en MT5 real, bot_engine.py sigue arrastrando el SL con un trailing por
+  ATR(14) x 1.2 despues del breakeven, protegiendo mucho mas terreno.
+  Esto producia falsos negativos: señales que en MT5 real llegaron a TP1
+  y ganaron, pero que el simulador reportaba como perdida/plana.
+  Caso real detectado: señal 3769eefb (2026-08-10), simulador dijo
+  "LOSS +0.0 pts", MT5 real cerro en TP1 con +$16.86.
+- AHORA: get_candles_after() tambien trae un colchon de velas ANTERIORES
+  a la señal (context_before) para poder calcular ATR(14) en cada punto
+  del recorrido. Despues de que tp1_touched=True, el SL simulado ya no
+  se congela — se recalcula cada vela con la misma formula que usa
+  bot_engine.py (ATR(14) de M5 x TRAILING_ATR_MULTIPLIER), moviendose
+  SOLO a favor del trade, igual que la regla dura del bot real.
+- Nota de precision: esto no es 100% identico al trailing real, porque
+  bot_engine.py opera con precio tick a tick (symbol_info_tick) y aqui
+  solo tenemos velas M5 ya cerradas. Es una aproximacion mucho mas fiel
+  que la version anterior, pero puede haber pequeñas diferencias de
+  puntos exactos de cierre frente al ticket real en MT5.
 """
 
 import os
@@ -25,6 +48,13 @@ BREAKEVEN_FILE = "breakeven_signals.txt"
 LOOP_INTERVAL  = int(os.getenv("TRACKER_LOOP_INTERVAL", "60"))  # segundos entre cada revision
 
 ANTI_HUNT_SL_EXTRA = float(os.getenv("ANTI_HUNT_SL_EXTRA", "2.0"))
+
+# ── Trailing stop por ATR (post-breakeven) — replica bot_engine.py ──
+# Mismo multiplicador que usa bot_engine.py para que la simulacion sea
+# consistente con lo que de verdad pasa en la cuenta real.
+TRAILING_ATR_MULTIPLIER = float(os.getenv("TRAILING_ATR_MULTIPLIER", "1.2"))
+TRAILING_ATR_PERIOD = 14
+CONTEXT_BEFORE = 20  # velas previas a la señal, para poder calcular ATR(14) desde la 1ra vela posterior
 
 # ── Desfase Republica Dominicana (UTC-4, sin horario de verano) ──
 DR_OFFSET = timedelta(hours=-4)
@@ -195,7 +225,32 @@ def get_pending_signals():
         return []
     return r.json()
 
-def get_candles_after(created_at, limit=200):
+def get_candles_after(created_at, limit=200, context_before=CONTEXT_BEFORE):
+    """
+    Trae las velas M5 posteriores a `created_at` (igual que antes) MAS
+    un colchon de `context_before` velas ANTERIORES, necesarias para
+    poder calcular ATR(14) desde la primera vela posterior en adelante
+    (el trailing stop necesita el ATR de cada punto del recorrido, no
+    solo desde donde empieza la ventana de 200).
+    Devuelve (candles, offset) donde `offset` es el indice en la lista
+    donde empiezan las velas POSTERIORES a la señal (candles[offset:]
+    es el tramo que hay que recorrer para simular el cierre).
+    """
+    r_prev = requests.get(
+        f"{SUPABASE_URL}/rest/v1/ohlc_candles",
+        headers=headers(),
+        params={
+            "select":      "candle_time,high,low,close",
+            "instrument":  "eq.XAUUSD",
+            "timeframe":   "eq.M5",
+            "candle_time": f"lte.{created_at}",
+            "order":       "candle_time.desc",
+            "limit":       str(context_before),
+        },
+        timeout=20,
+    )
+    previas = list(reversed(r_prev.json())) if r_prev.status_code < 400 else []
+
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/ohlc_candles",
         headers=headers(),
@@ -209,9 +264,28 @@ def get_candles_after(created_at, limit=200):
         },
         timeout=20,
     )
-    if r.status_code >= 400:
-        return []
-    return r.json()
+    posteriores = r.json() if r.status_code < 400 else []
+
+    return previas + posteriores, len(previas)
+
+def calc_atr_window(candles, end_idx, period=TRAILING_ATR_PERIOD):
+    """
+    ATR(period) calculado con las `period` velas ANTERIORES a end_idx
+    (sin incluir end_idx). Misma formula que usa bot_engine.py — se
+    aplica sobre `candles`, la lista combinada (previas + posteriores)
+    que devuelve get_candles_after().
+    """
+    start = max(0, end_idx - period)
+    window = candles[start:end_idx]
+    if len(window) < 2:
+        return 0
+    trs = []
+    for i in range(1, len(window)):
+        h  = float(window[i]["high"])
+        l  = float(window[i]["low"])
+        pc = float(window[i - 1]["close"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs) / len(trs) if trs else 0
 
 def get_current_price():
     r = requests.get(
@@ -382,8 +456,8 @@ def run_cycle():
         if sig_id in breakeven_set:
             sl = entry
 
-        candles = get_candles_after(created, 200)
-        if not candles:
+        candles, offset = get_candles_after(created, 200)
+        if len(candles) <= offset:
             print(f"  [{sig_type}] Sin velas M5 posteriores todavía.")
             continue
 
@@ -391,7 +465,8 @@ def run_cycle():
         exit_price  = None
         tp1_touched = False
 
-        for candle in candles:
+        for idx in range(offset, len(candles)):
+            candle = candles[idx]
             h = float(candle["high"])
             l = float(candle["low"])
 
@@ -405,6 +480,17 @@ def run_cycle():
                         send_telegram(telegram_breakeven(signal, float(candle["close"])))
                         print(f"  BUY {sig_id[:8]} — Breakeven activado @ TP1 {tp1}")
                     sl = entry
+
+                # NUEVO: trailing por ATR, activo solo despues del breakeven.
+                # Replica check_trailing_stop() de bot_engine.py: el SL
+                # SOLO se mueve a favor del trade (mas arriba), nunca
+                # hacia atras — igual regla dura que el bot real.
+                if tp1_touched:
+                    atr = calc_atr_window(candles, idx, TRAILING_ATR_PERIOD)
+                    if atr > 0:
+                        nuevo_sl = h - atr * TRAILING_ATR_MULTIPLIER
+                        if nuevo_sl > sl:
+                            sl = nuevo_sl
 
                 if l <= sl:
                     result     = "WIN" if tp1_touched else "LOSS"
@@ -426,6 +512,14 @@ def run_cycle():
                         send_telegram(telegram_breakeven(signal, float(candle["close"])))
                         print(f"  SELL {sig_id[:8]} — Breakeven activado @ TP1 {tp1}")
                     sl = entry
+
+                # NUEVO: trailing por ATR, activo solo despues del breakeven.
+                if tp1_touched:
+                    atr = calc_atr_window(candles, idx, TRAILING_ATR_PERIOD)
+                    if atr > 0:
+                        nuevo_sl = l + atr * TRAILING_ATR_MULTIPLIER
+                        if nuevo_sl < sl:
+                            sl = nuevo_sl
 
                 if h >= sl:
                     result     = "WIN" if tp1_touched else "LOSS"
@@ -474,9 +568,10 @@ def run_cycle():
 
 def main():
     print(f"\n{'='*50}")
-    print(f"  RESULT TRACKER V3 — Loop continuo")
+    print(f"  RESULT TRACKER V3.1 — Loop continuo")
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Colchon anti-hunt SL: {ANTI_HUNT_SL_EXTRA} pts (replica bot_engine.py)")
+    print(f"  Trailing post-breakeven: ATR(14) x {TRAILING_ATR_MULTIPLIER} (replica bot_engine.py)")
     print(f"  Revisa cada {LOOP_INTERVAL}s — Ctrl+C para detener")
     print(f"{'='*50}")
 
