@@ -112,6 +112,10 @@ def _backtest_get_session_start_utc():
 # Cache de velas históricas de los pares del dólar (para el filtro DXY),
 # cargado UNA sola vez al inicio del backtest — se filtra por tiempo en
 # cada llamada, sin volver a golpear Supabase por cada vela simulada.
+# IMPORTANTE: se guarda en formato CRUDO de Supabase (candle_time/open/
+# high/low/close/volume), NO convertido con to_candles() — porque
+# get_pair_trend() (quien consume esto via get_candles) espera ese
+# formato crudo tal cual lo devolvía el get_candles original.
 _dxy_full_cache = {}
 
 
@@ -119,15 +123,15 @@ def _backtest_get_candles(timeframe, limit=100, instrument="XAUUSD"):
     """
     Reemplaza signal_engine.get_candles(). Si el instrumento es uno de
     los pares del dólar (DXY sintetico), devuelve el historico YA
-    cargado, filtrado hasta el momento que se esta simulando — nunca
-    "el mas reciente real". XAUUSD no debería llamarse aqui (las
-    estrategias reciben c5/c30/ch1 ya armados como parametros), pero se
-    deja un fallback vacio por seguridad.
+    cargado (formato crudo de Supabase), filtrado hasta el momento que
+    se esta simulando — nunca "el mas reciente real". XAUUSD no debería
+    llamarse aqui (las estrategias reciben c5/c30/ch1 ya armados como
+    parametros), pero se deja un fallback vacio por seguridad.
     """
     if instrument in _dxy_full_cache:
         now = _BACKTEST_NOW["time"]
         full = _dxy_full_cache[instrument]
-        filtrado = [c for c in full if _parse_time(c["time"]) <= now]
+        filtrado = [c for c in full if _parse_time(c["candle_time"]) <= now]
         return filtrado[-limit:]
     return []
 
@@ -142,7 +146,10 @@ se.get_candles = _backtest_get_candles
 # CARGA DE VELAS HISTORICAS
 # ============================================================
 
-def fetch_all_candles(instrument, timeframe, limit=8000):
+def fetch_all_candles_raw(instrument, timeframe, limit=8000):
+    """Igual que fetch_all_candles, pero SIN convertir a formato interno —
+    devuelve las filas tal cual las entrega Supabase (candle_time/open/
+    high/low/close/volume). Se usa para el cache de pares del dólar."""
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/ohlc_candles",
         headers=se.headers(),
@@ -156,13 +163,17 @@ def fetch_all_candles(instrument, timeframe, limit=8000):
         timeout=30,
     )
     r.raise_for_status()
-    return se.to_candles(r.json())
+    return r.json()
+
+
+def fetch_all_candles(instrument, timeframe, limit=8000):
+    return se.to_candles(fetch_all_candles_raw(instrument, timeframe, limit))
 
 
 def preload_dxy_pairs():
     print("  Cargando histórico de pares del dólar (filtro DXY)...")
     for par in se.DOLLAR_PAIRS:
-        candles = fetch_all_candles(par, "M30")
+        candles = fetch_all_candles_raw(par, "M30")  # formato crudo, ver nota en _backtest_get_candles
         _dxy_full_cache[par] = candles
         print(f"    {par}: {len(candles)} velas M30")
 
