@@ -8,6 +8,34 @@ REQUISITOS:
 - Variables de entorno ya existentes: SUPABASE_URL, SUPABASE_KEY (o SERVICE_ROLE_KEY),
   MT5_MAGIC (20260601), MT5_SYMBOL (GOLD)
 
+FIX EN ESTA VERSION (incluir operaciones manuales para P&L mensual):
+  - Hasta ahora, tanto `aperturas` como `deals_cierre` filtraban
+    exclusivamente por `d.magic == MAGIC`. Las operaciones abiertas a
+    mano en MT5 (fuera del bot) normalmente llevan magic = 0, asi que
+    quedaban completamente fuera de la sincronizacion — el P&L mensual
+    en Supabase nunca reflejaba esas operaciones, aunque afectaran el
+    balance real de la cuenta igual que las del bot.
+  - Ahora el filtro es por SYMBOL en vez de por MAGIC: se sincronizan
+    TODOS los deals cerrados de GOLD en esta cuenta, sea cual sea su
+    magic number. Se agrega un campo nuevo `origen` a cada registro:
+      - "BOT" si el magic del deal coincide con MAGIC (20260601)
+      - "MANUAL" si el magic es 0 (abierta a mano en el terminal)
+      - "OTRO(magic=N)" para cualquier otro magic no reconocido, como
+        aviso por si en el futuro corre otro EA en la misma cuenta —
+        mejor visibilizarlo que mezclarlo silenciosamente con BOT o
+        MANUAL.
+  - El vinculo a `strategy`/`signal_id` sigue funcionando igual para
+    las operaciones del bot (via el comentario "TradingPro_xxxxxxxx").
+    Las manuales simplemente no encuentran coincidencia de comentario
+    y quedan sin signal_id/strategy — es el comportamiento correcto,
+    ya que no vienen de ninguna señal generada por el sistema.
+  - `origen` se incluye SIEMPRE en el registro (a diferencia de
+    signal_id/strategy/open_time/precio_apertura, que se omiten
+    cuando no hay dato — ver el fix de mas abajo sobre por que). Esto
+    es seguro porque `origen` siempre es calculable de forma directa
+    desde el magic del deal de cierre, sin depender de ningun cruce
+    que pueda fallar.
+
 FIX EN ESTA VERSION (perdida de vinculo strategy/signal_id en re-sincronizaciones):
   - BUG ENCONTRADO el 2026-08-07: si cargar_signals_cache() fallaba por
     cualquier motivo (timeout, corte de red), el codigo anterior dejaba
@@ -210,6 +238,22 @@ def buscar_signal_por_comentario(comentario):
     return None, None
 
 
+def determinar_origen(magic: int) -> str:
+    """
+    Clasifica el deal segun su magic number:
+      - MAGIC del bot -> "BOT"
+      - 0 (default de MT5 para ordenes manuales) -> "MANUAL"
+      - cualquier otro -> "OTRO(magic=N)", para que quede visible si en
+        el futuro corre otro EA distinto en la misma cuenta, en vez de
+        mezclarlo silenciosamente con BOT o MANUAL.
+    """
+    if magic == MAGIC:
+        return "BOT"
+    if magic == 0:
+        return "MANUAL"
+    return f"OTRO(magic={magic})"
+
+
 def sincronizar_trades_cerrados(dias_atras: int = 3):
     """
     Lee los deals de MT5 de los últimos `dias_atras` días, separa los de
@@ -217,6 +261,10 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     con su señal original (strategy + signal_id) usando el comentario del
     deal de APERTURA — no el de cierre — y hace upsert en Supabase
     (trades_ejecutados) usando el ticket como llave única.
+
+    Se sincronizan TODOS los deals de SYMBOL (no solo los del bot) para
+    poder medir el P&L real de la cuenta a fin de mes, incluyendo
+    operaciones manuales — ver FIX arriba (incluir operaciones manuales).
 
     IMPORTANTE: MT5 sobreescribe automaticamente el comentario del deal
     de cierre con la razon del cierre (ej. "[sl 4039.51]", "[tp 4031.86]"),
@@ -252,26 +300,30 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
 
     # Info del deal de APERTURA por position_id (comment, time, price) —
     # es el unico que conserva el "TradingPro_xxxxxxxx" que puso
-    # bot_engine.py, y de donde sale open_time/precio_apertura.
+    # bot_engine.py, y de donde sale open_time/precio_apertura. Ya NO se
+    # filtra por magic == MAGIC aqui, para tambien capturar la apertura
+    # de operaciones manuales (magic 0) y poder tomarles open_time/precio.
     aperturas = {
         d.position_id: {"comment": d.comment, "time": d.time, "price": d.price}
         for d in deals
-        if d.magic == MAGIC and d.entry == mt5.DEAL_ENTRY_IN
+        if d.symbol == SYMBOL and d.entry == mt5.DEAL_ENTRY_IN
     }
 
-    # Solo nos interesan los deals de SALIDA (cierre de posición) de nuestro bot
-    # entry == 1 significa DEAL_ENTRY_OUT (cierre). entry == 0 es apertura.
+    # Deals de SALIDA (cierre de posición) de este simbolo — de CUALQUIER
+    # magic, no solo el del bot, para incluir operaciones manuales en el
+    # P&L. entry == 1 significa DEAL_ENTRY_OUT (cierre); entry == 0 apertura.
     deals_cierre = [
         d for d in deals
-        if d.magic == MAGIC and d.entry == mt5.DEAL_ENTRY_OUT
+        if d.symbol == SYMBOL and d.entry == mt5.DEAL_ENTRY_OUT
     ]
 
     if not deals_cierre:
-        print("[sync_trades] No hay trades cerrados nuevos con ese magic number.")
+        print("[sync_trades] No hay trades cerrados nuevos en este símbolo.")
         return
 
     registros = []
     vinculados = 0
+    manuales = 0
     for d in deals_cierre:
         profit_neto = d.profit + d.swap + d.commission
 
@@ -281,9 +333,14 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         if signal_id:
             vinculados += 1
 
+        origen = determinar_origen(d.magic)
+        if origen == "MANUAL":
+            manuales += 1
+
         registro = {
             "ticket": d.ticket,
             "magic": d.magic,
+            "origen": origen,  # "BOT" / "MANUAL" / "OTRO(magic=N)" — siempre presente
             "symbol": d.symbol or SYMBOL,
             "tipo": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
             "volumen": d.volume,
@@ -293,7 +350,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
             "comision": d.commission,
             "profit_neto": profit_neto,
             "close_time": epoch_broker_to_utc_iso(d.time),
-            "comentario": d.comment,  # razon de cierre (sl/tp), se conserva tal cual
+            "comentario": d.comment,  # razon de cierre (sl/tp) o vacio si fue manual
         }
 
         # IMPORTANTE: estas 4 claves solo se incluyen si hay dato real.
@@ -332,7 +389,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
 
     print(
         f"[sync_trades] {len(registros)} trades sincronizados hacia Supabase "
-        f"({vinculados} vinculados a su señal/estrategia original)."
+        f"({vinculados} vinculados a su señal/estrategia original, {manuales} manuales)."
     )
     return len(registros)
 
@@ -351,7 +408,7 @@ def loop_continuo(intervalo_segundos: int = None):
 
     print(f"\n{'='*55}")
     print(f"  SYNC TRADES SUPABASE — Loop continuo")
-    print(f"  Magic: {MAGIC} | Simbolo: {SYMBOL}")
+    print(f"  Magic: {MAGIC} | Simbolo: {SYMBOL} (incluye BOT + MANUAL)")
     print(f"  Sincroniza cada {intervalo_segundos}s — Ctrl+C para detener")
     print(f"{'='*55}\n")
 
