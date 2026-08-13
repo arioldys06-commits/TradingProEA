@@ -55,6 +55,18 @@ Filtro Anti-Trampa Institucional del FVG — NUEVO:
          formarse el FVG, lo atraviesa por completo sin reaccionar,
          la señal se descarta directamente (no solo resta puntos).
 
+Opening Range Breakout con Pullback y VWAP — NUEVO (mejora Estrategia 2):
+  - En vez de disparar en la misma vela que rompe el rango de apertura,
+    la Estrategia 2 (Killzone Breakout) ahora exige el patron completo
+    Breakout -> Pullback -> Reanudacion (ver detect_orb_pullback).
+    Reduce frecuencia de señales de esta estrategia a cambio de mejor
+    calidad de entrada.
+  - Se suma una confirmacion de VWAP de la sesion activa (bono/penal.
+    de score +/-10, igual estilo que el filtro DXY): confirma si el
+    precio esta del lado esperado del volumen ponderado de la killzone.
+    Usa el volumen de ticks de MT5 como proxy (XAUUSD es CFD, no hay
+    volumen real negociado).
+
 Filtro de Volatilidad Minima (ATR) — NUEVO:
   - Evita entrar cuando el mercado esta en rango muerto (pre-Londres,
     almuerzo NY, fines de sesion) donde el spread se come el TP.
@@ -71,14 +83,40 @@ Validador de Vigencia (filtro anti-manipulación):
   - Los ~90s de latencia actúan como filtro natural de fakeouts/sweeps
   - Timestamp en Telegram muestra vela_time vs publish_time para medir retraso
 
-Killzone obligatoria:
-  - Estrategias 1, 3 y 4 solo operan dentro de London/NY KZ
-  - Estrategia 2 ya requiere KZ por diseño
+Killzone — bono de score, ya NO es obligatoria (CAMBIO, ver FIX abajo):
+  - Estrategias 1, 3 y 4 pueden publicar señal fuera de killzone si el
+    resto de las confluencias dan score suficiente (>= MIN_SCORE). Ya
+    no hay bloqueo duro — killzone activa sigue sumando puntos igual
+    que antes, solo que ahora es opcional en vez de obligatoria.
+  - Estrategia 2 SIGUE exigiendo killzone obligatoria por diseño: su
+    logica entera es operar la ruptura del rango justo al abrir sesion
+    (London/NY), no tiene sentido estructural fuera de ese contexto.
 
 Objetivo: 4-6 señales diarias de alta calidad
 Score mínimo para publicar: 70/100
 Loop interno: analiza cada 30 segundos
 """
+
+# ============================================================
+# FIX 2026-08-13 (killzone de bloqueo obligatorio -> bono de score):
+#   - Antes, killzone_requerida() cortaba la ejecucion de las
+#     estrategias 1, 3 y 4 por completo si is_killzone() era False —
+#     ni siquiera llegaban a calcular el resto de las confluencias.
+#   - A peticion explicita: se quiere poder tomar operaciones fuera de
+#     killzone tambien, siempre que el resto de las condiciones se
+#     cumplan igual de exigentes (mismo MIN_SCORE=75, sin relajar
+#     ningun otro filtro).
+#   - killzone_requerida() ya NO bloquea (siempre devuelve True) — solo
+#     deja un aviso informativo en el log cuando la señal se evalua
+#     fuera de killzone. La killzone activa sigue sumando su bono de
+#     score normal dentro de cada estrategia (linea "if is_killzone():
+#     score += N"), exactamente igual que antes — la diferencia es que
+#     ahora ese bono es opcional, no una condicion de entrada obligatoria.
+#   - Estrategia 2 (Killzone Breakout) NO se toco: sigue con su propio
+#     chequeo `if not is_killzone(): return None` al inicio de la
+#     funcion, porque su logica completa depende de operar el rango de
+#     apertura de sesion — no tiene sentido estructural fuera de eso.
+# ============================================================
 
 import os
 import sys
@@ -156,19 +194,14 @@ def telegram_signal(sig):
     arrow    = "BUY" if sig["signal_type"] == "BUY" else "SELL"
     ote      = sig.get("ote")
     ote_line = f"OTE Golden: {ote['golden']:.2f} (62-79% Fib)\n" if ote else ""
-    # Timestamps para medir latencia real
     vela_time    = sig.get("candle_time", "N/A")
     publish_time = datetime.now().strftime("%H:%M:%S")
     latencia     = ""
     if vela_time != "N/A":
         try:
             vt_raw = datetime.fromisoformat(vela_time.replace("Z", "+00:00"))
-            # candle_time ya viene en UTC real: data_engine.py ya hizo la
-            # correccion EET->UTC antes de guardarlo en Supabase. Restar
-            # el offset otra vez aqui duplicaba la correccion y producia
-            # un "Delay" inflado en ~1h que no reflejaba la demora real.
             vt_utc = vt_raw if vt_raw.tzinfo else vt_raw.replace(tzinfo=timezone.utc)
-            vt_rd  = vt_utc - timedelta(hours=4)  # UTC → RD (UTC-4)
+            vt_rd  = vt_utc - timedelta(hours=4)
             now_utc = datetime.now(timezone.utc)
             diff = (now_utc - vt_utc).total_seconds()
             latencia = f"Vela: {vt_rd.strftime('%H:%M:%S')} RD | Pub: {publish_time} | Delay: {int(diff)}s\n"
@@ -191,8 +224,6 @@ def telegram_signal(sig):
         f"Trading Pro — XAUUSD_Signals_DR"
     )
 
-# ── FETCH CANDLES ─────────────────────────────────────────────
-
 def get_candles(timeframe, limit=100, instrument="XAUUSD"):
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/ohlc_candles",
@@ -209,7 +240,6 @@ def get_candles(timeframe, limit=100, instrument="XAUUSD"):
     if r.status_code >= 400:
         return []
     data = r.json()
-    # Revertir para orden cronológico
     return list(reversed(data))
 
 def to_candles(rows):
@@ -221,8 +251,6 @@ def to_candles(rows):
         "C": float(c["close"]),
         "V": int(c.get("volume", 0)),
     } for c in rows]
-
-# ── INDICADORES ───────────────────────────────────────────────
 
 def ema(closes, period):
     if len(closes) < period:
@@ -273,46 +301,108 @@ def detect_fvgs(candles):
     fvgs = []
     for i in range(2, len(candles)):
         a, b, c = candles[i-2], candles[i-1], candles[i]
-        if a["H"] < c["L"]:  # FVG alcista
+        if a["H"] < c["L"]:
             fvgs.append({"type": "BUY", "top": c["L"], "bottom": a["H"],
                           "mid": (c["L"] + a["H"]) / 2, "idx": i})
-        if a["L"] > c["H"]:  # FVG bajista
+        if a["L"] > c["H"]:
             fvgs.append({"type": "SELL", "top": a["L"], "bottom": c["H"],
                           "mid": (a["L"] + c["H"]) / 2, "idx": i})
     return fvgs
 
-# ── FILTRO DE VOLATILIDAD MINIMA (ATR) — NUEVO ─────────────────
-# Rechaza señales cuando el mercado esta en rango muerto: el ATR(14)
-# actual de M5 (ya calculado en cada estrategia con calc_atr) cae por
-# debajo de un umbral relativo al ATR historico promedio (30 dias,
-# fijado en .env). No agrega llamadas nuevas ni cambia el resto del
-# pipeline — solo compara un numero ya calculado contra el umbral.
+def detect_orb_pullback(candles, range_high, range_low, direction, lookback=6):
+    ventana = candles[-lookback:]
+    if len(ventana) < 3:
+        return False
+
+    if direction == "BUY":
+        breakout_idx = None
+        for i, c in enumerate(ventana[:-1]):
+            if c["C"] > range_high:
+                breakout_idx = i
+                break
+        if breakout_idx is None:
+            return False
+
+        pullback_candles = ventana[breakout_idx + 1:-1]
+        if not pullback_candles:
+            return False
+        if any(c["C"] < range_high for c in pullback_candles):
+            return False
+
+        pullback_high = max(c["H"] for c in pullback_candles)
+        last = ventana[-1]
+        return last["C"] > pullback_high and last["C"] > range_high
+
+    else:
+        breakout_idx = None
+        for i, c in enumerate(ventana[:-1]):
+            if c["C"] < range_low:
+                breakout_idx = i
+                break
+        if breakout_idx is None:
+            return False
+
+        pullback_candles = ventana[breakout_idx + 1:-1]
+        if not pullback_candles:
+            return False
+        if any(c["C"] > range_low for c in pullback_candles):
+            return False
+
+        pullback_low = min(c["L"] for c in pullback_candles)
+        last = ventana[-1]
+        return last["C"] < pullback_low and last["C"] < range_low
+
+
+def get_session_start_utc():
+    now = datetime.now(timezone.utc)
+    rdh = ((now.hour - 4) + 24) % 24
+    t = rdh * 100 + now.minute
+
+    if 300 <= t < 600:
+        start_rdh = 3
+    elif 900 <= t < 1200:
+        start_rdh = 9
+    else:
+        return None
+
+    start_utc_hour = (start_rdh + 4) % 24
+    start = now.replace(hour=start_utc_hour, minute=0, second=0, microsecond=0)
+    if start > now:
+        start -= timedelta(days=1)
+    return start
+
+
+def calc_session_vwap(candles):
+    session_start = get_session_start_utc()
+    if session_start is None:
+        return None
+
+    session_candles = []
+    for c in candles:
+        try:
+            ct = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ct >= session_start:
+            session_candles.append(c)
+
+    if len(session_candles) < 3:
+        return None
+
+    total_vol = sum(c["V"] for c in session_candles)
+    if total_vol <= 0:
+        return None
+
+    return sum(c["C"] * c["V"] for c in session_candles) / total_vol
 
 def filtro_volatilidad_ok(atr_actual):
-    """
-    Retorna (ok, umbral). ok=True si el ATR actual esta por encima
-    del umbral minimo aceptable de volatilidad.
-    """
     umbral = ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER
     return atr_actual >= umbral, umbral
 
-# ── FILTRO ANTI-TRAMPA INSTITUCIONAL DEL FVG — NUEVO ──────────
-# Un FVG "trampa" es un gap que parece institucional pero en realidad
-# es ruido o manipulacion. Se valida con 3 criterios: si hubo barrido
-# de liquidez antes de formarse, si la vela de impulso tiene cuerpo
-# dominante y tamano razonable vs ATR, y si el retest reacciona en vez
-# de atravesarlo de largo.
-
 def hubo_sweep_antes_del_fvg(candles, fvg, lookback=15):
-    """
-    Comprueba si, poco antes de formarse el FVG, hubo un barrido de
-    liquidez (mecha que rompe un swing high/low reciente y cierra de
-    vuelta adentro). Un FVG institucional real casi siempre viene
-    despues de cazar stops, no de la nada.
-    """
     idx = fvg["idx"]
     start = max(0, idx - lookback)
-    previas = candles[start:idx - 1]  # velas antes de la vela de impulso
+    previas = candles[start:idx - 1]
     if len(previas) < 5:
         return False
 
@@ -336,12 +426,6 @@ def hubo_sweep_antes_del_fvg(candles, fvg, lookback=15):
 
 
 def score_validez_fvg(candles, fvg, atr):
-    """
-    Evalua si un FVG parece institucional real o una trampa, mirando
-    la vela de impulso que lo creo (la del medio, indice fvg['idx']-1)
-    y el tamano del gap relativo al ATR.
-    Devuelve (score_ajuste, lista_de_razones).
-    """
     score, reasons = 0, []
     idx = fvg["idx"]
     if idx < 1 or idx >= len(candles):
@@ -354,13 +438,11 @@ def score_validez_fvg(candles, fvg, atr):
         return 0, []
     body_ratio = body / rango
 
-    # Vela de impulso con cuerpo dominante = flujo institucional real
     if body_ratio >= 0.70:
         score += 20; reasons.append(f"Impulso fuerte {body_ratio:.0%}")
     elif body_ratio < 0.40:
         score -= 15; reasons.append(f"Impulso debil {body_ratio:.0%} (sospechoso)")
 
-    # Tamano del FVG vs ATR — un gap gigante suele ser noticia/spike, no flujo ordenado
     gap_size = fvg["top"] - fvg["bottom"]
     if atr > 0:
         ratio_atr = gap_size / atr
@@ -373,13 +455,6 @@ def score_validez_fvg(candles, fvg, atr):
 
 
 def retest_reacciono_o_atraveso(candles, fvg, max_velas=3):
-    """
-    Desde que se formo el FVG, revisa las velas siguientes: si el
-    precio lo atraviesa por completo sin reaccion (cierre mas alla
-    del otro extremo) es trampa. Si rechaza dentro del gap, es valido.
-    Devuelve True (valido), False (trampa confirmada), o None (aun
-    sin suficientes velas para decidir).
-    """
     idx = fvg["idx"]
     posteriores = candles[idx:idx + max_velas + 1]
     if not posteriores:
@@ -392,21 +467,7 @@ def retest_reacciono_o_atraveso(candles, fvg, max_velas=3):
             return False
     return True
 
-# ── CONFLUENCIAS PARA SCALPING M5 SMC — NUEVO ──────────────────
-# 5 criterios adicionales de confluencia para reforzar la estrategia 1
-# (Sweep + BOS/CHoCH): Order Block, FVG cercano, momentum del rechazo
-# en la vela de sweep, madurez de la tendencia en TFs superiores, y
-# zona de liquidez de sesion (rango asiatico/pre-London).
-
 def detect_last_order_block(candles, direction, lookback=30):
-    """
-    Encuentra el ultimo Order Block valido: la ultima vela opuesta a la
-    direccion buscada, justo antes de un movimiento impulsivo fuerte
-    (cuerpo >=60% del rango) que se produjo en esa direccion.
-    BUY  -> OB alcista: vela bajista antes de un impulso alcista fuerte.
-    SELL -> OB bajista: vela alcista antes de un impulso bajista fuerte.
-    Devuelve {"top", "bottom", "idx"} o None si no se encuentra.
-    """
     start = max(0, len(candles) - lookback)
     for i in range(len(candles) - 2, start, -1):
         impulso = candles[i]
@@ -427,7 +488,6 @@ def detect_last_order_block(candles, direction, lookback=30):
 
 
 def price_near_ob(price, ob, atr, tolerance_atr=0.3):
-    """Comprueba si el precio actual esta dentro (o cerca) de la zona del OB."""
     if not ob or atr <= 0:
         return False
     buffer = atr * tolerance_atr
@@ -435,11 +495,6 @@ def price_near_ob(price, ob, atr, tolerance_atr=0.3):
 
 
 def fvg_confluencia_cercana(candles, direction, current_price, atr, lookback=15):
-    """
-    Busca si existe un FVG reciente en la misma direccion del setup,
-    cerca del precio actual. Es la secuencia clasica SMC: sweep -> BOS
-    -> FVG -> entrada. Si el FVG ya esta ahi, refuerza la confluencia.
-    """
     if atr <= 0:
         return False
     recientes = candles[-lookback:]
@@ -453,13 +508,6 @@ def fvg_confluencia_cercana(candles, direction, current_price, atr, lookback=15)
 
 
 def sweep_rejection_fuerte(vela, direction):
-    """
-    Valida que la vela que hizo el sweep tenga un rechazo fuerte: mecha
-    larga en la direccion barrida y cierre claramente alejado del
-    extremo. Un sweep con mecha corta es mas sospechoso de ser ruido.
-    BUY  -> sweep de un low -> se espera mecha inferior larga (>=35% del rango)
-    SELL -> sweep de un high -> se espera mecha superior larga (>=35% del rango)
-    """
     rango = vela["H"] - vela["L"]
     if rango == 0:
         return False
@@ -472,12 +520,6 @@ def sweep_rejection_fuerte(vela, direction):
 
 
 def tendencia_madura(candles, period_fast=9, period_slow=20):
-    """
-    Compara la separacion actual entre EMA9/EMA20 contra la separacion
-    de hace 3 velas. Si la separacion se mantiene o crece, la tendencia
-    de ese timeframe esta establecida (no es un cruce recien formado,
-    mas propenso a fakeout). Devuelve True/False, o None si faltan datos.
-    """
     closes = [c["C"] for c in candles]
     if len(closes) < period_slow + 5:
         return None
@@ -493,12 +535,6 @@ def tendencia_madura(candles, period_fast=9, period_slow=20):
 
 
 def liquidez_sesion_confluencia(candles, direction, current_price, lookback=40):
-    """
-    Compara el precio actual contra el rango reciente (aprox. sesion
-    asiatica / pre-London) como zona de liquidez de referencia. Los
-    sweeps que ocurren cerca del limite de ese rango suelen tener mas
-    peso, porque ahi es donde se acumulan stops de retail.
-    """
     ventana = candles[-lookback:]
     if len(ventana) < 10:
         return False
@@ -512,21 +548,11 @@ def liquidez_sesion_confluencia(candles, direction, current_price, lookback=40):
     else:
         return abs(current_price - rango_high) <= tolerancia
 
-# ── OTE — OPTIMAL TRADE ENTRY (ICT Fibonacci) ─────────────────
-# El OTE es el retroceso del 62%-79% del ultimo swing
-# Es la zona donde los institucionales reentran despues de un BOS/CHoCH
-# Niveles clave ICT: 0.62, 0.705 (golden pocket), 0.79
-
-OTE_LOW  = 0.62   # 62% retroceso — inicio zona OTE
-OTE_HIGH = 0.79   # 79% retroceso — fin zona OTE
-OTE_GOLD = 0.705  # Golden pocket — nivel optimo
+OTE_LOW  = 0.62
+OTE_HIGH = 0.79
+OTE_GOLD = 0.705
 
 def calc_ote(swing_high, swing_low, direction):
-    """
-    Calcula la zona OTE basada en el ultimo swing.
-    BUY:  retroceso desde swing_high (precio baja a OTE y sube)
-    SELL: retroceso desde swing_low  (precio sube a OTE y baja)
-    """
     rng = swing_high - swing_low
     if rng <= 0:
         return None
@@ -546,7 +572,6 @@ def price_in_ote(current_price, ote):
     return ote["low"] <= current_price <= ote["high"]
 
 def ote_score_bonus(current_price, ote):
-    """Bonus +5 a +15 segun proximidad al golden pocket."""
     if not ote or not price_in_ote(current_price, ote):
         return 0
     zone_size = ote["high"] - ote["low"]
@@ -556,16 +581,7 @@ def ote_score_bonus(current_price, ote):
     proximity = 1 - (dist / zone_size)
     return round(proximity * 15)
 
-# ── FILTRO DE CONFIRMACIÓN DE VELA (Imagen 1) ─────────────────
-# ENTRY válido: vela previa opuesta + vela actual en dirección con engulf
-# NO ENTRY: sin engulf, dos velas iguales, indecisión
-
 def confirmar_entrada_por_vela(candles, direccion):
-    """
-    Valida estructura de confirmación de 2 velas antes de entrar.
-    BUY:  vela previa bajista + vela actual alcista que cierra sobre open anterior
-    SELL: vela previa alcista + vela actual bajista que cierra bajo open anterior
-    """
     if len(candles) < 2:
         return False
     prev = candles[-2]
@@ -573,25 +589,16 @@ def confirmar_entrada_por_vela(candles, direccion):
     if direccion == "BUY":
         previa_bajista = prev["C"] < prev["O"]
         actual_alcista = curr["C"] > curr["O"]
-        engulf         = curr["C"] > prev["O"]   # cierra por encima del open anterior
+        engulf         = curr["C"] > prev["O"]
         return previa_bajista and actual_alcista and engulf
     elif direccion == "SELL":
         previa_alcista = prev["C"] > prev["O"]
         actual_bajista = curr["C"] < curr["O"]
-        engulf         = curr["C"] < prev["O"]   # cierra por debajo del open anterior
+        engulf         = curr["C"] < prev["O"]
         return previa_alcista and actual_bajista and engulf
     return False
 
-# ── BONUS DE MORFOLOGÍA DE VELA (Imagen 2) ────────────────────
-# Marubozu (cuerpo >80%) → 90-95% probabilidad → +15 pts
-# Pin Bar / Doji con mecha dominante → 80% probabilidad → +10 pts
-# Mecha opuesta dominante (50/50) → penalizar -10 pts
-
 def score_morfologia_vela(candles, direccion):
-    """
-    Bonus/penalización basado en probabilidad por morfología de vela.
-    Se aplica sobre la vela de confirmación (última vela).
-    """
     if len(candles) < 1:
         return 0, ""
     vela   = candles[-1]
@@ -619,16 +626,7 @@ def score_morfologia_vela(candles, direccion):
             return -10, "Mecha inferior dominante (50/50)"
     return 0, ""
 
-# ── FILTRO DE CORRELACIÓN CON EL DOLAR (DXY sintetico) ────────
-# Este broker no expone un simbolo nativo de indice del dolar, asi que se
-# construye uno sintetico combinando la tendencia de 4 pares mayores.
-
 def get_pair_trend(par, timeframe="M30", limit=60):
-    """
-    Calcula la tendencia (BUY/SELL) de un par segun EMA9 vs EMA20,
-    igual que se hace para XAUUSD. Devuelve None si no hay datos
-    suficientes (ej. data_engine.py aun no ha subido velas de este par).
-    """
     rows = get_candles(timeframe, limit, instrument=par)
     if len(rows) < 20:
         return None
@@ -640,16 +638,6 @@ def get_pair_trend(par, timeframe="M30", limit=60):
     return "BUY" if e9 > e20 else "SELL"
 
 def get_dxy_trend():
-    """
-    Combina la tendencia de EURUSD, GBPUSD, USDCHF y USDJPY en un voto
-    de fuerza del dolar:
-      - EURUSD/GBPUSD en SELL (bajando) = voto a favor del dolar fuerte
-      - USDCHF/USDJPY en BUY  (subiendo) = voto a favor del dolar fuerte
-    Devuelve:
-      "BUY"     -> dolar fortaleciendose (3-4 votos de 4)
-      "SELL"    -> dolar debilitandose   (0-1 votos de 4)
-      "NEUTRAL" -> sin consenso claro (2 votos), o datos insuficientes
-    """
     votos_dolar_fuerte = 0
     pares_evaluados = 0
 
@@ -660,35 +648,23 @@ def get_dxy_trend():
         pares_evaluados += 1
 
         if par in DOLLAR_PAIRS_INVERSOS:
-            # EURUSD/GBPUSD: si el par SELL (bajando), el dolar se fortalece
             if trend == "SELL":
                 votos_dolar_fuerte += 1
         else:
-            # USDCHF/USDJPY: si el par BUY (subiendo), el dolar se fortalece
             if trend == "BUY":
                 votos_dolar_fuerte += 1
 
     if pares_evaluados < 3:
-        # Datos insuficientes (ej. data_engine.py recien desplegado, o
-        # aun no ha subido suficientes velas de los pares) -> no forzar opinion.
         return "NEUTRAL"
 
     if votos_dolar_fuerte >= 3:
-        return "BUY"    # dolar fortaleciendose
+        return "BUY"
     if votos_dolar_fuerte <= 1:
-        return "SELL"   # dolar debilitandose
-    return "NEUTRAL"    # 2 de 4 — sin consenso
+        return "SELL"
+    return "NEUTRAL"
 
 
 def dxy_score_bonus(signal_type, dxy_trend):
-    """
-    Bono/penalizacion segun la correlacion clasica oro-dolar:
-      oro SELL + dolar fuerte (BUY)  -> confirma  -> +DXY_SCORE_BONUS
-      oro BUY  + dolar debil (SELL)  -> confirma  -> +DXY_SCORE_BONUS
-      cualquier otra combinacion (que no sea NEUTRAL) -> contradice -> -DXY_SCORE_BONUS
-      dxy_trend NEUTRAL -> no afecta -> 0
-    Devuelve (puntos, razon_texto_o_None).
-    """
     if dxy_trend == "NEUTRAL":
         return 0, None
 
@@ -700,15 +676,7 @@ def dxy_score_bonus(signal_type, dxy_trend):
     else:
         return -DXY_SCORE_BONUS, f"USD {dxy_trend} contradice {signal_type} (-{DXY_SCORE_BONUS})"
 
-# ── VALIDADOR DE VIGENCIA (filtro anti-manipulación) ──────────
-# Los ~90s de latencia del sistema filtran fakeouts naturalmente
-# Si el precio ya se alejó más de 0.5x ATR → señal expirada
-
 def señal_vigente(sig, precio_actual):
-    """
-    Verifica que el precio sigue cerca de la entrada original.
-    Si se alejó más de 0.5x ATR la señal ya expiró (manipulación o movimiento rápido).
-    """
     atr       = sig.get("atr", 5)
     distancia = abs(precio_actual - sig["entry_price"])
     limite    = atr * 0.5
@@ -717,15 +685,21 @@ def señal_vigente(sig, precio_actual):
         print(f"  [VIGENCIA] Señal expirada — precio se alejó {distancia:.2f} pts (max {limite:.2f})")
     return vigente
 
-# ── KILLZONE OBLIGATORIA ───────────────────────────────────────
-# Estrategias 1, 3 y 4 solo operan en London/NY KZ
-# Evita señales en zona muerta donde el mercado no tiene dirección
+# ── KILLZONE — BONO DE SCORE, YA NO BLOQUEO OBLIGATORIO ────────
+# CAMBIO 2026-08-13: killzone_requerida() ya no bloquea las estrategias
+# 1, 3 y 4 fuera de killzone — solo deja un aviso informativo en el
+# log y SIEMPRE devuelve True. La killzone activa sigue sumando su
+# bono de score normal (linea "if is_killzone(): score += N" dentro de
+# cada estrategia), pero ahora es opcional, no obligatoria.
+#
+# Estrategia 2 (Killzone Breakout) NO usa esta funcion — sigue con su
+# propio chequeo `if not is_killzone(): return None` al inicio, porque
+# su logica completa depende de operar el rango de apertura de sesion.
 
 def killzone_requerida(nombre_estrategia):
-    """Bloquea estrategias fuera de killzone."""
+    """Ya no bloquea — deja aviso en el log cuando opera fuera de killzone."""
     if not is_killzone():
-        print(f"  [{nombre_estrategia}] Bloqueado — fuera de Killzone (solo opera en London/NY KZ)")
-        return False
+        print(f"  [{nombre_estrategia}] Fuera de Killzone — evaluando igual (killzone es bono de score, no bloqueo obligatorio)")
     return True
 
 def is_killzone():
@@ -749,12 +723,9 @@ def in_cooldown(strategy):
     elapsed = (datetime.now(timezone.utc) - last_signal_time[strategy]).total_seconds()
     return elapsed < SIGNAL_COOLDOWN
 
-# ── PUBLICAR SEÑAL ────────────────────────────────────────────
-
 def publish_signal(sig):
     global daily_count, last_day, last_signal_time
 
-    # Reset contador diario
     today = datetime.now(timezone.utc).date()
     if last_day != today:
         daily_count = 0
@@ -762,7 +733,6 @@ def publish_signal(sig):
 
     if daily_count >= MAX_DAILY:
         print(f"  [SKIP] Límite diario {MAX_DAILY} señales alcanzado.")
-        # Igual notificar Telegram que hay señal aunque no se publique
         send_telegram(
             f"[ALERTA] {sig['signal_type']} detectado — límite diario alcanzado\n"
             f"Estrategia: {sig['strategy']}\n"
@@ -775,8 +745,6 @@ def publish_signal(sig):
         print(f"  [SKIP] Cooldown activo para {sig['strategy']}")
         return False
 
-    # ── Validador de vigencia anti-manipulación ──
-    # Obtener precio actual de la última vela M5
     try:
         rows = get_candles("M5", 1)
         if rows:
@@ -784,9 +752,8 @@ def publish_signal(sig):
             if not señal_vigente(sig, precio_actual):
                 return False
     except:
-        pass  # Si falla el check, continuar igual
+        pass
 
-    # Insertar en Supabase
     payload = {
         "id":            str(uuid.uuid4()),
         "signal_type":   sig["signal_type"],
@@ -818,7 +785,6 @@ def publish_signal(sig):
     daily_count += 1
     last_signal_time[sig["strategy"]] = datetime.now(timezone.utc)
 
-    # Telegram — enviar señal completa
     msg   = telegram_signal(sig)
     ok_tg = send_telegram(msg)
     if ok_tg:
@@ -835,14 +801,8 @@ def publish_signal(sig):
     )
     return True
 
-# ════════════════════════════════════════════════════════════════
-# ESTRATEGIA 1 — SCALPING M5 SMC
-# Sweep de liquidez + BOS/CHoCH + confluencia multi-TF
-# ════════════════════════════════════════════════════════════════
-
 def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
-    if not killzone_requerida("1-Scalping SMC"):
-        return None
+    killzone_requerida("1-Scalping SMC")  # ya no bloquea, solo informa en log
     if len(c5) < 30:
         return None
 
@@ -856,7 +816,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not e9 or not e20 or atr < 0.5:
         return None
 
-    # ── Filtro de volatilidad minima (ATR) — NUEVO ──
     vol_ok, vol_umbral = filtro_volatilidad_ok(atr)
     if not vol_ok:
         print(f"  [1] Scalping M5 SMC: descartado — volatilidad insuficiente (ATR={atr:.2f} < umbral={vol_umbral:.2f})")
@@ -864,7 +823,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
 
     ema_dir = "BUY" if e9 > e20 else "SELL"
 
-    # Confluencia TF superiores
     def tf_dir(candles):
         if len(candles) < 10:
             return None
@@ -875,7 +833,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     dir_m30 = tf_dir(c30)
     dir_h1  = tf_dir(ch1)
 
-    # Swing highs/lows
     highs, lows = detect_swing_hl(c5[-30:], lookback=2)
     if not highs or not lows:
         return None
@@ -886,11 +843,9 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     sweep_low  = last["L"] < swing_l and last["C"] > swing_l
     sweep_high = last["H"] > swing_h and last["C"] < swing_h
 
-    # OTE — Optimal Trade Entry (ICT Fibonacci 62-79%)
     ote_buy  = calc_ote(swing_h, swing_l, "BUY")
     ote_sell = calc_ote(swing_h, swing_l, "SELL")
 
-    # BOS/CHoCH últimas 20 velas
     r = c5[-20:]
     rH = max(c["H"] for c in r[-5:]); pH = max(c["H"] for c in r[-10:-5])
     rL = min(c["L"] for c in r[-5:]); pL = min(c["L"] for c in r[-10:-5])
@@ -908,7 +863,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         if choch   == "BUY": score += 20; reasons.append("CHoCH BUY")
         elif bos   == "BUY": score += 10; reasons.append("BOS BUY")
         if is_killzone():    score += 5;  reasons.append("Killzone")
-        # OTE bonus — precio en zona 62-79% Fibonacci
         ote_bonus = ote_score_bonus(last["C"], ote_buy)
         if ote_bonus > 0:
             score += ote_bonus
@@ -922,7 +876,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         if choch   == "SELL": score += 20; reasons.append("CHoCH SELL")
         elif bos   == "SELL": score += 10; reasons.append("BOS SELL")
         if is_killzone():     score += 5;  reasons.append("Killzone")
-        # OTE bonus — precio en zona 62-79% Fibonacci
         ote_bonus = ote_score_bonus(last["C"], ote_sell)
         if ote_bonus > 0:
             score += ote_bonus
@@ -932,21 +885,17 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not sig_type:
         return None
 
-    # ── NUEVO: confluencias adicionales para Scalping M5 SMC ──
     ventana_scalp = c5[-40:]
 
-    # 1. Order Block — el sweep deberia ocurrir cerca de un OB de mayor jerarquia
     ob = detect_last_order_block(ventana_scalp, sig_type)
     if price_near_ob(last["C"], ob, atr):
         score += 15
         reasons.append("Order Block confirmado")
 
-    # 2. FVG cercano en la misma direccion (secuencia sweep -> BOS -> FVG)
     if fvg_confluencia_cercana(ventana_scalp, sig_type, last["C"], atr):
         score += 10
         reasons.append("FVG cercano confluencia")
 
-    # 3. Momentum del rechazo en la vela de sweep
     if sweep_rejection_fuerte(last, sig_type):
         score += 10
         reasons.append("Rechazo fuerte en sweep")
@@ -954,7 +903,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         score -= 10
         reasons.append("Sweep debil (mecha corta)")
 
-    # 4. Madurez de la tendencia en M30/H1 — evita cruces de EMA recien formados
     madura_m30 = tendencia_madura(c30)
     madura_h1  = tendencia_madura(ch1)
     if madura_m30:
@@ -964,7 +912,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         score += 5
         reasons.append("Tendencia H1 establecida")
 
-    # 5. Zona de liquidez de sesion (rango asiatico/pre-London)
     if liquidez_sesion_confluencia(ventana_scalp, sig_type, last["C"]):
         score += 10
         reasons.append("Zona de liquidez de sesion")
@@ -972,19 +919,16 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if score < MIN_SCORE:
         return None
 
-    # ── Filtro confirmación de vela (Imagen 1) ──
     if not confirmar_entrada_por_vela(c5, sig_type):
         print(f"  [1] Scalping M5 SMC: {sig_type} descartado — sin confirmación de vela")
         return None
 
-    # ── Bonus morfología (Imagen 2) ──
     morfo_bonus, morfo_reason = score_morfologia_vela(c5, sig_type)
     if morfo_bonus != 0:
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -996,7 +940,6 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         return None
 
     sl_pts = max(atr * 1.2, 5)
-    # Si precio esta en OTE usar golden pocket como entrada ideal
     ote_active = ote_buy if sig_type == "BUY" else ote_sell
     if price_in_ote(last["C"], ote_active):
         entry = ote_active["golden"]
@@ -1018,12 +961,8 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
         "candle_time":   last["time"],
     }
 
-# ════════════════════════════════════════════════════════════════
-# ESTRATEGIA 2 — LONDON/NY KILLZONE BREAKOUT
-# Opera el primer movimiento fuerte al inicio de cada sesión
-# ════════════════════════════════════════════════════════════════
-
 def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
+    # NO se toco — sigue exigiendo killzone obligatoria por diseño.
     if not is_killzone():
         return None
     if len(c5) < 20 or len(ch1) < 5:
@@ -1035,20 +974,17 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
     if atr < 0.5:
         return None
 
-    # Rango de las últimas 6 velas M5 (30 min pre-sesión)
     pre_candles = c5[-7:-1]
     range_high  = max(c["H"] for c in pre_candles)
     range_low   = min(c["L"] for c in pre_candles)
     range_size  = range_high - range_low
 
-    # Necesitamos un rango mínimo y una ruptura clara
     if range_size < atr * 0.5:
         return None
 
-    breakout_up   = last["C"] > range_high and last["C"] - range_high > atr * 0.3
-    breakout_down = last["C"] < range_low  and range_low - last["C"] > atr * 0.3
+    breakout_up   = detect_orb_pullback(c5, range_high, range_low, "BUY")
+    breakout_down = detect_orb_pullback(c5, range_high, range_low, "SELL")
 
-    # Confirmar con H1
     closes_h1 = [c["C"] for c in ch1]
     e9h1  = ema(closes_h1, 9)
     e20h1 = ema(closes_h1, 20)
@@ -1073,19 +1009,25 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
     if not sig_type or score < MIN_SCORE:
         return None
 
-    # ── Filtro confirmación de vela (Imagen 1) ──
+    vwap = calc_session_vwap(c5)
+    if vwap is not None:
+        if sig_type == "BUY" and last["C"] > vwap:
+            score += 10; reasons.append(f"VWAP {vwap:.2f} confirma BUY")
+        elif sig_type == "SELL" and last["C"] < vwap:
+            score += 10; reasons.append(f"VWAP {vwap:.2f} confirma SELL")
+        else:
+            score -= 10; reasons.append(f"VWAP {vwap:.2f} contradice {sig_type}")
+
     if not confirmar_entrada_por_vela(c5, sig_type):
         print(f"  [2] Killzone Breakout: {sig_type} descartado — sin confirmación de vela")
         return None
 
-    # ── Bonus morfología (Imagen 2) ──
     morfo_bonus, morfo_reason = score_morfologia_vela(c5, sig_type)
     if morfo_bonus != 0:
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -1113,16 +1055,8 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
         "candle_time":   last["time"],
     }
 
-# ════════════════════════════════════════════════════════════════
-# ESTRATEGIA 3 — FVG FILL M5
-# Detecta Fair Value Gaps recientes y espera que el precio regrese
-# Incluye filtro anti-trampa institucional (sweep previo, momentum
-# de la vela de impulso, tamano vs ATR, y reaccion en el retest)
-# ════════════════════════════════════════════════════════════════
-
 def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
-    if not killzone_requerida("3-FVG Fill"):
-        return None
+    killzone_requerida("3-FVG Fill")  # ya no bloquea, solo informa en log
     if len(c5) < 30:
         return None
 
@@ -1131,7 +1065,6 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if atr < 0.5:
         return None
 
-    # ── Filtro de volatilidad minima (ATR) — NUEVO ──
     vol_ok, vol_umbral = filtro_volatilidad_ok(atr)
     if not vol_ok:
         print(f"  [3] FVG Fill: descartado — volatilidad insuficiente (ATR={atr:.2f} < umbral={vol_umbral:.2f})")
@@ -1144,28 +1077,23 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
         return None
     trend = "BUY" if e9 > e20 else "SELL"
 
-    # Detectar FVGs en las últimas 40 velas
     ventana_fvg = c5[-40:]
     fvgs = detect_fvgs(ventana_fvg)
     if not fvgs:
         return None
 
-    # Filtrar FVGs en dirección de la tendencia y sin llenar aún
     valid_fvgs = [f for f in fvgs if f["type"] == trend]
     if not valid_fvgs:
         return None
 
-    # Tomar el FVG más reciente
     fvg = valid_fvgs[-1]
 
-    # Verificar si el precio está tocando el FVG ahora
     price_in_fvg_buy  = trend == "BUY"  and last["L"] <= fvg["top"]    and last["C"] >= fvg["bottom"]
     price_in_fvg_sell = trend == "SELL" and last["H"] >= fvg["bottom"] and last["C"] <= fvg["top"]
 
     if not price_in_fvg_buy and not price_in_fvg_sell:
         return None
 
-    # Confirmar con M30
     closes_m30 = [c["C"] for c in c30]
     e9m30  = ema(closes_m30, 9)
     e20m30 = ema(closes_m30, 20)
@@ -1186,7 +1114,6 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if trend == "SELL" and rsi > 40: score += 10; reasons.append(f"RSI {rsi}")
     score += 10; reasons.append("FVG institucional")
 
-    # ── Filtro anti-trampa institucional del FVG ──
     fvg_sweep_ok  = hubo_sweep_antes_del_fvg(ventana_fvg, fvg)
     fvg_bonus, fvg_reasons = score_validez_fvg(ventana_fvg, fvg, atr)
     fvg_retest_ok = retest_reacciono_o_atraveso(ventana_fvg, fvg)
@@ -1208,19 +1135,16 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if score < MIN_SCORE:
         return None
 
-    # ── Filtro confirmación de vela (Imagen 1) ──
     if not confirmar_entrada_por_vela(c5, sig_type):
         print(f"  [3] FVG Fill: {sig_type} descartado — sin confirmación de vela")
         return None
 
-    # ── Bonus morfología (Imagen 2) ──
     morfo_bonus, morfo_reason = score_morfologia_vela(c5, sig_type)
     if morfo_bonus != 0:
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -1248,14 +1172,8 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
         "candle_time":   last["time"],
     }
 
-# ════════════════════════════════════════════════════════════════
-# ESTRATEGIA 4 — EMA PULLBACK M5
-# Pullback a EMA9/20 en tendencia clara con vela de confirmación
-# ════════════════════════════════════════════════════════════════
-
 def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
-    if not killzone_requerida("4-EMA Pullback"):
-        return None
+    killzone_requerida("4-EMA Pullback")  # ya no bloquea, solo informa en log
     if len(c5) < 30:
         return None
 
@@ -1269,7 +1187,6 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not e9 or not e20 or atr < 0.5:
         return None
 
-    # ── Filtro de volatilidad minima (ATR) — NUEVO ──
     vol_ok, vol_umbral = filtro_volatilidad_ok(atr)
     if not vol_ok:
         print(f"  [4] EMA Pullback: descartado — volatilidad insuficiente (ATR={atr:.2f} < umbral={vol_umbral:.2f})")
@@ -1277,7 +1194,6 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
 
     trend = "BUY" if e9 > e20 else "SELL"
 
-    # Tendencia fuerte: EMA9 > EMA20 > EMA50 (o viceversa)
     strong_trend = False
     if e50:
         strong_trend = (trend == "BUY"  and e9 > e20 > e50) or \
@@ -1286,7 +1202,6 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     last = c5[-1]
     prev = c5[-2]
 
-    # Pullback: precio tocó zona EMA9/20 y rebotó
     ema_zone_top = max(e9, e20) + atr * 0.1
     ema_zone_bot = min(e9, e20) - atr * 0.1
 
@@ -1296,7 +1211,6 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not touched_ema_buy and not touched_ema_sell:
         return None
 
-    # Vela de confirmación: cierre fuerte en dirección de tendencia
     last_body = abs(last["C"] - last["O"])
     last_range = last["H"] - last["L"]
     strong_candle = last_body > last_range * 0.5
@@ -1304,7 +1218,6 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not strong_candle:
         return None
 
-    # Confirmar con M30 y H1
     def tf_dir(candles):
         if len(candles) < 10: return None
         cl = [c["C"] for c in candles]
@@ -1330,19 +1243,16 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if score < MIN_SCORE:
         return None
 
-    # ── Filtro confirmación de vela (Imagen 1) ──
     if not confirmar_entrada_por_vela(c5, sig_type):
         print(f"  [4] EMA Pullback: {sig_type} descartado — sin confirmación de vela")
         return None
 
-    # ── Bonus morfología (Imagen 2) ──
     morfo_bonus, morfo_reason = score_morfologia_vela(c5, sig_type)
     if morfo_bonus != 0:
         score += morfo_bonus
         if morfo_reason:
             reasons.append(morfo_reason)
 
-    # ── Bono/penalizacion por correlacion con el dolar ──
     dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
     if dxy_bonus != 0:
         score += dxy_bonus
@@ -1370,13 +1280,10 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
         "candle_time":   last["time"],
     }
 
-# ── CICLO PRINCIPAL ───────────────────────────────────────────
-
 def analyze():
     now_str = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{now_str}] Analizando mercado...")
 
-    # Cargar velas
     rows_m5  = get_candles("M5",  100)
     rows_m30 = get_candles("M30", 60)
     rows_h1  = get_candles("H1",  60)
@@ -1389,8 +1296,6 @@ def analyze():
     c30 = to_candles(rows_m30)
     ch1 = to_candles(rows_h1)
 
-    # Tendencia del dolar (indice sintetico), una sola vez por ciclo
-    # y se pasa a las 4 estrategias — evita recalcularla 4 veces por ronda.
     dxy_trend = get_dxy_trend()
 
     last_price = c5[-1]["C"]
@@ -1401,7 +1306,6 @@ def analyze():
 
     signals_found = 0
 
-    # ── TradingPro AI Elite
     try:
         if not AI_ENGINE_AVAILABLE or analyze_tradingpro_ai is None:
             print(f"  [AI] TradingPro AI Elite desactivado: {AI_ENGINE_IMPORT_ERROR}")
@@ -1439,7 +1343,6 @@ def analyze():
     except Exception as e:
         print(f"  [AI] Error TradingPro AI Elite: {e}")
 
-    # ── Estrategia 1: Scalping M5 SMC
     try:
         sig = strategy_scalping_m5(c5, c30, ch1, dxy_trend)
         if sig:
@@ -1452,7 +1355,6 @@ def analyze():
     except Exception as e:
         print(f"  [1] Error Scalping M5 SMC: {e}")
 
-    # ── Estrategia 2: Killzone Breakout
     try:
         sig = strategy_killzone_breakout(c5, ch1, dxy_trend)
         if sig:
@@ -1466,7 +1368,6 @@ def analyze():
     except Exception as e:
         print(f"  [2] Error Killzone Breakout: {e}")
 
-    # ── Estrategia 3: FVG Fill
     try:
         sig = strategy_fvg_fill(c5, c30, dxy_trend)
         if sig:
@@ -1479,7 +1380,6 @@ def analyze():
     except Exception as e:
         print(f"  [3] Error FVG Fill: {e}")
 
-    # ── Estrategia 4: EMA Pullback
     try:
         sig = strategy_ema_pullback(c5, c30, ch1, dxy_trend)
         if sig:
@@ -1506,20 +1406,20 @@ def main():
     print(f"  Estrategias activas:")
     print(f"    AI. TradingPro AI Elite (Confluence Engine)")
     print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib + OB/FVG/liquidez)")
-    print(f"    2. Killzone Breakout (London/NY)")
+    print(f"    2. Killzone Breakout (London/NY) con Pullback + VWAP")
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
     print(f"    4. EMA Pullback M5")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
     print(f"  Filtro volatilidad ATR: umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f} (hist={ATR_PROMEDIO_HISTORICO} x mult={ATR_MIN_MULTIPLIER})")
+    print(f"  Killzone: BONO de score en estrategias 1/3/4 (ya no bloqueo obligatorio) | Estrategia 2 SIGUE exigiendo killzone")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("ERROR: Faltan SUPABASE_URL o SUPABASE_KEY en .env")
         sys.exit(1)
 
-    # Verificar Telegram al arrancar
     if TELEGRAM_TOKEN:
         ok = send_telegram(
             f"Trading Pro XAUUSD — Signal Engine INICIADO\n"
@@ -1528,6 +1428,7 @@ def main():
             f"Filtro DXY sintetico activo ({', '.join(DOLLAR_PAIRS)})\n"
             f"Filtro FVG anti-trampa activo\n"
             f"Filtro volatilidad ATR activo (umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f})\n"
+            f"Killzone: bono de score en 1/3/4, ya no bloqueo obligatorio\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
@@ -1538,7 +1439,6 @@ def main():
     else:
         print("  [TELEGRAM] Sin TELEGRAM_TOKEN — notificaciones desactivadas")
 
-    # Loop en tiempo real
     while True:
         try:
             analyze()
