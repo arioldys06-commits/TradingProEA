@@ -29,7 +29,30 @@ ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
-CAMBIOS EN ESTA VERSION (limite de perdidas fuera de killzone + time-stop):
+CAMBIOS EN ESTA VERSION (fix: señal huerfana en Supabase tras cierre anticipado):
+- BUG: los cierres anticipados reales en MT5 (CHoCH exit, time-stop)
+  cerraban la posicion en MT5 pero NUNCA actualizaban la señal
+  correspondiente en Supabase — se quedaba con status=EXECUTING para
+  siempre. result_tracker.py solo revisa señales EXECUTING y las
+  simula recorriendo velas M5 desde cero, sin saber que la posicion
+  real ya se habia cerrado por otro motivo y a otro precio. Resultado:
+  Telegram reportaba un WIN/LOSS ficticio sobre un trade que ya no
+  existia (caso detectado: señal entrada 4402.65, EMA Pullback M5,
+  reportada como LOSS por result_tracker.py aunque ya se habia cerrado
+  antes via CHoCH/time-stop).
+- FIX: get_strategy_by_position_comment() se reemplaza por
+  get_signal_info_by_position_comment(), que ademas de la estrategia
+  devuelve el signal_id completo (antes solo se pedia "strategy" a
+  Supabase). Se agrega update_signal_closed(sig_id, result, exit_price)
+  que marca la señal como CLOSED con su resultado real (WIN si el
+  profit de MT5 al cerrar fue positivo, LOSS si no) en el mismo
+  momento en que se cierra la posicion real. check_choch_exit() y
+  check_time_stop() ahora reciben sig_id y llaman a esta funcion
+  justo despues de close_position_market(). Con esto, cualquier señal
+  cerrada por estos caminos deja de ser EXECUTING de inmediato y
+  result_tracker.py no vuelve a simularla.
+
+CAMBIOS EN VERSION ANTERIOR (limite de perdidas fuera de killzone + time-stop):
 - NUEVO 2026-08-17 (limite de perdidas FUERA de killzone):
   Desde que killzone_requerida() en signal_engine.py dejo de bloquear
   (13-ago), todas las estrategias pueden operar fuera de Londres/NYC.
@@ -590,36 +613,82 @@ def detect_choch(candles):
     return None
 
 
-def get_strategy_by_position_comment(comment):
+def get_signal_info_by_position_comment(comment):
     """
     El comment de la orden real en MT5 es 'TradingPro_{signal_id[:8]}'
     (ver execute_order). Busca en Supabase la señal cuyo id empieza
-    con ese prefijo para saber de que estrategia es la posicion
-    abierta — asi la gestion de salida por CHoCH solo se aplica a las
-    estrategias listadas en EARLY_EXIT_STRATEGIES.
+    con ese prefijo y devuelve (signal_id, strategy) — antes esta
+    funcion (get_strategy_by_position_comment) solo devolvia strategy,
+    lo cual bastaba para decidir si aplicar CHoCH/time-stop pero no
+    alcanzaba para poder cerrar la señal en Supabase despues de un
+    cierre anticipado real en MT5 (ver update_signal_closed y el FIX
+    2026-08-17 en el bloque de comentarios de arriba).
+    Devuelve (None, None) si no se pudo resolver.
     """
     if not comment or not comment.startswith("TradingPro_"):
-        return None
+        return None, None
     prefix = comment.replace("TradingPro_", "").strip()
     if not prefix:
-        return None
+        return None, None
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/signals",
             headers=headers(),
             params={
                 "id":     f"like.{prefix}*",
-                "select": "strategy",
+                "select": "id,strategy",
                 "limit":  "1",
             },
             timeout=15,
         )
         if r.status_code >= 400:
-            return None
+            return None, None
         data = r.json()
-        return data[0]["strategy"] if data else None
+        if not data:
+            return None, None
+        return data[0]["id"], data[0]["strategy"]
     except Exception:
-        return None
+        return None, None
+
+
+def update_signal_closed(sig_id, result, exit_price=None, intentos=3):
+    """
+    NUEVO 2026-08-17: cierra en Supabase (status=CLOSED, result=WIN/LOSS)
+    una señal cuya posicion real en MT5 se cerro por un camino que NO es
+    el flujo normal de result_tracker.py (CHoCH exit o time-stop). Sin
+    esto, la señal se quedaba con status=EXECUTING para siempre y
+    result_tracker.py la seguia "viendo" como posicion abierta,
+    simulando su recorrido con velas M5 desde cero — generando un
+    WIN/LOSS ficticio en Telegram que no correspondia al cierre real.
+    Reintenta igual que update_signal_status, por consistencia.
+    """
+    if not sig_id or not SUPABASE_URL or not SUPABASE_KEY:
+        return False
+
+    ultimo_error = None
+    for intento in range(1, intentos + 1):
+        try:
+            r = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/signals?id=eq.{sig_id}",
+                headers=headers(),
+                json={"status": "CLOSED", "result": result},
+                timeout=15,
+            )
+            if r.status_code < 400:
+                return True
+            ultimo_error = f"HTTP {r.status_code}: {r.text}"
+        except Exception as e:
+            ultimo_error = str(e)
+
+        print(f"  [SUPABASE] Intento {intento}/{intentos} fallo al cerrar señal {sig_id}: {ultimo_error}")
+        if intento < intentos:
+            time.sleep(2)
+
+    log_error_to_file(
+        f"NO SE PUDO CERRAR SEÑAL tras {intentos} intentos. "
+        f"Señal: {sig_id} -> CLOSED/{result} | Error: {ultimo_error}"
+    )
+    return False
 
 
 def close_position_market(position, motivo=""):
@@ -861,7 +930,7 @@ def check_trailing_stop(position, side, now_str):
     return True
 
 
-def check_time_stop(position, strategy, now_str):
+def check_time_stop(position, sig_id, strategy, now_str):
     """
     Cierra la posicion si lleva mas de TIME_STOP_MINUTES abierta y
     todavia no llego a breakeven (no alcanzo el 70% del camino a TP1).
@@ -873,6 +942,12 @@ def check_time_stop(position, strategy, now_str):
     siga sangrando tiempo sin confirmar la tesis del pullback, se cierra
     a mercado despues de TIME_STOP_MINUTES si no hay progreso real.
     Devuelve True si cerro la posicion, False si no hizo nada.
+
+    FIX 2026-08-17 (señal huerfana en Supabase): ademas de cerrar la
+    posicion real en MT5, ahora tambien cierra la señal correspondiente
+    en Supabase (status=CLOSED, result=WIN/LOSS segun profit real) para
+    que result_tracker.py deje de "verla" como EXECUTING y no simule un
+    resultado ficticio sobre un trade que ya no existe.
     """
     if strategy not in TIME_STOP_STRATEGIES:
         return False
@@ -898,6 +973,21 @@ def check_time_stop(position, strategy, now_str):
         f"  [TIME STOP] {strategy} — {elapsed_min:.0f} min sin llegar a breakeven. "
         f"Posicion {position.ticket} cerrada @ {close_price} | Profit aprox: ${profit_antes}"
     )
+
+    # FIX 2026-08-17: cerrar la señal en Supabase para que result_tracker.py
+    # no la siga tratando como EXECUTING y simule un resultado ficticio.
+    resultado = "WIN" if profit_antes > 0 else "LOSS"
+    if sig_id:
+        cerrada_ok = update_signal_closed(sig_id, resultado, close_price)
+        if not cerrada_ok:
+            print(f"  [TIME STOP] AVISO: no se pudo cerrar la señal {sig_id[:8]} en Supabase")
+    else:
+        print("  [TIME STOP] AVISO: no se encontro signal_id — la señal puede quedar EXECUTING en Supabase")
+        log_error_to_file(
+            f"Time stop cerro ticket {position.ticket} pero no se pudo resolver signal_id "
+            f"desde el comment de la posicion"
+        )
+
     send_telegram(
         f"[BOT] CIERRE POR TIEMPO — {strategy}\n"
         f"Motivo: {elapsed_min:.0f} min abierta sin alcanzar breakeven\n"
@@ -909,13 +999,24 @@ def check_time_stop(position, strategy, now_str):
     return True
 
 
-def check_choch_exit(position, side, strategy, now_str):
+def check_choch_exit(position, side, sig_id, strategy, now_str):
     """
     Si la posicion abierta pertenece a una estrategia con gestion de
     salida temprana (EARLY_EXIT_STRATEGIES) y aparece un CHoCH en
     contra de su direccion, la cierra de inmediato. Devuelve True si
     cerro la posicion (para que run_cycle no siga evaluando nada mas
     ese ciclo), False si no hizo nada.
+
+    FIX 2026-08-17 (señal huerfana en Supabase): ademas de cerrar la
+    posicion real en MT5, ahora tambien cierra la señal correspondiente
+    en Supabase (status=CLOSED, result=WIN/LOSS segun profit real).
+    Antes, un cierre por CHoCH dejaba la señal con status=EXECUTING
+    para siempre, y result_tracker.py la seguia simulando su recorrido
+    con velas M5 desde cero — reportando por Telegram un WIN/LOSS
+    ficticio que no correspondia al cierre real ya ocurrido en MT5.
+    Caso detectado: señal con entrada 4402.65 (EMA Pullback M5)
+    reportada como LOSS por result_tracker.py aunque ya se habia
+    cerrado antes por esta via.
     """
     if strategy not in EARLY_EXIT_STRATEGIES:
         return False
@@ -940,6 +1041,20 @@ def check_choch_exit(position, side, strategy, now_str):
         f"  [CHoCH EXIT] {strategy} — CHoCH {choch} detectado en contra de {side}. "
         f"Posicion {position.ticket} cerrada @ {close_price} | Profit aprox: ${profit_antes}"
     )
+
+    # FIX 2026-08-17: cerrar la señal en Supabase — ver docstring arriba.
+    resultado = "WIN" if profit_antes > 0 else "LOSS"
+    if sig_id:
+        cerrada_ok = update_signal_closed(sig_id, resultado, close_price)
+        if not cerrada_ok:
+            print(f"  [CHoCH EXIT] AVISO: no se pudo cerrar la señal {sig_id[:8]} en Supabase")
+    else:
+        print("  [CHoCH EXIT] AVISO: no se encontro signal_id — la señal puede quedar EXECUTING en Supabase")
+        log_error_to_file(
+            f"CHoCH exit cerro ticket {position.ticket} pero no se pudo resolver signal_id "
+            f"desde el comment de la posicion"
+        )
+
     send_telegram(
         f"[BOT] CIERRE ANTICIPADO — {strategy}\n"
         f"Motivo: cambio de estructura (CHoCH {choch}) en contra de {side}\n"
@@ -1307,14 +1422,14 @@ def run_cycle():
         # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
         check_trailing_stop(pos, side, now_str)
 
-        strategy = get_strategy_by_position_comment(getattr(pos, "comment", None))
+        sig_id, strategy = get_signal_info_by_position_comment(getattr(pos, "comment", None))
 
         # ── NUEVO 2026-08-17: cierre por tiempo si no llega a breakeven ──
-        cerrada_por_tiempo = check_time_stop(pos, strategy, now_str)
+        cerrada_por_tiempo = check_time_stop(pos, sig_id, strategy, now_str)
 
         # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
         if not cerrada_por_tiempo and strategy in EARLY_EXIT_STRATEGIES:
-            check_choch_exit(pos, side, strategy, now_str)
+            check_choch_exit(pos, side, sig_id, strategy, now_str)
 
         return
 
