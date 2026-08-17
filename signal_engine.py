@@ -88,9 +88,11 @@ Killzone — bono de score, ya NO es obligatoria (CAMBIO, ver FIX abajo):
     resto de las confluencias dan score suficiente (>= MIN_SCORE). Ya
     no hay bloqueo duro — killzone activa sigue sumando puntos igual
     que antes, solo que ahora es opcional en vez de obligatoria.
-  - Estrategia 4 (EMA Pullback M5) es la EXCEPCION desde el fix del
-    2026-08-17 (ver mas abajo): la killzone NYC vuelve a ser un
-    bloqueo duro solo para ella, por evidencia real de resultados.
+  - Estrategia 4 (EMA Pullback M5) tiene una regla especial desde el
+    2026-08-17: en killzone NYC solo publica señal si el score es muy
+    alto (>= NYC_MIN_SCORE_EMA_PULLBACK, 90 por defecto) — el resto de
+    esa ventana horaria queda descartada por evidencia real de
+    resultados (ver mas abajo).
   - Estrategia 2 SIGUE exigiendo killzone obligatoria por diseño: su
     logica entera es operar la ruptura del rango justo al abrir sesion
     (London/NY), no tiene sentido estructural fuera de ese contexto.
@@ -122,15 +124,20 @@ Loop interno: analiza cada 30 segundos
 # ============================================================
 
 # ============================================================
-# FIX 2026-08-17 (EMA Pullback M5 — bloqueo killzone NYC + M30/H1 obligatorio):
+# FIX 2026-08-17 (EMA Pullback M5 — killzone NYC + M30/H1 obligatorio):
 #   - Analisis del historico real de trades del bot (origen=BOT,
 #     strategy='EMA Pullback M5', 25 operaciones): las que cerraron en
 #     horario NYC (9:00-12:00 RD) dieron 1W/9L, -$130.46 — el 96% de
 #     la perdida total de la estrategia (-$135.40). Fuera de esa
 #     ventana la misma estrategia dio 9W/4L, +$21.70 neto.
-#   - CAMBIO 1: se agrega BLOCK_NYC_EMA_PULLBACK — bloqueo duro
-#     (no bono) SOLO para EMA Pullback M5 en killzone NYC. El resto de
-#     estrategias no se toca; siguen con killzone como bono opcional.
+#   - CAMBIO 1 (v1, bloqueo total -> v2, umbral de score): la primera
+#     version bloqueaba NYC por completo para esta estrategia. A
+#     pedido explicito de Arioldys, se cambia a un umbral de score mas
+#     exigente: en NYC solo se permite operar si el score final es
+#     >= NYC_MIN_SCORE_EMA_PULLBACK (90 por defecto). Asi no se
+#     descartan de plano señales realmente excelentes que caigan en
+#     esa ventana, pero se sigue bloqueando el grueso 75-89 que es
+#     donde vivia casi toda la perdida historica.
 #   - CAMBIO 2: dir_m30 y dir_h1, que antes sumaban +15 c/u como bono
 #     (el score se saturaba en 90-100 con o sin alineacion real de
 #     timeframes mayores, perdiendo poder de discriminacion), ahora
@@ -184,12 +191,16 @@ DXY_SCORE_BONUS = 10  # puntos que suma/resta la confirmacion/contradiccion del 
 ATR_PROMEDIO_HISTORICO = float(os.getenv("ATR_PROMEDIO_HISTORICO", "2.0"))
 ATR_MIN_MULTIPLIER     = float(os.getenv("ATR_MIN_MULTIPLIER", "0.8"))
 
-# ── Bloqueo killzone NYC para EMA Pullback M5 — NUEVO 2026-08-17 ──
+# ── Killzone NYC para EMA Pullback M5 — NUEVO 2026-08-17 (v2) ──
 # Historico real: 10 trades en NYC (9-12 RD) = 1W/9L, -$130.46.
 # El resto del dia (misma estrategia) = 9W/4L, +$21.70. La ventana NYC
-# concentra el 96% de la perdida total de esta estrategia — se bloquea
-# duro en vez de solo restar puntos.
+# concentra el 96% de la perdida total de esta estrategia.
+# v1 bloqueaba NYC por completo; v2 en cambio permite operar en NYC
+# solo si el score es muy alto (>= NYC_MIN_SCORE_EMA_PULLBACK), a
+# pedido explicito de Arioldys — asi no se pierden señales realmente
+# excelentes solo por caer en la ventana horaria mala.
 BLOCK_NYC_EMA_PULLBACK = os.getenv("BLOCK_NYC_EMA_PULLBACK", "true").lower() == "true"
+NYC_MIN_SCORE_EMA_PULLBACK = int(os.getenv("NYC_MIN_SCORE_EMA_PULLBACK", "90"))
 
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
@@ -730,10 +741,12 @@ def señal_vigente(sig, precio_actual):
 # propio chequeo `if not is_killzone(): return None` al inicio, porque
 # su logica completa depende de operar el rango de apertura de sesion.
 #
-# CAMBIO 2026-08-17: EMA Pullback M5 tiene ADEMAS su propio bloqueo
-# duro solo para killzone NYC (ver BLOCK_NYC_EMA_PULLBACK e
-# is_nyc_killzone() arriba) — killzone_requerida() sigue sin bloquear
-# nada por si sola, el bloqueo NYC vive dentro de strategy_ema_pullback().
+# CAMBIO 2026-08-17: EMA Pullback M5 tiene ADEMAS su propia regla de
+# killzone NYC (ver BLOCK_NYC_EMA_PULLBACK, NYC_MIN_SCORE_EMA_PULLBACK
+# e is_nyc_killzone() arriba) — killzone_requerida() sigue sin bloquear
+# nada por si sola, la regla de NYC vive dentro de
+# strategy_ema_pullback(), evaluada como umbral de score al final de
+# la funcion, no como bloqueo temprano.
 
 def killzone_requerida(nombre_estrategia):
     """Ya no bloquea — deja aviso en el log cuando opera fuera de killzone."""
@@ -1214,14 +1227,6 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
 def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     killzone_requerida("4-EMA Pullback")  # ya no bloquea, solo informa en log
 
-    # NUEVO 2026-08-17: bloqueo duro de killzone NYC solo para esta
-    # estrategia. Historico real: 10 trades en NYC = 1W/9L, -$130.46
-    # (96% de la perdida total de la estrategia). Fuera de NYC la
-    # misma estrategia da 9W/4L, +$21.70 neto.
-    if BLOCK_NYC_EMA_PULLBACK and is_nyc_killzone():
-        print("  [4] EMA Pullback: bloqueado — killzone NYC excluida (winrate historico 10% en esta ventana)")
-        return None
-
     if len(c5) < 30:
         return None
 
@@ -1318,6 +1323,22 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
 
     score = max(0, min(score, 100))
     if score < MIN_SCORE:
+        return None
+
+    # CAMBIO 2026-08-17 (v2): el bloqueo duro de killzone NYC se
+    # reemplaza por un umbral de score mas exigente SOLO en esa
+    # ventana. Historico real: 10 trades en NYC = 1W/9L, -$130.46
+    # (96% de la perdida total de la estrategia). En vez de excluir
+    # NYC por completo, se permite operar ahi unicamente si la señal
+    # es de muy alta calidad (score >= NYC_MIN_SCORE_EMA_PULLBACK,
+    # 90 por defecto) — el resto de la ventana (score 75-89) se sigue
+    # descartando, que es donde vivia casi toda la perdida historica.
+    if BLOCK_NYC_EMA_PULLBACK and is_nyc_killzone() and score < NYC_MIN_SCORE_EMA_PULLBACK:
+        print(
+            f"  [4] EMA Pullback: {sig_type} descartado en killzone NYC — "
+            f"score {score} < {NYC_MIN_SCORE_EMA_PULLBACK} requerido en esta ventana "
+            f"(winrate historico 10% en NYC, solo se permite con score muy alto)"
+        )
         return None
 
     sl_pts = max(atr * 1.1, 4)
@@ -1465,13 +1486,13 @@ def main():
     print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib + OB/FVG/liquidez)")
     print(f"    2. Killzone Breakout (London/NY) con Pullback + VWAP")
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
-    print(f"    4. EMA Pullback M5 (killzone NYC bloqueada, M30+H1 obligatorio)")
+    print(f"    4. EMA Pullback M5 (killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK}, M30+H1 obligatorio)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
     print(f"  Filtro volatilidad ATR: umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f} (hist={ATR_PROMEDIO_HISTORICO} x mult={ATR_MIN_MULTIPLIER})")
     print(f"  Killzone: BONO de score en estrategias 1/3 (ya no bloqueo obligatorio) | Estrategia 2 SIGUE exigiendo killzone")
-    print(f"  EMA Pullback M5: killzone NYC BLOQUEADA (BLOCK_NYC_EMA_PULLBACK={BLOCK_NYC_EMA_PULLBACK}) + M30/H1 obligatorio")
+    print(f"  EMA Pullback M5: killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK} (BLOCK_NYC_EMA_PULLBACK={BLOCK_NYC_EMA_PULLBACK}) + M30/H1 obligatorio")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1487,7 +1508,7 @@ def main():
             f"Filtro FVG anti-trampa activo\n"
             f"Filtro volatilidad ATR activo (umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f})\n"
             f"Killzone: bono de score en 1/3, ya no bloqueo obligatorio\n"
-            f"EMA Pullback M5: killzone NYC bloqueada + M30/H1 obligatorio\n"
+            f"EMA Pullback M5: killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK} + M30/H1 obligatorio\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
