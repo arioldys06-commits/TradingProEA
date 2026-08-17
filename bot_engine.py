@@ -12,19 +12,46 @@ Reglas:
 - Vigencia: rechaza señales de mas de 10 min o con precio ya movido (anti señal-vieja)
 - Maximo N perdidas por dia (MAX_LOSSES_PER_DAY, real, leido del historial de MT5)
   — protege la cuenta si se deja corriendo sin supervision
-- NUEVO: Maximo 2 perdidas POR KILLZONE (Londres 3-6 AM RD / NYC 9-12 PM RD),
+- Maximo 2 perdidas POR KILLZONE (Londres 3-6 AM RD / NYC 9-12 PM RD),
   independiente del limite diario general — protege cada sesion por separado
+- NUEVO: Maximo 2 perdidas FUERA de ambas killzones — protege las horas
+  donde el bot opera fuera de sesion desde que killzone dejo de ser
+  bloqueo obligatorio en signal_engine.py
 - SL anti-hunt: 20 puntos extra
 - Maximo 1 operacion abierta a la vez
 - Maximo 6 operaciones por dia (configurable via MAX_DAILY en .env)
 - Solo ejecuta estrategias permitidas
+- NUEVO: cierre por tiempo (time-stop) para estrategias en
+  TIME_STOP_STRATEGIES si no llegan a breakeven en TIME_STOP_MINUTES
 - Notifica a Telegram al abrir
 
 ADVERTENCIA:
 Este script ejecuta ordenes REALES en MT5.
 Usalo solo en la PC donde MetaTrader 5 este abierto y conectado.
 
-CAMBIOS EN ESTA VERSION (fix critico: zona horaria en conteo de perdidas):
+CAMBIOS EN ESTA VERSION (limite de perdidas fuera de killzone + time-stop):
+- NUEVO 2026-08-17 (limite de perdidas FUERA de killzone):
+  Desde que killzone_requerida() en signal_engine.py dejo de bloquear
+  (13-ago), todas las estrategias pueden operar fuera de Londres/NYC.
+  Se agrega MAX_LOSSES_OUTSIDE_KILLZONE (2 por defecto), evaluado solo
+  cuando get_current_killzone() devuelve None (fuera de ambas
+  ventanas). Si se alcanza, el bot pausa fuera de killzone hasta que
+  entre la proxima ventana — mismo patron que MAX_LOSSES_PER_KILLZONE,
+  reutilizando get_daily_losses()/get_killzone_losses() por diferencia
+  en vez de reconvertir horarios de nuevo.
+- NUEVO 2026-08-17 (time-stop para EMA Pullback M5):
+  Analisis del historico real de trades del bot (25 operaciones,
+  origen=BOT, strategy='EMA Pullback M5'): los trades ganadores
+  resuelven en ~15-20 min; los perdedores se alargan 35-100+ min sin
+  llegar a breakeven. Se agrega check_time_stop(): si una posicion de
+  una estrategia en TIME_STOP_STRATEGIES lleva mas de
+  TIME_STOP_MINUTES abierta y todavia no alcanzo el 70% del camino a
+  TP1 (no esta en _breakeven_applied), se cierra a mercado en vez de
+  dejarla seguir sangrando tiempo. Se evalua ANTES que check_choch_exit
+  en run_cycle — si el time-stop ya cerro la posicion, CHoCH no se
+  evalua ese ciclo (ya no hay posicion que cerrar).
+
+CAMBIOS EN VERSION ANTERIOR (fix critico: zona horaria en conteo de perdidas):
 - BUG ENCONTRADO 2026-08-11: en un solo dia hubo 5 perdidas reales
   ejecutadas (4 EMA Pullback M5 + 1 FVG Fill M5) cuando MAX_LOSSES_PER_DAY=4
   y MAX_LOSSES_PER_KILLZONE=2 (default) deberian haber bloqueado la 5ta
@@ -49,7 +76,7 @@ CAMBIOS EN ESTA VERSION (fix critico: zona horaria en conteo de perdidas):
   de perdidas realmente refleje el dia/killzone en hora RD, no un rango
   desfasado por la diferencia horaria con el servidor.
 
-CAMBIOS EN ESTA VERSION (trailing stop por ATR despues del breakeven):
+CAMBIOS EN VERSION ANTERIOR (trailing stop por ATR despues del breakeven):
 - NUEVO: una vez que el breakeven ya se activo en una posicion (SL en
   la entrada), el bot empieza a "arrastrar" el SL detrás del precio
   usando una distancia = ATR(14) de M5 x TRAILING_ATR_MULTIPLIER (1.2
@@ -72,7 +99,7 @@ CAMBIOS EN ESTA VERSION (trailing stop por ATR despues del breakeven):
   por ticket (para no saturar el canal); los ajustes siguientes solo
   quedan en el log de consola.
 
-CAMBIOS EN ESTA VERSION (breakeven real al 70% del camino a TP1):
+CAMBIOS EN VERSION ANTERIOR (breakeven real al 70% del camino a TP1):
 - NUEVO: mientras hay una posicion real abierta, si el precio ya
   recorrio BREAKEVEN_TRIGGER_PCT (70% por defecto) de la distancia
   entre la entrada y el TP1, el bot mueve el SL real en MT5 al precio
@@ -87,7 +114,7 @@ CAMBIOS EN ESTA VERSION (breakeven real al 70% del camino a TP1):
   result_tracker.py (para estimar resultados de señales), nunca se
   aplicaba de verdad sobre la posicion real en la cuenta.
 
-CAMBIOS EN ESTA VERSION (gestion de salida por cambio de estructura):
+CAMBIOS EN VERSION ANTERIOR (gestion de salida por cambio de estructura):
 - NUEVO: mientras hay una posicion real abierta de una estrategia marcada
   en EARLY_EXIT_STRATEGIES (por ahora solo "EMA Pullback M5"), cada ciclo
   el bot revisa las velas M5 recientes de Supabase buscando un CHoCH
@@ -104,7 +131,7 @@ CAMBIOS EN ESTA VERSION (gestion de salida por cambio de estructura):
   run_cycle() ya revisa posiciones abiertas en cada ciclo — es el punto
   natural para engancharlo, sin abrir una segunda conexion a MT5.
 
-CAMBIOS EN ESTA VERSION (limite de perdidas por killzone):
+CAMBIOS EN VERSION ANTERIOR (limite de perdidas por killzone):
 - Antes MAX_LOSSES_PER_DAY paraba el bot para TODO el dia apenas se
   alcanzaban N perdidas, sin distinguir si esas perdidas fueron todas
   en una sola sesion (ej. Londres de madrugada) o repartidas.
@@ -116,7 +143,8 @@ CAMBIOS EN ESTA VERSION (limite de perdidas por killzone):
   deja de operar SOLO durante esa ventana — si luego entra la otra
   killzone, se evalua por separado desde cero.
 - Fuera de ambas killzones sigue rigiendo unicamente el limite diario
-  general (MAX_LOSSES_PER_DAY).
+  general (MAX_LOSSES_PER_DAY) — hasta este cambio, ver arriba el
+  nuevo MAX_LOSSES_OUTSIDE_KILLZONE.
 
 CAMBIOS EN VERSION ANTERIOR (fix: auto-limpieza de señales vencidas):
 - Antes, cuando una señal PENDING se descartaba por vigencia (mas de
@@ -202,6 +230,15 @@ KILLZONES = [KILLZONE_LONDON, KILLZONE_NYC]
 # la otra killzone se evalua por separado, desde cero.
 MAX_LOSSES_PER_KILLZONE = int(os.getenv("MAX_LOSSES_PER_KILLZONE", "2"))
 
+# ── Limite de perdidas FUERA de ambas killzones — NUEVO 2026-08-17 ──
+# Proteccion general: desde que killzone_requerida() dejo de bloquear
+# en signal_engine.py (13-ago), todas las estrategias pueden operar
+# fuera de Londres/NYC. Este limite corta el bot fuera de esas ventanas
+# si ya acumulo MAX_LOSSES_OUTSIDE_KILLZONE perdidas hoy en horario
+# no-killzone, independiente del limite diario general y de los
+# limites por killzone.
+MAX_LOSSES_OUTSIDE_KILLZONE = int(os.getenv("MAX_LOSSES_OUTSIDE_KILLZONE", "2"))
+
 # ── Gestion de salida por cambio de estructura (CHoCH) ──
 # Estrategias que, mientras tienen una posicion real abierta, se
 # monitorean en cada ciclo por si aparece un CHoCH en contra — de ser
@@ -209,6 +246,14 @@ MAX_LOSSES_PER_KILLZONE = int(os.getenv("MAX_LOSSES_PER_KILLZONE", "2"))
 EARLY_EXIT_STRATEGIES = ["EMA Pullback M5"]
 # Misma ventana que usa signal_engine.py para detectar CHoCH (20 velas M5).
 CHOCH_WINDOW = 20
+
+# ── Cierre por tiempo (time-stop) — NUEVO 2026-08-17 ──
+# Historico real: trades ganadores de EMA Pullback M5 resuelven en
+# ~15-20 min; los perdedores se alargan 35-100+ min sin llegar a
+# breakeven. Si a los TIME_STOP_MINUTES no llego al 70% del camino a
+# TP1, se cierra en vez de dejarla sangrar mas tiempo.
+TIME_STOP_STRATEGIES = ["EMA Pullback M5"]
+TIME_STOP_MINUTES = int(os.getenv("TIME_STOP_MINUTES", "25"))
 
 # ── Breakeven real al 70% del camino a TP1 ──
 # Se aplica a TODAS las estrategias (no solo a las de EARLY_EXIT_STRATEGIES):
@@ -468,6 +513,22 @@ def get_killzone_losses(start_time, end_time):
     return sum(1 for d in closing_deals if d.profit < 0)
 
 
+def get_outside_killzone_losses():
+    """
+    Perdidas de HOY que cerraron fuera de ambas killzones (Londres
+    3-6 RD / NYC 9-12 RD). Se calcula por diferencia sobre funciones
+    ya probadas (get_daily_losses / get_killzone_losses) en vez de
+    reconvertir horarios de nuevo, para no repetir la logica de
+    rd_to_broker_time() y arriesgar otro bug de zona horaria.
+    """
+    total = get_daily_losses()
+    london_start, london_end = KILLZONE_LONDON[1], KILLZONE_LONDON[2]
+    nyc_start, nyc_end = KILLZONE_NYC[1], KILLZONE_NYC[2]
+    london_losses = get_killzone_losses(london_start, london_end)
+    nyc_losses = get_killzone_losses(nyc_start, nyc_end)
+    return total - london_losses - nyc_losses
+
+
 def get_open_positions():
     positions = mt5.positions_get(symbol=MT5_SYMBOL)
 
@@ -565,7 +626,8 @@ def close_position_market(position, motivo=""):
     """
     Cierra a mercado el 100% de una posicion abierta (orden inversa
     sobre el mismo ticket). Se usa para el cierre anticipado por CHoCH
-    en contra — no espera a que el precio toque SL o TP1.
+    en contra, y para el cierre por tiempo (time-stop) — no espera a
+    que el precio toque SL o TP1.
     """
     tick = mt5.symbol_info_tick(MT5_SYMBOL)
     if tick is None:
@@ -583,7 +645,7 @@ def close_position_market(position, motivo=""):
         "price":        close_price,
         "deviation":    DEVIATION,
         "magic":        MAGIC_NUMBER,
-        "comment":      "CHoCH_exit",
+        "comment":      motivo or "CHoCH_exit",
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -799,6 +861,54 @@ def check_trailing_stop(position, side, now_str):
     return True
 
 
+def check_time_stop(position, strategy, now_str):
+    """
+    Cierra la posicion si lleva mas de TIME_STOP_MINUTES abierta y
+    todavia no llego a breakeven (no alcanzo el 70% del camino a TP1).
+    Solo aplica a estrategias en TIME_STOP_STRATEGIES.
+
+    NUEVO 2026-08-17: historico real de EMA Pullback M5 (25 trades) —
+    los ganadores resuelven en ~15-20 min, los perdedores se alargan
+    35-100+ min sin llegar a breakeven. En vez de dejar que la posicion
+    siga sangrando tiempo sin confirmar la tesis del pullback, se cierra
+    a mercado despues de TIME_STOP_MINUTES si no hay progreso real.
+    Devuelve True si cerro la posicion, False si no hizo nada.
+    """
+    if strategy not in TIME_STOP_STRATEGIES:
+        return False
+
+    if position.ticket in _breakeven_applied:
+        return False  # ya iba ganando lo suficiente, no forzar salida
+
+    open_time_utc = datetime.fromtimestamp(position.time, tz=timezone.utc)
+    elapsed_min = (datetime.now(timezone.utc) - open_time_utc).total_seconds() / 60
+
+    if elapsed_min < TIME_STOP_MINUTES:
+        return False
+
+    profit_antes = round(position.profit, 2)
+    ok, close_price, error_detail = close_position_market(position, motivo="time_stop")
+
+    if not ok:
+        print(f"  [TIME STOP] Error cerrando ticket {position.ticket}: {error_detail}")
+        log_error_to_file(f"Time stop fallo — ticket {position.ticket} ({strategy}): {error_detail}")
+        return False
+
+    print(
+        f"  [TIME STOP] {strategy} — {elapsed_min:.0f} min sin llegar a breakeven. "
+        f"Posicion {position.ticket} cerrada @ {close_price} | Profit aprox: ${profit_antes}"
+    )
+    send_telegram(
+        f"[BOT] CIERRE POR TIEMPO — {strategy}\n"
+        f"Motivo: {elapsed_min:.0f} min abierta sin alcanzar breakeven\n"
+        f"Ticket: {position.ticket}\n"
+        f"Precio de cierre: {close_price}\n"
+        f"Profit aprox.: ${profit_antes}\n"
+        f"Hora: {now_str}"
+    )
+    return True
+
+
 def check_choch_exit(position, side, strategy, now_str):
     """
     Si la posicion abierta pertenece a una estrategia con gestion de
@@ -817,7 +927,7 @@ def check_choch_exit(position, side, strategy, now_str):
         return False
 
     profit_antes = round(position.profit, 2)
-    ok, close_price, error_detail = close_position_market(position)
+    ok, close_price, error_detail = close_position_market(position, motivo="CHoCH_exit")
 
     if not ok:
         print(f"  [CHoCH EXIT] Error cerrando ticket {position.ticket}: {error_detail}")
@@ -1112,6 +1222,7 @@ def update_signal_status(sig_id, status, intentos=3):
 
 _loss_alert_sent_date = None
 _kz_loss_alert_sent = {}  # {(date, killzone_name): True} — evita spamear Telegram cada ciclo
+                          # (incluye la clave especial "OUTSIDE_KZ")
 
 
 def run_cycle():
@@ -1161,6 +1272,26 @@ def run_cycle():
                 _kz_loss_alert_sent[alert_key] = True
             return
 
+    # ── NUEVO 2026-08-17: limite de perdidas FUERA de ambas killzones ──
+    if kz is None:
+        outside_losses = get_outside_killzone_losses()
+        if outside_losses >= MAX_LOSSES_OUTSIDE_KILLZONE:
+            print(
+                f"  [{now_str}] Limite de perdidas fuera de killzone alcanzado "
+                f"({outside_losses}/{MAX_LOSSES_OUTSIDE_KILLZONE}). Se pausa fuera de Londres/NYC."
+            )
+            alert_key = (date.today(), "OUTSIDE_KZ")
+            if _kz_loss_alert_sent.get(alert_key) is not True:
+                send_telegram(
+                    f"[BOT] Limite de perdidas fuera de killzone — "
+                    f"{outside_losses}/{MAX_LOSSES_OUTSIDE_KILLZONE}\n"
+                    f"El bot pausa fuera de Londres (03:00-06:00) y NYC (09:00-12:00) RD. "
+                    f"Se reactiva al entrar la proxima killzone.\n"
+                    f"Hora: {now_str}"
+                )
+                _kz_loss_alert_sent[alert_key] = True
+            return
+
     open_positions = get_open_positions()
     if open_positions:
         pos = open_positions[0]
@@ -1176,9 +1307,13 @@ def run_cycle():
         # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
         check_trailing_stop(pos, side, now_str)
 
-        # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
         strategy = get_strategy_by_position_comment(getattr(pos, "comment", None))
-        if strategy in EARLY_EXIT_STRATEGIES:
+
+        # ── NUEVO 2026-08-17: cierre por tiempo si no llega a breakeven ──
+        cerrada_por_tiempo = check_time_stop(pos, strategy, now_str)
+
+        # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
+        if not cerrada_por_tiempo and strategy in EARLY_EXIT_STRATEGIES:
             check_choch_exit(pos, side, strategy, now_str)
 
         return
@@ -1264,10 +1399,12 @@ def main():
         print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
     print(f"  Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} (Londres 03:00-06:00 RD / NYC 09:00-12:00 RD)")
+    print(f"  Max perdidas fuera de killzone: {MAX_LOSSES_OUTSIDE_KILLZONE}")
     print(f"  [FIX 2026-08-11] Conteo de perdidas ahora corrige offset horario RD -> servidor broker (EET/EEST)")
     print(f"  Breakeven real al {BREAKEVEN_TRIGGER_PCT*100:.0f}% del camino a TP1 (todas las estrategias)")
     print(f"  Trailing stop por ATR x{TRAILING_ATR_MULTIPLIER} despues del breakeven (todas las estrategias)")
     print(f"  Salida por CHoCH activa para: {', '.join(EARLY_EXIT_STRATEGIES)}")
+    print(f"  Time-stop ({TIME_STOP_MINUTES} min) activo para: {', '.join(TIME_STOP_STRATEGIES)}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
     print(f"  Loop: cada {LOOP_INTERVAL}s — Ctrl+C para detener")
@@ -1288,7 +1425,9 @@ def main():
         send_telegram(
             f"[BOT] bot_engine.py INICIADO\n"
             f"Riesgo: {RISK_PERCENT}% | Score min: {MIN_SCORE} | Max diario: {MAX_DAILY}\n"
-            f"Max perdidas/dia: {MAX_LOSSES_PER_DAY} | Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE}\n"
+            f"Max perdidas/dia: {MAX_LOSSES_PER_DAY} | Max perdidas/killzone: {MAX_LOSSES_PER_KILLZONE} | "
+            f"Max perdidas fuera de killzone: {MAX_LOSSES_OUTSIDE_KILLZONE}\n"
+            f"Time-stop {TIME_STOP_MINUTES} min activo para: {', '.join(TIME_STOP_STRATEGIES)}\n"
             f"Loop: {LOOP_INTERVAL}s\n"
             f"Hora: {now_str}"
         )
