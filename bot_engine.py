@@ -290,6 +290,19 @@ TRAILING_ATR_MULTIPLIER = float(os.getenv("TRAILING_ATR_MULTIPLIER", "1.2"))
 TRAILING_ATR_PERIOD = 14
 # ──────────────────────────────────────────────────────────────
 
+# ── Filtro de spread maximo — NUEVO 2026-08-18 ──
+# En aperturas de killzone (justo cuando opera Sweep Displacement M1)
+# el spread de XAUUSD se ensancha, y un SL de M1 calculado con precision
+# milimetrica puede quedar barrido de inmediato por el spread mismo,
+# no por el movimiento real del mercado. Se rechaza la ejecucion (no
+# la señal en Supabase, que sigue PENDING para el proximo ciclo) si el
+# spread actual supera el maximo permitido. Por ahora solo aplica a
+# Sweep Displacement M1 (la mas sensible al spread por operar en M1
+# con SL ajustado); las demas estrategias (M5/M15) tienen SL mas
+# amplios donde el spread pesa proporcionalmente menos.
+SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1"]
+MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "35"))  # ajustar segun spread tipico real de GOLD en XMGlobal
+
 ALLOWED_STRATEGIES = [
     "Scalping M5",
     "Scalping M1",
@@ -302,6 +315,7 @@ ALLOWED_STRATEGIES = [
     "FVG Fill M5",
     "EMA Pullback M5",
     "TradingPro AI Elite",
+    "Sweep Displacement M1",
 ]
 
 
@@ -1172,6 +1186,19 @@ def get_current_price():
     return tick.ask, tick.bid
 
 
+def spread_actual_ok():
+    """Lee el spread actual del simbolo en puntos (ya calculado por MT5
+    en symbol_info().spread, no hace falta recalcular ask-bid a mano).
+    Devuelve (ok, spread_points). Si no se puede leer el simbolo, se
+    deja pasar (fail-open) en vez de bloquear por un problema de datos
+    — mismo criterio que ya usa calc_anti_hunt_sl() cuando symbol_info
+    devuelve None."""
+    symbol = mt5.symbol_info(MT5_SYMBOL)
+    if symbol is None:
+        return True, None
+    return symbol.spread <= MAX_SPREAD_POINTS, symbol.spread
+
+
 def calc_anti_hunt_sl(signal_type, original_sl):
     symbol = mt5.symbol_info(MT5_SYMBOL)
 
@@ -1227,6 +1254,18 @@ def execute_order(signal):
     if ask is None or bid is None:
         print("  Sin precio disponible en MT5.")
         return None, "Sin precio disponible en MT5 (symbol_info_tick devolvio None)"
+
+    # NUEVO 2026-08-18: filtro de spread maximo, solo para estrategias
+    # sensibles (Sweep Displacement M1 por ahora). La señal en Supabase
+    # NO se marca FAILED por esto en el momento en que se descarta aqui
+    # — el rechazo ocurre a nivel de ejecucion, mismo tratamiento que
+    # cualquier otro fallo de execute_order() (ver run_cycle: marca
+    # FAILED recien despues de que execute_order devuelve None).
+    if signal["strategy"] in SPREAD_FILTER_STRATEGIES:
+        spread_ok, spread_pts = spread_actual_ok()
+        if not spread_ok:
+            print(f"  Spread actual {spread_pts} pts > maximo {MAX_SPREAD_POINTS} pts para {signal['strategy']} — orden rechazada")
+            return None, f"Spread demasiado ancho ({spread_pts} pts > {MAX_SPREAD_POINTS} max) para {signal['strategy']}"
 
     signal_type = signal["signal_type"]
     original_sl = float(signal["stop_loss"])
@@ -1520,6 +1559,7 @@ def main():
     print(f"  Trailing stop por ATR x{TRAILING_ATR_MULTIPLIER} despues del breakeven (todas las estrategias)")
     print(f"  Salida por CHoCH activa para: {', '.join(EARLY_EXIT_STRATEGIES)}")
     print(f"  Time-stop ({TIME_STOP_MINUTES} min) activo para: {', '.join(TIME_STOP_STRATEGIES)}")
+    print(f"  Filtro de spread maximo ({MAX_SPREAD_POINTS} pts) activo para: {', '.join(SPREAD_FILTER_STRATEGIES)}")
     print(f"  Vigencia: max {MAX_SIGNAL_AGE_MINUTES} min | deriva max {MAX_PRICE_DRIFT_RATIO}x el riesgo original")
     print(f"  Estrategias permitidas: {len(ALLOWED_STRATEGIES)}")
     print(f"  Loop: cada {LOOP_INTERVAL}s — Ctrl+C para detener")
