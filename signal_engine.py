@@ -202,6 +202,20 @@ ATR_MIN_MULTIPLIER     = float(os.getenv("ATR_MIN_MULTIPLIER", "0.8"))
 BLOCK_NYC_EMA_PULLBACK = os.getenv("BLOCK_NYC_EMA_PULLBACK", "true").lower() == "true"
 NYC_MIN_SCORE_EMA_PULLBACK = int(os.getenv("NYC_MIN_SCORE_EMA_PULLBACK", "90"))
 
+# ── Filtros anti-whipsaw para EMA Pullback M5 — NUEVO 2026-08-18 ──
+# Diagnostico: el historico real de la estrategia (10 trades en killzone
+# NYC = 1W/9L, -$130.46, 96% de la perdida total) es la firma clasica de
+# un sistema de cruce de EMAs operando en rango — el ATR minimo ya
+# filtra volatilidad, pero no distingue movimiento DIRECCIONAL de ruido
+# lateral. Se agregan dos filtros OBLIGATORIOS (no bono):
+#   1. ADX(14) > ADX_MIN_TREND y subiendo — prohibe operar en rango.
+#   2. VWAP de sesion como sesgo direccional — solo BUY sobre VWAP,
+#      solo SELL bajo VWAP. Si no hay sesion activa (calc_session_vwap
+#      devuelve None fuera de killzone), el filtro se omite (no bloquea)
+#      porque no hay VWAP de sesion que evaluar.
+ADX_PERIOD = 14
+ADX_MIN_TREND = float(os.getenv("ADX_MIN_TREND", "25"))
+
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
     rdh = ((now.hour - 4) + 24) % 24
@@ -314,6 +328,67 @@ def calc_atr(candles, period=14):
         h, l, pc = candles[i]["H"], candles[i]["L"], candles[i-1]["C"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
+
+def calc_adx(candles, period=ADX_PERIOD):
+    """ADX(14) estandar (metodo de Wilder). Devuelve (adx_actual, subiendo)
+    donde `subiendo` compara el ADX actual contra el de 3 velas atras
+    (mas estable que comparar solo contra la vela inmediata anterior).
+    Devuelve (None, None) si no hay velas suficientes."""
+    if len(candles) < period * 3:
+        return None, None
+
+    trs, plus_dms, minus_dms = [], [], []
+    for i in range(1, len(candles)):
+        high, low = candles[i]["H"], candles[i]["L"]
+        prev_high, prev_low, prev_close = candles[i-1]["H"], candles[i-1]["L"], candles[i-1]["C"]
+
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm  = up_move   if (up_move > down_move and up_move > 0) else 0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0
+        plus_dms.append(plus_dm)
+        minus_dms.append(minus_dm)
+
+    def wilder_smooth(values, period):
+        if len(values) < period:
+            return []
+        smoothed = [sum(values[:period])]
+        for v in values[period:]:
+            smoothed.append(smoothed[-1] - (smoothed[-1] / period) + v)
+        return smoothed
+
+    tr_s    = wilder_smooth(trs, period)
+    plus_s  = wilder_smooth(plus_dms, period)
+    minus_s = wilder_smooth(minus_dms, period)
+
+    dx_values = []
+    for i in range(min(len(tr_s), len(plus_s), len(minus_s))):
+        if tr_s[i] == 0:
+            dx_values.append(0)
+            continue
+        plus_di  = 100 * plus_s[i]  / tr_s[i]
+        minus_di = 100 * minus_s[i] / tr_s[i]
+        di_sum = plus_di + minus_di
+        dx_values.append(100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0)
+
+    if len(dx_values) < period:
+        return None, None
+
+    adx_values = [sum(dx_values[:period]) / period]
+    for dx in dx_values[period:]:
+        adx_values.append((adx_values[-1] * (period - 1) + dx) / period)
+
+    if not adx_values:
+        return None, None
+
+    current = round(adx_values[-1], 2)
+    ref_idx = -4 if len(adx_values) >= 4 else -2 if len(adx_values) >= 2 else None
+    subiendo = adx_values[-1] > adx_values[ref_idx] if ref_idx is not None else None
+    return current, subiendo
+
 
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -1271,6 +1346,33 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if not strong_candle:
         return None
 
+    # NUEVO 2026-08-18: filtro ADX obligatorio (anti-rango/whipsaw).
+    # El historico real (killzone NYC: 1W/9L, -$130.46) tiene la firma
+    # clasica de un cruce de EMAs operando en lateral — ATR ya filtra
+    # volatilidad pero no distingue movimiento direccional de ruido.
+    adx, adx_subiendo = calc_adx(c5, period=ADX_PERIOD)
+    if adx is None:
+        return None
+    if adx < ADX_MIN_TREND:
+        print(f"  [4] EMA Pullback: {trend} descartado — ADX {adx:.1f} < {ADX_MIN_TREND} (mercado en rango)")
+        return None
+    if adx_subiendo is False:
+        print(f"  [4] EMA Pullback: {trend} descartado — ADX {adx:.1f} bajando (tendencia perdiendo fuerza)")
+        return None
+
+    # NUEVO 2026-08-18: filtro VWAP direccional obligatorio.
+    # Solo BUY con precio sobre el VWAP de sesion, solo SELL por debajo.
+    # Si no hay sesion activa (fuera de killzone), calc_session_vwap
+    # devuelve None y el filtro se omite (no bloquea).
+    vwap = calc_session_vwap(c5)
+    if vwap is not None:
+        if trend == "BUY" and last["C"] <= vwap:
+            print(f"  [4] EMA Pullback: BUY descartado — precio {last['C']:.2f} bajo VWAP {vwap:.2f}")
+            return None
+        if trend == "SELL" and last["C"] >= vwap:
+            print(f"  [4] EMA Pullback: SELL descartado — precio {last['C']:.2f} sobre VWAP {vwap:.2f}")
+            return None
+
     def tf_dir(candles):
         if len(candles) < 10: return None
         cl = [c["C"] for c in candles]
@@ -1301,6 +1403,9 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if is_killzone():    score += 10; reasons.append("Killzone activa")
     if trend == "BUY"  and rsi < 65: score += 5; reasons.append(f"RSI {rsi}")
     if trend == "SELL" and rsi > 35: score += 5; reasons.append(f"RSI {rsi}")
+    reasons.append(f"ADX {adx:.1f} {'subiendo' if adx_subiendo else 'estable'} (> {ADX_MIN_TREND})")
+    if vwap is not None:
+        reasons.append(f"VWAP {vwap:.2f} confirma sesgo {trend}")
 
     if score < MIN_SCORE:
         return None
@@ -1358,6 +1463,357 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
         "candle_time":   last["time"],
     }
 
+# ════════════════════════════════════════════════════════════════
+# ESTRATEGIA 5: Institutional Sweep & Displacement Scalp (M1)
+# ════════════════════════════════════════════════════════════════
+# Contexto (15m/5m): barrido de un nivel clave de liquidez (rango
+# asiatico, PDH/PDL, equal highs/lows).
+# Confirmacion (1m): mecha de rechazo + Market Structure Shift (MSS)
+# con vela de desplazamiento (cuerpo grande vs ATR) + spike de volumen.
+# Entrada: NO en el breakout — se espera el retroceso a un FVG
+# generado por el desplazamiento, o al VWAP de sesion, con la primera
+# señal de rechazo confirmada por vela.
+# Salidas: SL detras del extremo barrido + buffer; TP1/TP2 en
+# multiplos del riesgo (mismo estilo que las demas estrategias —
+# TP1 es el unico TP real que ejecuta bot_engine.py en MT5; TP2 queda
+# como referencia y el "correr la posicion" lo hace el trailing por
+# ATR que ya existe en bot_engine.py, igual que en las otras 4).
+# Horario: SOLO aperturas de Londres/NY (ventana mas angosta que la
+# killzone general del resto de estrategias) — es un filtro OBLIGATORIO,
+# no un bono, porque la logica de "caza de stops institucional" pierde
+# sentido fuera de esas aperturas de alta liquidez.
+# ════════════════════════════════════════════════════════════════
+
+SWEEP_SL_BUFFER = 0.30            # "1-2 pips" detras del extremo barrido, en precio de GOLD
+SWEEP_MIN_DISPLACEMENT_ATR = 1.2  # cuerpo de la vela de desplazamiento vs ATR(14) M1
+SWEEP_VOLUME_MULT = 1.5           # volumen de la vela de rebote vs promedio de las ultimas 20 velas M1
+SWEEP_SWING_LOOKBACK = 8          # velas M1 hacia atras para el swing menor pre-impulso
+SWEEP_EQUAL_TOLERANCE = 0.30      # tolerancia en precio para equal highs/lows (M5)
+SWEEP_ENTRY_TOLERANCE_ATR = 0.5   # tolerancia (en ATR M1) para considerar precio "en" el FVG o VWAP
+
+# Noticias de alto impacto — integracion opcional con news_engine.py.
+# Import protegido: si el modulo o la funcion no existen todavia, el
+# filtro de noticias simplemente se desactiva (no rompe el motor).
+try:
+    from news_engine import get_high_impact_news_times
+    NEWS_FILTER_AVAILABLE = True
+except Exception:
+    get_high_impact_news_times = None
+    NEWS_FILTER_AVAILABLE = False
+
+
+def is_sweep_killzone():
+    """Ventana propia y mas angosta que is_killzone(): Londres 08:00-11:00 UTC
+    y NY 13:30-16:30 UTC == 04:00-07:00 RD y 09:30-12:30 RD."""
+    now = datetime.now(timezone.utc)
+    rdh = ((now.hour - 4) + 24) % 24
+    t   = rdh * 100 + now.minute
+    return (400 <= t < 700) or (930 <= t < 1230)
+
+
+def en_blackout_de_noticias(buffer_minutos=5):
+    if not NEWS_FILTER_AVAILABLE:
+        return False
+    try:
+        eventos = get_high_impact_news_times()  # se espera lista de datetime UTC
+        now = datetime.now(timezone.utc)
+        return any(abs((now - ev).total_seconds()) <= buffer_minutos * 60 for ev in eventos)
+    except Exception as e:
+        print(f"  [5] Aviso: no se pudo evaluar blackout de noticias ({e}) — filtro omitido este ciclo")
+        return False
+
+
+def get_asian_range(c15):
+    """Rango de la sesion asiatica (00:00-08:00 UTC) del dia actual."""
+    hoy = datetime.now(timezone.utc).date()
+    sesion = []
+    for c in c15:
+        try:
+            ct = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ct.date() == hoy and 0 <= ct.hour < 8:
+            sesion.append(c)
+    if not sesion:
+        return None, None
+    return max(c["H"] for c in sesion), min(c["L"] for c in sesion)
+
+
+def get_pdh_pdl(c15):
+    """Maximo/minimo del dia UTC anterior, usando velas M15."""
+    ayer = datetime.now(timezone.utc).date() - timedelta(days=1)
+    sesion = []
+    for c in c15:
+        try:
+            ct = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ct.date() == ayer:
+            sesion.append(c)
+    if not sesion:
+        return None, None
+    return max(c["H"] for c in sesion), min(c["L"] for c in sesion)
+
+
+def get_equal_levels(c5, lookback=40, tolerance=SWEEP_EQUAL_TOLERANCE):
+    """Equal highs / equal lows recientes en M5 (aproximacion: dos
+    maximos o minimos dentro de `tolerance` en precio)."""
+    highs, lows = detect_swing_hl(c5[-lookback:], lookback=2)
+    eq_high, eq_low = None, None
+    for i in range(len(highs)):
+        for j in range(i + 1, len(highs)):
+            if abs(highs[i]["price"] - highs[j]["price"]) <= tolerance:
+                eq_high = max(highs[i]["price"], highs[j]["price"])
+                break
+        if eq_high:
+            break
+    for i in range(len(lows)):
+        for j in range(i + 1, len(lows)):
+            if abs(lows[i]["price"] - lows[j]["price"]) <= tolerance:
+                eq_low = min(lows[i]["price"], lows[j]["price"])
+                break
+        if eq_low:
+            break
+    return eq_high, eq_low
+
+
+def find_minor_swing_m1(c1, direction, lookback=SWEEP_SWING_LOOKBACK):
+    """Swing high/low menor en M1, excluyendo la ultima vela (el impulso)."""
+    ventana = c1[-(lookback + 1):-1]
+    if len(ventana) < 3:
+        return None
+    if direction == "BUY":
+        return max(c["H"] for c in ventana)
+    return min(c["L"] for c in ventana)
+
+
+def detect_sweep_mss_m1(c1, key_level, direction, atr1, search_window=20):
+    """Busca en una ventana hacia atras (excluyendo la vela actual, que se
+    asume parte del retroceso/entrada) la vela de DESPLAZAMIENTO que:
+      - viene precedida (1-3 velas antes) de un barrido del `key_level`
+        con cierre de rechazo (rejection) de vuelta,
+      - rompe el swing menor previo (MSS),
+      - tiene cuerpo >= ATR x SWEEP_MIN_DISPLACEMENT_ATR,
+      - tiene volumen >= promedio x SWEEP_VOLUME_MULT.
+    Devuelve el evento MAS RECIENTE que cumple todo (no necesariamente la
+    ultima vela del array), para poder evaluar el retroceso por separado."""
+    n = len(c1)
+    start = max(SWEEP_SWING_LOOKBACK + 1, n - search_window)
+
+    # Recorre de la vela mas reciente hacia atras, EXCLUYENDO la ultima
+    # (se asume que la ultima vela es el retroceso/entrada en curso, no
+    # el impulso de desplazamiento en si).
+    for idx in range(n - 2, start - 1, -1):
+        candle = c1[idx]
+        body = abs(candle["C"] - candle["O"])
+        if atr1 <= 0 or body < SWEEP_MIN_DISPLACEMENT_ATR * atr1:
+            continue
+
+        prev_window = c1[max(0, idx - 20):idx]
+        avg_vol = sum(c["V"] for c in prev_window) / len(prev_window) if prev_window else candle["V"]
+        vol_spike = avg_vol > 0 and candle["V"] >= SWEEP_VOLUME_MULT * avg_vol
+        if not vol_spike:
+            continue
+
+        swing = find_minor_swing_m1(c1[:idx + 1], direction)
+        if swing is None:
+            continue
+
+        # El barrido puede ser la propia vela de desplazamiento o alguna
+        # de las 1-2 velas justo antes (mecha de rechazo previa al impulso).
+        ventana_sweep = c1[max(0, idx - 2):idx + 1]
+
+        if direction == "BUY":
+            swept_candidates = [c for c in ventana_sweep if c["L"] < key_level]
+            if not swept_candidates:
+                continue
+            sweep_candle = min(swept_candidates, key=lambda c: c["L"])
+            rejection = sweep_candle["C"] > key_level
+            mss = candle["C"] > swing and candle["C"] > candle["O"]
+            swept_extreme = sweep_candle["L"]
+        else:
+            swept_candidates = [c for c in ventana_sweep if c["H"] > key_level]
+            if not swept_candidates:
+                continue
+            sweep_candle = max(swept_candidates, key=lambda c: c["H"])
+            rejection = sweep_candle["C"] < key_level
+            mss = candle["C"] < swing and candle["C"] < candle["O"]
+            swept_extreme = sweep_candle["H"]
+
+        if rejection and mss:
+            return {
+                "valid": True,
+                "swept_extreme": swept_extreme,
+                "displacement_idx": idx,
+                "checks": {
+                    "swept": True, "rejection": True, "mss": True,
+                    "displacement": True, "vol_spike": True,
+                },
+            }
+
+    return {"valid": False}
+
+
+def precio_en_zona_entrada(candles_recientes, fvg, vwap, atr1, direction):
+    """El rechazo hace que el CIERRE de la vela de confirmacion salga de la
+    zona (es justamente lo que confirma el rechazo) — lo que debe tocar la
+    zona es la MECHA (high/low) de alguna de las ultimas 2 velas, igual que
+    strategy_fvg_fill ya hace con sus propios FVGs."""
+    tol = atr1 * SWEEP_ENTRY_TOLERANCE_ATR if atr1 > 0 else 0.5
+    recientes = candles_recientes[-2:]
+
+    if fvg and fvg["type"] == direction:
+        zona_lo, zona_hi = fvg["bottom"] - tol, fvg["top"] + tol
+        if direction == "BUY":
+            tocada = any(c["L"] <= zona_hi and c["C"] >= zona_lo for c in recientes)
+        else:
+            tocada = any(c["H"] >= zona_lo and c["C"] <= zona_hi for c in recientes)
+        if tocada:
+            return True, f"FVG {direction} en {fvg['bottom']:.2f}-{fvg['top']:.2f}"
+
+    if vwap is not None:
+        if direction == "BUY" and any(c["L"] <= vwap + tol and c["C"] >= vwap - tol for c in recientes):
+            return True, f"VWAP sesion {vwap:.2f}"
+        if direction == "SELL" and any(c["H"] >= vwap - tol and c["C"] <= vwap + tol for c in recientes):
+            return True, f"VWAP sesion {vwap:.2f}"
+
+    return False, ""
+
+
+def strategy_sweep_displacement(c15, c5, dxy_trend="NEUTRAL"):
+    """Estrategia 5: Institutional Sweep & Displacement Scalp.
+    Contexto en c15/c5, confirmacion y entrada en M1 (fetch propio)."""
+
+    # ── Filtro duro de horario: SOLO aperturas Londres/NY ──
+    if not is_sweep_killzone():
+        return None
+
+    # ── Filtro duro de noticias de alto impacto (±5 min) ──
+    if en_blackout_de_noticias(buffer_minutos=5):
+        print("  [5] Sweep Displacement: descartado — blackout de noticias de alto impacto")
+        return None
+
+    if len(c15) < 20 or len(c5) < 40:
+        return None
+
+    rows_m1 = get_candles("M1", 60)
+    if len(rows_m1) < SWEEP_SWING_LOOKBACK + 5:
+        return None
+    c1 = to_candles(rows_m1)
+
+    atr1 = calc_atr(c1, period=14)
+    if atr1 <= 0:
+        return None
+
+    vwap = calc_session_vwap(c5)
+    last_price = c1[-1]["C"]
+
+    asia_high, asia_low = get_asian_range(c15)
+    pdh, pdl = get_pdh_pdl(c15)
+    eq_high, eq_low = get_equal_levels(c5)
+
+    niveles_compra = [("rango asiatico", asia_low), ("PDL", pdl), ("equal lows", eq_low)]
+    niveles_venta  = [("rango asiatico", asia_high), ("PDH", pdh), ("equal highs", eq_high)]
+
+    candidato = None  # (direction, level_name, level, result)
+
+    for level_name, level in niveles_compra:
+        if level is None:
+            continue
+        result = detect_sweep_mss_m1(c1, level, "BUY", atr1)
+        if result.get("valid"):
+            candidato = ("BUY", level_name, level, result)
+            break
+
+    if not candidato:
+        for level_name, level in niveles_venta:
+            if level is None:
+                continue
+            result = detect_sweep_mss_m1(c1, level, "SELL", atr1)
+            if result.get("valid"):
+                candidato = ("SELL", level_name, level, result)
+                break
+
+    if not candidato:
+        return None
+
+    sig_type, level_name, level, result = candidato
+    disp_idx = result["displacement_idx"]
+
+    # ── Entrada: esperar retroceso al FVG generado por el desplazamiento, o al VWAP ──
+    fvgs = detect_fvgs(c1)
+    fvg = next(
+        (f for f in fvgs if f["type"] == sig_type and abs(f["idx"] - disp_idx) <= 1),
+        None,
+    )
+    en_zona, zona_desc = precio_en_zona_entrada(c1, fvg, vwap, atr1, sig_type)
+    if not en_zona:
+        return None
+
+    # ── Confirmacion de vela en el retroceso (misma logica que las otras 4) ──
+    if not confirmar_entrada_por_vela(c1, sig_type):
+        print(f"  [5] Sweep Displacement: {sig_type} descartado — sin confirmación de vela en el retroceso")
+        return None
+
+    checks = result["checks"]
+    score = 0
+    reasons = [f"Sweep de {level_name} ({level:.2f})"]
+    score += 20; reasons.append("Rechazo tras el barrido")
+    score += 20; reasons.append("MSS confirmado en M1")
+    score += 15; reasons.append("Desplazamiento fuerte (cuerpo >= ATR x1.2)")
+    score += 15; reasons.append("Volumen en spike")
+    score += 15; reasons.append(f"Entrada en retroceso: {zona_desc}")
+    score += 5;  reasons.append("Killzone Londres/NY (apertura)")
+
+    morfo_bonus, morfo_reason = score_morfologia_vela(c1, sig_type)
+    if morfo_bonus != 0:
+        score += morfo_bonus
+        if morfo_reason:
+            reasons.append(morfo_reason)
+
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
+    score = max(0, min(score, 100))
+    if score < MIN_SCORE:
+        return None
+
+    swept_extreme = result["swept_extreme"]
+    entry = last_price
+
+    if sig_type == "BUY":
+        sl = swept_extreme - SWEEP_SL_BUFFER
+        sl_pts = entry - sl
+        if sl_pts <= 0:
+            return None
+        tp1 = entry + sl_pts * 1.5
+        tp2 = entry + sl_pts * 3
+    else:
+        sl = swept_extreme + SWEEP_SL_BUFFER
+        sl_pts = sl - entry
+        if sl_pts <= 0:
+            return None
+        tp1 = entry - sl_pts * 1.5
+        tp2 = entry - sl_pts * 3
+
+    return {
+        "signal_type":   sig_type,
+        "entry_price":   entry,
+        "stop_loss":     sl,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "confidence":    score,
+        "strategy":      "Sweep Displacement M1",
+        "timeframe":     "M1",
+        "atr":           atr1,
+        "reasons":       reasons,
+        "candle_time":   c1[-1]["time"],
+    }
+
+
 def analyze():
     now_str = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{now_str}] Analizando mercado...")
@@ -1365,6 +1821,7 @@ def analyze():
     rows_m5  = get_candles("M5",  100)
     rows_m30 = get_candles("M30", 60)
     rows_h1  = get_candles("H1",  60)
+    rows_m15 = get_candles("M15", 250)  # NUEVO: reutilizado por AI Elite y por Sweep Displacement M1
 
     if not rows_m5:
         print("  Sin velas M5 disponibles.")
@@ -1373,6 +1830,7 @@ def analyze():
     c5  = to_candles(rows_m5)
     c30 = to_candles(rows_m30)
     ch1 = to_candles(rows_h1)
+    c15 = to_candles(rows_m15)
 
     dxy_trend = get_dxy_trend()
 
@@ -1396,9 +1854,6 @@ def analyze():
                 "close": c["C"],
                 "volume": c["V"],
             } for c in c5]
-
-            c15_rows = get_candles("M15", 250)
-            c15 = to_candles(c15_rows)
 
             c15_ai = [{
                 "time": c["time"],
@@ -1470,6 +1925,18 @@ def analyze():
     except Exception as e:
         print(f"  [4] Error EMA Pullback: {e}")
 
+    try:
+        sig = strategy_sweep_displacement(c15, c5, dxy_trend)
+        if sig:
+            if publish_signal(sig):
+                signals_found += 1
+            else:
+                print(f"  [5] Sweep Displacement: señal detectada pero no publicada")
+        else:
+            print(f"  [5] Sweep Displacement M1: sin setup (fuera de killzone, sin sweep+MSS, o sin retest a FVG/VWAP)")
+    except Exception as e:
+        print(f"  [5] Error Sweep Displacement: {e}")
+
     if signals_found > 0:
         print(f"  => {signals_found} señal(es) publicada(s) esta ronda")
     else:
@@ -1487,6 +1954,7 @@ def main():
     print(f"    2. Killzone Breakout (London/NY) con Pullback + VWAP")
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
     print(f"    4. EMA Pullback M5 (killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK}, M30+H1 obligatorio)")
+    print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY obligatoria)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
