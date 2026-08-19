@@ -304,7 +304,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     # filtra por magic == MAGIC aqui, para tambien capturar la apertura
     # de operaciones manuales (magic 0) y poder tomarles open_time/precio.
     aperturas = {
-        d.position_id: {"comment": d.comment, "time": d.time, "price": d.price}
+        d.position_id: {"comment": d.comment, "time": d.time, "price": d.price, "type": d.type}
         for d in deals
         if d.symbol == SYMBOL and d.entry == mt5.DEAL_ENTRY_IN
     }
@@ -337,12 +337,32 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         if origen == "MANUAL":
             manuales += 1
 
+        # FIX 2026-08-18 (tipo de operacion invertido): MT5 cierra una
+        # posicion BUY con un deal de tipo SELL, y viceversa — son dos
+        # deals distintos por posicion (apertura y cierre), cada uno
+        # con su propio `type`. El codigo anterior tomaba d.type del
+        # deal de CIERRE directamente, mostrando la direccion real
+        # invertida el 100% de las veces (confirmado cruzando contra
+        # signal_type en `signals`: todas las filas de trades_ejecutados
+        # tenian tipo opuesto a la señal que las origino, ganadoras y
+        # perdedoras por igual). El profit/profit_neto SIEMPRE fue
+        # correcto — el bot operaba bien, solo se mostraba mal la
+        # columna `tipo`. Fix: usar el type del deal de APERTURA
+        # (misma fuente que ya usamos para open_time/precio_apertura).
+        # Fallback si no se encontro el deal de apertura (posicion
+        # abierta antes de la ventana de `dias_atras`): invertir el
+        # type del deal de cierre, ya que sabemos que es el opuesto.
+        if apertura and "type" in apertura:
+            tipo = "BUY" if apertura["type"] == mt5.DEAL_TYPE_BUY else "SELL"
+        else:
+            tipo = "SELL" if d.type == mt5.DEAL_TYPE_BUY else "BUY"
+
         registro = {
             "ticket": d.ticket,
             "magic": d.magic,
             "origen": origen,  # "BOT" / "MANUAL" / "OTRO(magic=N)" — siempre presente
             "symbol": d.symbol or SYMBOL,
-            "tipo": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
+            "tipo": tipo,
             "volumen": d.volume,
             "precio_cierre": d.price,
             "profit": d.profit,
