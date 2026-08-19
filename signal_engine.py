@@ -574,6 +574,118 @@ def score_validez_fvg(candles, fvg, atr):
     return score, reasons
 
 
+# ── Filtros "A+" para FVG Fill M5 — NUEVO 2026-08-18 ──
+# Basado en la metodologia institucional: no todo FVG vale, solo los
+# que nacen de un barrido de liquidez REAL (nivel clave, no cualquier
+# swing), rompen estructura de verdad (no solo cuerpo grande), y estan
+# ubicados en zona de buen precio (Discount para compras, Premium para
+# ventas). Se implementan como BONOS/PENALIZACIONES de score (no
+# bloqueo duro) para no cortar la frecuencia de la unica estrategia del
+# bot sin perdidas — excepcion: la regla del 50% (CE) SI es bloqueo
+# duro, igual que ya hace retest_reacciono_o_atraveso con el FVG
+# completo, porque es una invalidacion real del setup, no una
+# preferencia de calidad.
+
+def institutional_sweep_before_fvg(c5, c15, fvg, lookback=15):
+    """Version mas estricta de hubo_sweep_antes_del_fvg(): exige que el
+    barrido previo haya sido sobre un nivel institucional real (rango
+    asiatico, PDH/PDL, equal highs/lows) — no un swing menor cualquiera.
+    Devuelve (True/False, nombre_del_nivel_o_None)."""
+    idx = fvg["idx"]
+    start = max(0, idx - lookback)
+    previas = c5[start:idx]
+    if not previas:
+        return False, None
+
+    asia_high, asia_low = get_asian_range(c15)
+    pdh, pdl = get_pdh_pdl(c15)
+    eq_high, eq_low = get_equal_levels(c5)
+
+    if fvg["type"] == "BUY":
+        niveles = [("rango asiatico", asia_low), ("PDL", pdl), ("equal lows", eq_low)]
+        for nombre, nivel in niveles:
+            if nivel is not None and any(c["L"] < nivel for c in previas):
+                return True, nombre
+    else:
+        niveles = [("rango asiatico", asia_high), ("PDH", pdh), ("equal highs", eq_high)]
+        for nombre, nivel in niveles:
+            if nivel is not None and any(c["H"] > nivel for c in previas):
+                return True, nombre
+
+    return False, None
+
+
+def mss_confirmado_fvg(c5, fvg, lookback=20):
+    """Confirma que la vela de impulso que genero el FVG realmente
+    ROMPIO estructura (cerro mas alla del ultimo swing relevante), no
+    solo que tuvo cuerpo grande (eso ya lo mide score_validez_fvg)."""
+    idx = fvg["idx"]
+    start = max(0, idx - lookback)
+    previas = c5[start:idx - 1]
+    if len(previas) < 5 or idx < 1:
+        return False
+
+    highs, lows = detect_swing_hl(previas, lookback=2)
+    impulso = c5[idx - 1]
+
+    if fvg["type"] == "BUY" and highs:
+        swing_h = max(h["price"] for h in highs[-2:])
+        return impulso["C"] > swing_h
+    if fvg["type"] == "SELL" and lows:
+        swing_l = min(l["price"] for l in lows[-2:])
+        return impulso["C"] < swing_l
+    return False
+
+
+def zona_premium_discount(c5, fvg, nivel_barrido=None, lookback=15):
+    """Compras solo en Discount (FVG por debajo del 50% del impulso),
+    ventas solo en Premium (FVG por encima del 50%). El rango del
+    impulso va desde el nivel barrido (o el swing mas cercano si no se
+    detecto nivel institucional) hasta el extremo de la vela de impulso.
+    Devuelve True/False, o None si no se pudo calcular (no penaliza)."""
+    idx = fvg["idx"]
+    if idx < 1:
+        return None
+    impulso = c5[idx - 1]
+
+    if fvg["type"] == "BUY":
+        start = nivel_barrido if nivel_barrido is not None else (
+            min((c["L"] for c in c5[max(0, idx - lookback):idx]), default=None)
+        )
+        end = impulso["H"]
+        if start is None or end <= start:
+            return None
+        mid = start + (end - start) * 0.5
+        fvg_mid = (fvg["top"] + fvg["bottom"]) / 2
+        return fvg_mid <= mid
+    else:
+        start = nivel_barrido if nivel_barrido is not None else (
+            max((c["H"] for c in c5[max(0, idx - lookback):idx]), default=None)
+        )
+        end = impulso["L"]
+        if start is None or end >= start:
+            return None
+        mid = start - (start - end) * 0.5
+        fvg_mid = (fvg["top"] + fvg["bottom"]) / 2
+        return fvg_mid >= mid
+
+
+def ce_no_violado(candles, fvg, max_velas=3):
+    """Regla del 50% (Consequent Encroachment): ninguna vela M5, desde
+    que se formo el FVG, puede CERRAR mas alla del 50% del gap. Mecha
+    esta permitida, cuerpo no. Si se viola, el FVG perdio su respeto
+    algoritmico — bloqueo duro, igual criterio que retest_reacciono_o_atraveso."""
+    idx = fvg["idx"]
+    ce = (fvg["top"] + fvg["bottom"]) / 2
+    posteriores = candles[idx:idx + max_velas + 1]
+    for vela in posteriores:
+        if fvg["type"] == "BUY" and vela["C"] < ce:
+            return False
+        if fvg["type"] == "SELL" and vela["C"] > ce:
+            return False
+    return True
+
+
 def retest_reacciono_o_atraveso(candles, fvg, max_velas=3):
     idx = fvg["idx"]
     posteriores = candles[idx:idx + max_velas + 1]
@@ -1182,7 +1294,7 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
         "candle_time":   last["time"],
     }
 
-def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
+def strategy_fvg_fill(c5, c30, c15, dxy_trend="NEUTRAL"):
     killzone_requerida("3-FVG Fill")  # ya no bloquea, solo informa en log
     if len(c5) < 30:
         return None
@@ -1249,12 +1361,58 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
         print(f"  [3] FVG Fill: {sig_type} descartado — precio atraveso el FVG sin reaccionar (trampa)")
         return None
 
-    if fvg_sweep_ok:
-        score += 15
-        reasons.append("Sweep de liquidez previo al FVG")
+    # NUEVO 2026-08-18 (FVG A+, filtro 5 — bloqueo duro): regla del 50%
+    # (Consequent Encroachment). Mas estricta que el retest de arriba
+    # (que usa el FVG completo) — ninguna vela puede CERRAR mas alla
+    # del punto medio del gap desde que se formo.
+    if not ce_no_violado(ventana_fvg, fvg):
+        print(f"  [3] FVG Fill: {sig_type} descartado — vela cerro mas alla del 50% CE del FVG (setup invalidado)")
+        return None
+
+    # NUEVO 2026-08-18 (FVG A+, filtro 1 — bono/penalizacion reforzada):
+    # sweep sobre nivel institucional real (asia/PDH-PDL/equal highs-lows)
+    # vale mas que el sweep generico que ya existia.
+    inst_sweep_ok, inst_level_name = institutional_sweep_before_fvg(ventana_fvg, c15, fvg)
+    if inst_sweep_ok:
+        score += 20
+        reasons.append(f"Sweep institucional de {inst_level_name} previo al FVG")
+    elif fvg_sweep_ok:
+        score += 10
+        reasons.append("Sweep generico previo al FVG (no en nivel institucional clave)")
     else:
         score -= 10
         reasons.append("Sin sweep previo (FVG dudoso)")
+
+    # NUEVO 2026-08-18 (FVG A+, filtro 2 — bono/penalizacion): MSS real,
+    # no solo cuerpo grande (eso ya lo suma fvg_bonus mas abajo).
+    nivel_barrido = None
+    if inst_sweep_ok:
+        _asia_h, _asia_l = get_asian_range(c15)
+        _pdh, _pdl = get_pdh_pdl(c15)
+        _eq_h, _eq_l = get_equal_levels(c5)
+        candidatos = {"rango asiatico": _asia_l if sig_type == "BUY" else _asia_h,
+                      "PDL": _pdl, "PDH": _pdh,
+                      "equal lows": _eq_l, "equal highs": _eq_h}
+        nivel_barrido = candidatos.get(inst_level_name)
+
+    if mss_confirmado_fvg(ventana_fvg, fvg):
+        score += 15
+        reasons.append("MSS confirmado (ruptura real de estructura)")
+    else:
+        score -= 10
+        reasons.append("Sin MSS confirmado (vela de impulso no rompio estructura)")
+
+    # NUEVO 2026-08-18 (FVG A+, filtro 3 — bono/penalizacion): zona de
+    # buen precio (Discount para compras, Premium para ventas).
+    en_buena_zona = zona_premium_discount(ventana_fvg, fvg, nivel_barrido)
+    if en_buena_zona is True:
+        score += 15
+        zona_nombre = "Discount" if sig_type == "BUY" else "Premium"
+        reasons.append(f"FVG en zona {zona_nombre} (buen precio)")
+    elif en_buena_zona is False:
+        score -= 15
+        zona_nombre = "Premium" if sig_type == "BUY" else "Discount"
+        reasons.append(f"FVG en zona {zona_nombre} (precio caro, penalizado)")
 
     score += fvg_bonus
     reasons.extend(fvg_reasons)
@@ -1282,8 +1440,27 @@ def strategy_fvg_fill(c5, c30, dxy_trend="NEUTRAL"):
     if score < MIN_SCORE:
         return None
 
-    sl_pts = max(atr * 1.2, 5)
-    entry  = last["C"]
+    # NUEVO 2026-08-18 (FVG A+, filtro 5 — SL quirurgico): en vez de un
+    # SL generico por ATR, se ubica detras del 50% (CE) del FVG — el
+    # mismo nivel que ya usamos como invalidacion dura arriba. Si por
+    # algun motivo da un riesgo absurdamente chico (FVG muy angosto),
+    # se usa un piso minimo de ATR x0.4 para no quedar con un SL
+    # pegado al precio.
+    entry = last["C"]
+    ce_level = (fvg["top"] + fvg["bottom"]) / 2
+    CE_BUFFER = 0.15
+    if sig_type == "BUY":
+        sl_ce = ce_level - CE_BUFFER
+        sl_pts_ce = entry - sl_ce
+    else:
+        sl_ce = ce_level + CE_BUFFER
+        sl_pts_ce = sl_ce - entry
+
+    if sl_pts_ce > 0:
+        sl_pts = max(sl_pts_ce, atr * 0.4)
+        reasons.append(f"SL quirurgico en 50% CE del FVG ({ce_level:.2f})")
+    else:
+        sl_pts = max(atr * 1.2, 5)
 
     return {
         "signal_type":   sig_type,
@@ -1907,7 +2084,7 @@ def analyze():
         print(f"  [2] Error Killzone Breakout: {e}")
 
     try:
-        sig = strategy_fvg_fill(c5, c30, dxy_trend)
+        sig = strategy_fvg_fill(c5, c30, c15, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
