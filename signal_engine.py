@@ -173,9 +173,9 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 
 MIN_SCORE        = 75    # Score mínimo para publicar señal (igualado a bot_engine.py MIN_SCORE=75)
-MAX_DAILY        = 20    # Máximo señales por día (filtro anti-spam)
+MAX_DAILY        = 12    # Máximo señales por día (bajado de 20 a 12, 2026-08-18: 20 era ruido excesivo en Supabase/Telegram; bot_engine.py tiene su PROPIO MAX_DAILY de ejecucion, este solo limita cuantas señales se publican)
 LOOP_INTERVAL    = 30    # Segundos entre cada análisis
-SIGNAL_COOLDOWN  = 120   # 2 min mínimo entre señales de la misma estrategia
+SIGNAL_COOLDOWN  = 300   # subido de 120 a 300s (2026-08-18): 120s dejaba abierta la ventana a 2-3 señales de la misma estrategia en la misma zona de liquidez antes de que cierre una vela M5
 
 # Pares usados para construir el indice sintetico de fuerza del dolar.
 # Deben coincidir con los que data_engine.py sube a ohlc_candles.
@@ -1042,6 +1042,9 @@ def publish_signal(sig):
 
 def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     killzone_requerida("1-Scalping SMC")  # ya no bloquea, solo informa en log
+    if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
+        print("  [1] Scalping M5 SMC: descartado — blackout de noticias de alto impacto")
+        return None
     if len(c5) < 30:
         return None
 
@@ -1204,6 +1207,9 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
     # NO se toco — sigue exigiendo killzone obligatoria por diseño.
     if not is_killzone():
         return None
+    if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
+        print("  [2] Killzone Breakout: descartado — blackout de noticias de alto impacto")
+        return None
     if len(c5) < 20 or len(ch1) < 5:
         return None
 
@@ -1296,6 +1302,9 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
 
 def strategy_fvg_fill(c5, c30, c15, dxy_trend="NEUTRAL"):
     killzone_requerida("3-FVG Fill")  # ya no bloquea, solo informa en log
+    if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
+        print("  [3] FVG Fill: descartado — blackout de noticias de alto impacto")
+        return None
     if len(c5) < 30:
         return None
 
@@ -1478,6 +1487,10 @@ def strategy_fvg_fill(c5, c30, c15, dxy_trend="NEUTRAL"):
 
 def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     killzone_requerida("4-EMA Pullback")  # ya no bloquea, solo informa en log
+
+    if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
+        print("  [4] EMA Pullback: descartado — blackout de noticias de alto impacto")
+        return None
 
     if len(c5) < 30:
         return None
@@ -1676,6 +1689,13 @@ SWEEP_ENTRY_TOLERANCE_ATR = 0.5   # tolerancia (en ATR M1) para considerar preci
 # Noticias de alto impacto — integracion opcional con news_engine.py.
 # Import protegido: si el modulo o la funcion no existen todavia, el
 # filtro de noticias simplemente se desactiva (no rompe el motor).
+# NUEVO 2026-08-18: antes SOLO la Estrategia 5 (Sweep Displacement M1)
+# usaba este blackout. Se globaliza a las 4 estrategias restantes
+# (Scalping M5 SMC, Killzone Breakout, FVG Fill M5, EMA Pullback M5)
+# con una ventana mas amplia (15 min) porque son menos sensibles al
+# milisegundo que el sweep en M1, pero igual de vulnerables al spike
+# de volatilidad y spread que genera una noticia de alto impacto.
+NEWS_BLACKOUT_MINUTES_GENERAL = 15
 try:
     from news_engine import get_high_impact_news_times
     NEWS_FILTER_AVAILABLE = True
