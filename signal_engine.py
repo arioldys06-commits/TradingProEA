@@ -214,7 +214,7 @@ NYC_MIN_SCORE_EMA_PULLBACK = int(os.getenv("NYC_MIN_SCORE_EMA_PULLBACK", "90"))
 #      devuelve None fuera de killzone), el filtro se omite (no bloquea)
 #      porque no hay VWAP de sesion que evaluar.
 ADX_PERIOD = 14
-ADX_MIN_TREND = float(os.getenv("ADX_MIN_TREND", "25"))
+ADX_MIN_TREND = float(os.getenv("ADX_MIN_TREND", "18"))  # bajado de 25 a 18 (2026-08-18): oro en M5 rara vez sostiene ADX>25, 25 dejaba casi sin señales
 
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
@@ -1350,14 +1350,15 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     # El historico real (killzone NYC: 1W/9L, -$130.46) tiene la firma
     # clasica de un cruce de EMAs operando en lateral — ATR ya filtra
     # volatilidad pero no distingue movimiento direccional de ruido.
+    # AJUSTE 2026-08-18 (v2): exigir fuerza minima Y pendiente positiva
+    # a la vez, en oro/M5, dejaba la estrategia casi sin señales. Se
+    # mantiene el umbral de fuerza como bloqueo duro (es lo que evita
+    # el rango real) y "subiendo" pasa a ser bono de score, no rechazo.
     adx, adx_subiendo = calc_adx(c5, period=ADX_PERIOD)
     if adx is None:
         return None
     if adx < ADX_MIN_TREND:
         print(f"  [4] EMA Pullback: {trend} descartado — ADX {adx:.1f} < {ADX_MIN_TREND} (mercado en rango)")
-        return None
-    if adx_subiendo is False:
-        print(f"  [4] EMA Pullback: {trend} descartado — ADX {adx:.1f} bajando (tendencia perdiendo fuerza)")
         return None
 
     # NUEVO 2026-08-18: filtro VWAP direccional obligatorio.
@@ -1403,7 +1404,11 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
     if is_killzone():    score += 10; reasons.append("Killzone activa")
     if trend == "BUY"  and rsi < 65: score += 5; reasons.append(f"RSI {rsi}")
     if trend == "SELL" and rsi > 35: score += 5; reasons.append(f"RSI {rsi}")
-    reasons.append(f"ADX {adx:.1f} {'subiendo' if adx_subiendo else 'estable'} (> {ADX_MIN_TREND})")
+    if adx_subiendo:
+        score += 8
+        reasons.append(f"ADX {adx:.1f} subiendo (> {ADX_MIN_TREND})")
+    else:
+        reasons.append(f"ADX {adx:.1f} estable/bajando (> {ADX_MIN_TREND} igual)")
     if vwap is not None:
         reasons.append(f"VWAP {vwap:.2f} confirma sesgo {trend}")
 
