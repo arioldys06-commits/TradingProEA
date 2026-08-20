@@ -43,6 +43,7 @@ LIMITACIONES CONOCIDAS (quedan documentadas, no ocultas):
 
 import os
 import sys
+import bisect
 from datetime import datetime, timezone, timedelta
 import uuid
 import requests
@@ -116,7 +117,16 @@ def _backtest_get_session_start_utc():
 # high/low/close/volume), NO convertido con to_candles() — porque
 # get_pair_trend() (quien consume esto via get_candles) espera ese
 # formato crudo tal cual lo devolvía el get_candles original.
-_dxy_full_cache = {}
+#
+# FIX 2026-08-20 (rendimiento — backtest se volvia impracticamente lento
+# despues de ~13 dias simulados): antes, cada llamada volvia a recorrer
+# TODA la lista (list comprehension) y re-parseaba cada candle_time de
+# texto a datetime, para las 4 monedas DXY, en CADA vela M5 simulada
+# (~8000 veces). Ahora se pre-calculan los timestamps UNA sola vez por
+# par (al cargar) y se usa busqueda binaria (bisect) para encontrar el
+# corte, en vez de escanear y re-parsear el historial completo cada vez.
+_dxy_full_cache = {}      # instrument -> lista cruda (candle_time/open/high/low/close/volume)
+_dxy_times_cache = {}     # instrument -> lista de datetime ya parseados, mismo orden/indices que _dxy_full_cache
 
 
 def _backtest_get_candles(timeframe, limit=100, instrument="XAUUSD"):
@@ -131,8 +141,9 @@ def _backtest_get_candles(timeframe, limit=100, instrument="XAUUSD"):
     if instrument in _dxy_full_cache:
         now = _BACKTEST_NOW["time"]
         full = _dxy_full_cache[instrument]
-        filtrado = [c for c in full if _parse_time(c["candle_time"]) <= now]
-        return filtrado[-limit:]
+        times = _dxy_times_cache[instrument]
+        idx = bisect.bisect_right(times, now)
+        return full[max(0, idx - limit):idx]
     return []
 
 
@@ -175,6 +186,7 @@ def preload_dxy_pairs():
     for par in se.DOLLAR_PAIRS:
         candles = fetch_all_candles_raw(par, "M30")  # formato crudo, ver nota en _backtest_get_candles
         _dxy_full_cache[par] = candles
+        _dxy_times_cache[par] = [_parse_time(c["candle_time"]) for c in candles]
         print(f"    {par}: {len(candles)} velas M30")
 
 
@@ -240,17 +252,26 @@ def run_backtest_for_strategy(nombre, fn_estrategia, c5_all, c30_all, ch1_all, n
     i = LOOKBACK_MIN_VELAS
     n = len(c5_all)
 
+    # FIX 2026-08-20 (rendimiento): timestamps de c30/ch1 pre-calculados
+    # UNA sola vez aqui, en vez de re-parsear cada "time" de texto a
+    # datetime en cada vela M5 simulada. bisect reemplaza el escaneo
+    # lineal completo de la lista por busqueda binaria.
+    c30_times = [_parse_time(c["time"]) for c in c30_all]
+    ch1_times = [_parse_time(c["time"]) for c in ch1_all] if necesita_ch1 else []
+
     while i < n:
         candle = c5_all[i]
         now = _parse_time(candle["time"])
         _BACKTEST_NOW["time"] = now
 
         c5 = c5_all[max(0, i - 99): i + 1]
-        c30 = [c for c in c30_all if _parse_time(c["time"]) <= now][-60:]
+        idx30 = bisect.bisect_right(c30_times, now)
+        c30 = c30_all[max(0, idx30 - 60):idx30]
 
         try:
             if necesita_ch1:
-                ch1 = [c for c in ch1_all if _parse_time(c["time"]) <= now][-60:]
+                idx1 = bisect.bisect_right(ch1_times, now)
+                ch1 = ch1_all[max(0, idx1 - 60):idx1]
                 dxy_trend = se.get_dxy_trend()
                 sig = fn_estrategia(c5, c30, ch1, dxy_trend)
             else:
@@ -417,12 +438,14 @@ def main():
     trades_kz = []
     i = LOOKBACK_MIN_VELAS
     n = len(c5_all)
+    ch1_times_kz = [_parse_time(c["time"]) for c in ch1_all]
     while i < n:
         candle = c5_all[i]
         now = _parse_time(candle["time"])
         _BACKTEST_NOW["time"] = now
         c5 = c5_all[max(0, i - 99): i + 1]
-        ch1 = [c for c in ch1_all if _parse_time(c["time"]) <= now][-60:]
+        idx1_kz = bisect.bisect_right(ch1_times_kz, now)
+        ch1 = ch1_all[max(0, idx1_kz - 60):idx1_kz]
         try:
             dxy_trend = se.get_dxy_trend()
             sig = se.strategy_killzone_breakout(c5, ch1, dxy_trend)
