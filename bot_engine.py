@@ -240,8 +240,14 @@ ERROR_LOG_FILE = "bot_errors.log"  # NUEVO: guarda el motivo real de cada fallo 
 LOOP_INTERVAL = int(os.getenv("BOT_LOOP_INTERVAL", "60"))  # segundos entre cada chequeo
 
 # ── Filtro de vigencia (anti señal-vieja) ──
-MAX_SIGNAL_AGE_MINUTES = 10
-MAX_PRICE_DRIFT_RATIO = 0.6
+# AJUSTE 2026-08-20: valores anteriores (10 min / 0.6x) eran demasiado
+# permisivos. Con MAX_PRICE_DRIFT_RATIO=0.6, una señal con SL de 16.86 pts
+# de riesgo (caso real del 20-ago) toleraba hasta 10.1 pts de deriva antes
+# de marcarse vencida — suficiente para comprar ya casi en el techo del
+# movimiento, justo antes del retroceso que activa el SL. Se ajusta a
+# valores mas estrictos para cortar entradas tardias:
+MAX_SIGNAL_AGE_MINUTES = 5
+MAX_PRICE_DRIFT_RATIO = 0.3
 
 # ── Killzones (hora local RD, la misma que usa datetime.now() en esta PC) ──
 KILLZONE_LONDON = ("LONDON", dtime(3, 0), dtime(6, 0))
