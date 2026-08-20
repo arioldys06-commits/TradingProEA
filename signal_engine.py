@@ -601,15 +601,22 @@ def institutional_sweep_before_fvg(c5, c15, fvg, lookback=15):
     pdh, pdl = get_pdh_pdl(c15)
     eq_high, eq_low = get_equal_levels(c5)
 
+    # FIX 2026-08-20: antes solo exigia que ALGUNA vela tocara el nivel
+    # (any(c["L"] < nivel ...)), sin comprobar que hubo rechazo real. Eso
+    # califica como "sweep institucional" (+20 score) cualquier ruptura
+    # con continuacion, no solo un barrido de liquidez real. Se alinea
+    # con el mismo criterio que ya usa hubo_sweep_antes_del_fvg(): exige
+    # que la vela que perfora el nivel tambien CIERRE de vuelta al otro
+    # lado (rechazo), no solo que lo toque con la mecha.
     if fvg["type"] == "BUY":
         niveles = [("rango asiatico", asia_low), ("PDL", pdl), ("equal lows", eq_low)]
         for nombre, nivel in niveles:
-            if nivel is not None and any(c["L"] < nivel for c in previas):
+            if nivel is not None and any(c["L"] < nivel and c["C"] > nivel for c in previas):
                 return True, nombre
     else:
         niveles = [("rango asiatico", asia_high), ("PDH", pdh), ("equal highs", eq_high)]
         for nombre, nivel in niveles:
-            if nivel is not None and any(c["H"] > nivel for c in previas):
+            if nivel is not None and any(c["H"] > nivel and c["C"] < nivel for c in previas):
                 return True, nombre
 
     return False, None
