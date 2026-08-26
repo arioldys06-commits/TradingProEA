@@ -417,6 +417,62 @@ def detect_swing_hl(candles, lookback=3):
             lows.append({"price": c["L"], "idx": i})
     return highs, lows
 
+def extension_agotada(candles, direction, current_price, atr, lookback=20, max_atr_multiplo=2.0):
+    """
+    Rechaza la señal si el precio ya recorrió demasiada distancia (en ATR)
+    desde el swing que originó el movimiento — es decir, si la entrada
+    llegaría después de que el impulso ya se agotó (entrada tardía,
+    "se toma la orden después del movimiento").
+
+    direction: "BUY" o "SELL"
+    Devuelve (agotada: bool, detalle: str)
+    """
+    if atr <= 0:
+        return False, "ATR invalido, no se puede evaluar extension"
+
+    highs, lows = detect_swing_hl(candles[-lookback:], lookback=3)
+
+    if direction == "SELL":
+        if not highs:
+            return False, "sin swing high de referencia"
+        origen = max(h["price"] for h in highs)
+        recorrido = origen - current_price
+    else:
+        if not lows:
+            return False, "sin swing low de referencia"
+        origen = min(l["price"] for l in lows)
+        recorrido = current_price - origen
+
+    ratio = recorrido / atr
+    agotada = ratio > max_atr_multiplo
+    if agotada:
+        print(
+            f"  [EXTENSION] Movimiento ya recorrio {recorrido:.2f} pts "
+            f"({ratio:.1f}x ATR, max {max_atr_multiplo}x) — entrada tardia, se descarta"
+        )
+    return agotada, f"{ratio:.1f}x ATR"
+
+def spike_reciente(candles, atr, max_atr_multiplo=2.0):
+    """Rechaza la señal si la ultima vela ya tuvo un rango (H-L) anormalmente
+    grande vs el ATR promedio — señal de spread ensanchado / spike de
+    volatilidad (noticia, apertura de sesion) donde el SL calculado con
+    ATR promedio (que no reacciona rapido) queda demasiado ajustado y
+    puede ser barrido casi de inmediato tras abrir la posicion."""
+    if atr <= 0 or not candles:
+        return False, "ATR invalido, no se puede evaluar spike"
+
+    ultima = candles[-1]
+    rango  = ultima["H"] - ultima["L"]
+    ratio  = rango / atr
+    es_spike = ratio > max_atr_multiplo
+    if es_spike:
+        print(
+            f"  [SPIKE] Ultima vela con rango {rango:.2f} pts "
+            f"({ratio:.1f}x ATR, max {max_atr_multiplo}x) — posible spread "
+            f"ensanchado/spike de volatilidad, se descarta"
+        )
+    return es_spike, f"{ratio:.1f}x ATR"
+
 def detect_fvgs(candles):
     fvgs = []
     for i in range(2, len(candles)):
@@ -1195,6 +1251,10 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     else:
         entry = last["C"]
 
+    agotada, detalle_ext = extension_agotada(c5, sig_type, entry, atr)
+    if agotada:
+        return None
+
     return {
         "signal_type":   sig_type,
         "entry_price":   entry,
@@ -1292,6 +1352,10 @@ def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
 
     sl_pts = max(atr * 1.3, 6)
     entry  = last["C"]
+
+    agotada, detalle_ext = extension_agotada(c5, sig_type, entry, atr)
+    if agotada:
+        return None
 
     return {
         "signal_type":   sig_type,
@@ -1478,6 +1542,14 @@ def strategy_fvg_fill(c5, c30, c15, dxy_trend="NEUTRAL"):
     else:
         sl_pts = max(atr * 1.2, 5)
 
+    agotada, detalle_ext = extension_agotada(c5, sig_type, entry, atr)
+    if agotada:
+        return None
+
+    es_spike, detalle_spike = spike_reciente(c5, atr)
+    if es_spike:
+        return None
+
     return {
         "signal_type":   sig_type,
         "entry_price":   entry,
@@ -1650,6 +1722,14 @@ def strategy_ema_pullback(c5, c30, ch1, dxy_trend="NEUTRAL"):
 
     sl_pts = max(atr * 1.1, 4)
     entry  = last["C"]
+
+    agotada, detalle_ext = extension_agotada(c5, sig_type, entry, atr)
+    if agotada:
+        return None
+
+    es_spike, detalle_spike = spike_reciente(c5, atr)
+    if es_spike:
+        return None
 
     return {
         "signal_type":   sig_type,
@@ -2007,6 +2087,10 @@ def strategy_sweep_displacement(c15, c5, dxy_trend="NEUTRAL"):
             return None
         tp1 = entry - sl_pts * 1.5
         tp2 = entry - sl_pts * 3
+
+    agotada, detalle_ext = extension_agotada(c1, sig_type, entry, atr1)
+    if agotada:
+        return None
 
     return {
         "signal_type":   sig_type,
