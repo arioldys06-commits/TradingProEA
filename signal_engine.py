@@ -1550,11 +1550,16 @@ def strategy_fvg_fill(c5, c30, c15, dxy_trend="NEUTRAL"):
     if es_spike:
         return None
 
+    # CAMBIO 2026-08-26: TP1 ampliado de 1.5R a 2R. Con 33.3% winrate
+    # historico (15 trades / 14 dias) la estrategia quedaba por debajo
+    # del punto de equilibrio matematico a 1.5R (breakeven = 40%). A 2R
+    # el breakeven baja a 33.3%, justo en el filo de lo que esta
+    # rindiendo — decision tomada en vez de pausar la estrategia.
     return {
         "signal_type":   sig_type,
         "entry_price":   entry,
         "stop_loss":     entry - sl_pts if sig_type == "BUY" else entry + sl_pts,
-        "take_profit_1": entry + sl_pts * 1.5 if sig_type == "BUY" else entry - sl_pts * 1.5,
+        "take_profit_1": entry + sl_pts * 2.0 if sig_type == "BUY" else entry - sl_pts * 2.0,
         "take_profit_2": entry + sl_pts * 3   if sig_type == "BUY" else entry - sl_pts * 3,
         "confidence":    min(score, 100),
         "strategy":      "FVG Fill M5",
