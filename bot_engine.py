@@ -246,8 +246,13 @@ LOOP_INTERVAL = int(os.getenv("BOT_LOOP_INTERVAL", "60"))  # segundos entre cada
 # de marcarse vencida — suficiente para comprar ya casi en el techo del
 # movimiento, justo antes del retroceso que activa el SL. Se ajusta a
 # valores mas estrictos para cortar entradas tardias:
-MAX_SIGNAL_AGE_MINUTES = 5
-MAX_PRICE_DRIFT_RATIO = 0.3
+# FIX 2026-08-25: antes estos dos valores estaban fijos en el codigo y
+# el .env los tenia declarados sin ningun efecto real (el bot siempre
+# usaba 5 / 0.3 sin importar lo que dijera el .env). Ahora se leen de
+# ahi, igual que ya hacia BOT_LOOP_INTERVAL, para poder ajustarlos sin
+# tocar el codigo.
+MAX_SIGNAL_AGE_MINUTES = int(os.getenv("MAX_SIGNAL_AGE_MINUTES", "5"))
+MAX_PRICE_DRIFT_RATIO = float(os.getenv("MAX_PRICE_DRIFT_RATIO", "0.3"))
 
 # ── Killzones (hora local RD, la misma que usa datetime.now() en esta PC) ──
 KILLZONE_LONDON = ("LONDON", dtime(3, 0), dtime(6, 0))
@@ -296,17 +301,19 @@ TRAILING_ATR_MULTIPLIER = float(os.getenv("TRAILING_ATR_MULTIPLIER", "1.2"))
 TRAILING_ATR_PERIOD = 14
 # ──────────────────────────────────────────────────────────────
 
-# ── Filtro de spread maximo — NUEVO 2026-08-18 ──
+# ── Filtro de spread maximo — NUEVO 2026-08-18 / AMPLIADO 2026-08-26 ──
 # En aperturas de killzone (justo cuando opera Sweep Displacement M1)
 # el spread de XAUUSD se ensancha, y un SL de M1 calculado con precision
 # milimetrica puede quedar barrido de inmediato por el spread mismo,
 # no por el movimiento real del mercado. Se rechaza la ejecucion (no
 # la señal en Supabase, que sigue PENDING para el proximo ciclo) si el
-# spread actual supera el maximo permitido. Por ahora solo aplica a
-# Sweep Displacement M1 (la mas sensible al spread por operar en M1
-# con SL ajustado); las demas estrategias (M5/M15) tienen SL mas
-# amplios donde el spread pesa proporcionalmente menos.
-SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1"]
+# spread actual supera el maximo permitido. Originalmente solo aplicaba
+# a Sweep Displacement M1 (la mas sensible por operar en M1 con SL
+# ajustado). AMPLIADO tras revisar trades del 19-23 ago: FVG Fill M5 y
+# EMA Pullback M5 tambien tuvieron stop-outs en 1-2 minutos por spikes
+# de spread/volatilidad que su ATR(14) promedio no alcanzo a capturar
+# a tiempo — se agregan aqui por el mismo motivo.
+SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1", "FVG Fill M5", "EMA Pullback M5"]
 MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "35"))  # ajustar segun spread tipico real de GOLD en XMGlobal
 
 ALLOWED_STRATEGIES = [
@@ -1390,6 +1397,52 @@ def run_cycle():
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
+    # ── FIX 2026-08-25 (bug critico: gestion de posicion saltada por limites) ──
+    # ANTES: los 4 chequeos de limite (MAX_DAILY, MAX_LOSSES_PER_DAY,
+    # MAX_LOSSES_PER_KILLZONE, MAX_LOSSES_OUTSIDE_KILLZONE) se evaluaban
+    # PRIMERO, y cualquiera de ellos hacia `return` antes de llegar al
+    # bloque que gestiona una posicion YA ABIERTA (breakeven, trailing
+    # stop, time-stop, CHoCH exit). Resultado: en cuanto se disparaba
+    # cualquier limite mientras habia una posicion abierta, esa posicion
+    # dejaba de recibir CUALQUIER gestion activa por el resto de su vida
+    # — se quedaba solo con su SL/TP original (anti-hunt), sin breakeven,
+    # sin trailing, sin time-stop, sin CHoCH exit. Caso mas facil de
+    # disparar: la ultima operacion permitida del dia (MAX_DAILY), que en
+    # el ciclo siguiente a abrirse ya cumple daily_count >= MAX_DAILY.
+    # FIX: la gestion de la posicion abierta se mueve ANTES de los 4
+    # limites. Los limites solo deben bloquear la apertura de OPERACIONES
+    # NUEVAS, nunca la gestion de una posicion que ya esta en curso —
+    # de hecho, es justo cuando el bot esta "pausado" por limites que mas
+    # importa que la posicion abierta siga protegida activamente.
+    open_positions = get_open_positions()
+    if open_positions:
+        pos = open_positions[0]
+        side = "BUY" if pos.type == 0 else "SELL"
+        print(
+            f"  [{now_str}] Posicion abierta: ticket {pos.ticket} | {side} | "
+            f"Profit: ${round(pos.profit, 2)}"
+        )
+
+        # ── NUEVO: breakeven real al 70% del camino a TP1 (todas las estrategias) ──
+        check_breakeven(pos, side, now_str)
+
+        # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
+        check_trailing_stop(pos, side, now_str)
+
+        sig_id, strategy = get_signal_info_by_position_comment(getattr(pos, "comment", None))
+
+        # ── NUEVO 2026-08-17: cierre por tiempo si no llega a breakeven ──
+        cerrada_por_tiempo = check_time_stop(pos, sig_id, strategy, now_str)
+
+        # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
+        if not cerrada_por_tiempo and strategy in EARLY_EXIT_STRATEGIES:
+            check_choch_exit(pos, side, sig_id, strategy, now_str)
+
+        return
+
+    # ── A partir de aqui NO hay posicion abierta: los limites solo
+    # deciden si se permite ABRIR una operacion nueva. ──
+
     daily_count = get_daily_count()
     if daily_count >= MAX_DAILY:
         print(f"  [{now_str}] Limite diario alcanzado ({daily_count}/{MAX_DAILY}). Esperando al dia siguiente.")
@@ -1451,32 +1504,6 @@ def run_cycle():
                 )
                 _kz_loss_alert_sent[alert_key] = True
             return
-
-    open_positions = get_open_positions()
-    if open_positions:
-        pos = open_positions[0]
-        side = "BUY" if pos.type == 0 else "SELL"
-        print(
-            f"  [{now_str}] Posicion abierta: ticket {pos.ticket} | {side} | "
-            f"Profit: ${round(pos.profit, 2)}"
-        )
-
-        # ── NUEVO: breakeven real al 70% del camino a TP1 (todas las estrategias) ──
-        check_breakeven(pos, side, now_str)
-
-        # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
-        check_trailing_stop(pos, side, now_str)
-
-        sig_id, strategy = get_signal_info_by_position_comment(getattr(pos, "comment", None))
-
-        # ── NUEVO 2026-08-17: cierre por tiempo si no llega a breakeven ──
-        cerrada_por_tiempo = check_time_stop(pos, sig_id, strategy, now_str)
-
-        # ── NUEVO: gestion de salida por cambio de estructura (CHoCH) ──
-        if not cerrada_por_tiempo and strategy in EARLY_EXIT_STRATEGIES:
-            check_choch_exit(pos, side, sig_id, strategy, now_str)
-
-        return
 
     signals = get_pending_signals(current_price=get_current_price()[0])
     if not signals:
