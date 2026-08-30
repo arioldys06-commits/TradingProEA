@@ -8,6 +8,7 @@ Estrategias:
   2. London/NY Killzone  — Breakout al inicio de sesión
   3. FVG Fill M5         — Entrada en Fair Value Gap sin llenar
   4. EMA Pullback M5     — Pullback a EMA9/20 en tendencia
+  6. Mean Reversion BB M15 — Reversion a la media en rango (Bollinger + RSI)
 
 ICT OTE Filter (Optimal Trade Entry):
   - Zona 62%-79% de retroceso Fibonacci del ultimo swing
@@ -216,6 +217,28 @@ NYC_MIN_SCORE_EMA_PULLBACK = int(os.getenv("NYC_MIN_SCORE_EMA_PULLBACK", "90"))
 ADX_PERIOD = 14
 ADX_MIN_TREND = float(os.getenv("ADX_MIN_TREND", "18"))  # bajado de 25 a 18 (2026-08-18): oro en M5 rara vez sostiene ADX>25, 25 dejaba casi sin señales
 
+# ── Estrategia 6: Mean Reversion Bollinger + RSI (M15) — NUEVO 2026-08-30 ──
+# Diagnostico real: de las 5 estrategias existentes, solo EMA Pullback M5
+# (45 trades) y FVG Fill M5 (28 trades) han disparado alguna vez; Scalping
+# M5 SMC, Killzone Breakout y Sweep Displacement M1 llevan 0 operaciones
+# reales — estan sobre-filtradas para las condiciones tipicas del oro.
+# Ademas, las 5 estrategias son todas de tendencia/ruptura; ninguna cubre
+# el mercado en rango lateral, que es exactamente lo que el ADX minimo y
+# el ATR minimo de las otras estan diseñados para EVITAR. Esta estrategia
+# llena ese hueco: opera reversion a la media en rango confirmado.
+MEAN_REV_BB_PERIOD = 20
+MEAN_REV_BB_STD = 1.6        # bajado de 2.0 a 1.6 (2026-08-30): bandas mas angostas, mas toques por semana
+MEAN_REV_RSI_PERIOD = 14
+MEAN_REV_RSI_OVERSOLD = 35   # subido de 30 a 35 (2026-08-30): umbral mas facil de alcanzar
+MEAN_REV_RSI_OVERBOUGHT = 65 # bajado de 70 a 65 (2026-08-30): idem
+# Simetrico e inverso a ADX_MIN_TREND (18) de EMA Pullback M5: las dos
+# estrategias casi no pueden coincidir en la misma vela (una exige
+# tendencia, la otra exige rango), evitando señales contradictorias.
+# Subido de 20 a 26 (2026-08-30) a pedido explicito de Arioldys para
+# aumentar frecuencia (objetivo >=10 señales/semana) — a costa de
+# aceptar mercados con algo mas de direccionalidad como "rango".
+MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
+
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
     rdh = ((now.hour - 4) + 24) % 24
@@ -328,6 +351,22 @@ def calc_atr(candles, period=14):
         h, l, pc = candles[i]["H"], candles[i]["L"], candles[i-1]["C"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
+
+def calc_bollinger_bands(closes, period=20, std_mult=2.0):
+    """Bandas de Bollinger estandar: SMA(period) +/- std_mult desviaciones
+    estandar de poblacion. Devuelve None si no hay velas suficientes."""
+    if len(closes) < period:
+        return None
+    ventana = closes[-period:]
+    sma = sum(ventana) / period
+    variance = sum((c - sma) ** 2 for c in ventana) / period
+    std = variance ** 0.5
+    return {
+        "mid":   sma,
+        "upper": sma + std_mult * std,
+        "lower": sma - std_mult * std,
+        "std":   std,
+    }
 
 def calc_adx(candles, period=ADX_PERIOD):
     """ADX(14) estandar (metodo de Wilder). Devuelve (adx_actual, subiendo)
@@ -2112,6 +2151,179 @@ def strategy_sweep_displacement(c15, c5, dxy_trend="NEUTRAL"):
     }
 
 
+# ════════════════════════════════════════════════════════════════
+# ESTRATEGIA 6: Mean Reversion Bollinger + RSI (M15) — NUEVO 2026-08-30
+# ════════════════════════════════════════════════════════════════
+# Motivo: las 5 estrategias anteriores son todas de tendencia/ruptura
+# (pullback, breakout, sweep institucional, FVG en direccion de la
+# tendencia). El ADX minimo de EMA Pullback M5 y el ATR minimo de las
+# demas existen justamente para EVITAR operar en rango lateral — pero
+# eso significa que cuando el oro entra en rango, el bot no tiene
+# ninguna estrategia diseñada para esas condiciones y se queda sin
+# señales (coincide con el diagnostico real: Scalping M5 SMC, Killzone
+# Breakout y Sweep Displacement M1 llevan 0 operaciones ejecutadas).
+#
+# Logica: reversion clasica a la media en rango CONFIRMADO, no en
+# cualquier rango — exige ADX < MEAN_REV_ADX_MAX (20), simetrico e
+# inverso al ADX_MIN_TREND (18) que exige EMA Pullback M5. Las dos
+# estrategias casi no pueden coincidir en la misma vela (una exige
+# tendencia, la otra exige rango confirmado), evitando señales
+# contradictorias del bot al mismo tiempo.
+#
+# Entrada: precio toca/cruza la banda de Bollinger (20, 2 desviaciones,
+# M15) con RSI(14) en zona extrema (<30 sobreventa para BUY, >70
+# sobrecompra para SELL), confirmado con vela de rechazo — mismo filtro
+# de vela (engulf) que ya usan las otras 4 estrategias.
+#
+# Filtro anti-squeeze: si las bandas estan demasiado angostas respecto
+# al ATR, se descarta — un rango tan chico hace que el spread se coma
+# el TP y cualquier ruido dispare falsos positivos.
+#
+# Salida: TP1 en la banda media (SMA20) — el objetivo es la reversion a
+# la media, NO la extension tipo ATR de las demas estrategias. TP2 en
+# la banda opuesta, para la porcion que se deja correr con el trailing
+# stop que ya maneja bot_engine.py, igual que en las otras 5.
+# ════════════════════════════════════════════════════════════════
+
+def strategy_mean_reversion_bb(c15, dxy_trend="NEUTRAL"):
+    if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
+        print("  [6] Mean Reversion BB: descartado — blackout de noticias de alto impacto")
+        return None
+
+    if len(c15) < MEAN_REV_BB_PERIOD + 20:
+        return None
+
+    closes15 = [c["C"] for c in c15]
+    atr = calc_atr(c15[-20:])
+    if atr < 0.5:
+        return None
+
+    bb = calc_bollinger_bands(closes15, MEAN_REV_BB_PERIOD, MEAN_REV_BB_STD)
+    if not bb:
+        return None
+
+    # Filtro anti-squeeze: bandas demasiado angostas -> reversion poco
+    # fiable (rango tan chico que el spread se come el TP y cualquier
+    # ruido dispara falsos positivos).
+    # Bajado de 2.0x a 1.3x ATR (2026-08-30) a pedido explicito de
+    # Arioldys para aumentar frecuencia — acepta rangos algo mas
+    # comprimidos que antes.
+    bb_width_ratio = (bb["upper"] - bb["lower"]) / atr if atr > 0 else 0
+    if bb_width_ratio < 1.3:
+        print(f"  [6] Mean Reversion BB: descartado — squeeze (ancho bandas {bb_width_ratio:.1f}x ATR < 1.3x)")
+        return None
+
+    rsi = calc_rsi(closes15[-30:], MEAN_REV_RSI_PERIOD)
+
+    # Filtro obligatorio de exclusividad con las estrategias de
+    # tendencia: solo opera en rango confirmado.
+    adx, _ = calc_adx(c15, period=ADX_PERIOD)
+    if adx is None:
+        return None
+    if adx >= MEAN_REV_ADX_MAX:
+        print(f"  [6] Mean Reversion BB: descartado — ADX {adx:.1f} >= {MEAN_REV_ADX_MAX} (mercado en tendencia, no rango)")
+        return None
+
+    last = c15[-1]
+
+    touched_lower = last["L"] <= bb["lower"]
+    touched_upper = last["H"] >= bb["upper"]
+
+    sig_type = None
+    if touched_lower and rsi < MEAN_REV_RSI_OVERSOLD:
+        sig_type = "BUY"
+    elif touched_upper and rsi > MEAN_REV_RSI_OVERBOUGHT:
+        sig_type = "SELL"
+
+    if not sig_type:
+        return None
+
+    if not confirmar_entrada_por_vela(c15, sig_type):
+        print(f"  [6] Mean Reversion BB: {sig_type} descartado — sin confirmación de vela de rechazo")
+        return None
+
+    score = 0
+    reasons = []
+
+    banda_nombre = "inferior" if sig_type == "BUY" else "superior"
+    score += 35; reasons.append(f"Precio toca banda {banda_nombre} de Bollinger")
+    score += 20; reasons.append(f"ADX {adx:.1f} confirma rango (< {MEAN_REV_ADX_MAX})")
+    score += 15; reasons.append(f"RSI {rsi} en zona extrema")
+
+    # Bono: cuanto mas extremo el RSI, mas fuerte la señal de agotamiento
+    # del movimiento (tope 15pts para no saturar el score).
+    if sig_type == "BUY":
+        rsi_bonus = min(15, max(0, MEAN_REV_RSI_OVERSOLD - rsi))
+    else:
+        rsi_bonus = min(15, max(0, rsi - MEAN_REV_RSI_OVERBOUGHT))
+    if rsi_bonus > 0:
+        score += round(rsi_bonus)
+        reasons.append(f"RSI extremo (+{round(rsi_bonus)}pts)")
+
+    score += 10; reasons.append(f"Bandas amplias ({bb_width_ratio:.1f}x ATR, sin squeeze)")
+
+    morfo_bonus, morfo_reason = score_morfologia_vela(c15, sig_type)
+    if morfo_bonus != 0:
+        score += morfo_bonus
+        if morfo_reason:
+            reasons.append(morfo_reason)
+
+    # El bono DXY aqui es un desempate suave (peso reducido a la mitad):
+    # la reversion a la media no depende del sesgo del dolar de la misma
+    # forma que una estrategia de tendencia/ruptura.
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += round(dxy_bonus * 0.5)
+        if dxy_reason:
+            reasons.append(f"{dxy_reason} (peso reducido, no es señal de tendencia)")
+
+    score = max(0, min(score, 100))
+    if score < MIN_SCORE:
+        return None
+
+    es_spike, detalle_spike = spike_reciente(c15, atr)
+    if es_spike:
+        print(f"  [6] Mean Reversion BB: {sig_type} descartado — {detalle_spike} (posible spike/noticia, no reversion organica)")
+        return None
+
+    entry = last["C"]
+    buffer_sl = atr * 0.3
+
+    if sig_type == "BUY":
+        sl  = bb["lower"] - buffer_sl
+        tp1 = bb["mid"]
+        tp2 = bb["upper"]
+    else:
+        sl  = bb["upper"] + buffer_sl
+        tp1 = bb["mid"]
+        tp2 = bb["lower"]
+
+    sl_pts = abs(entry - sl)
+    if sl_pts <= 0:
+        return None
+
+    # Si el TP1 (banda media) queda demasiado cerca del entry, el trade
+    # no vale el riesgo — se descarta en vez de forzar un TP artificial.
+    tp1_pts = abs(tp1 - entry)
+    if tp1_pts < sl_pts * 0.8:
+        print(f"  [6] Mean Reversion BB: {sig_type} descartado — TP1 muy cerca del entry ({tp1_pts:.2f} pts < 0.8R)")
+        return None
+
+    return {
+        "signal_type":   sig_type,
+        "entry_price":   entry,
+        "stop_loss":     sl,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "confidence":    score,
+        "strategy":      "Mean Reversion BB M15",
+        "timeframe":     "M15",
+        "atr":           atr,
+        "reasons":       reasons,
+        "candle_time":   last["time"],
+    }
+
+
 def analyze():
     now_str = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{now_str}] Analizando mercado...")
@@ -2119,7 +2331,7 @@ def analyze():
     rows_m5  = get_candles("M5",  100)
     rows_m30 = get_candles("M30", 60)
     rows_h1  = get_candles("H1",  60)
-    rows_m15 = get_candles("M15", 250)  # NUEVO: reutilizado por AI Elite y por Sweep Displacement M1
+    rows_m15 = get_candles("M15", 250)  # NUEVO: reutilizado por AI Elite, Sweep Displacement M1 y Mean Reversion BB
 
     if not rows_m5:
         print("  Sin velas M5 disponibles.")
@@ -2235,6 +2447,18 @@ def analyze():
     except Exception as e:
         print(f"  [5] Error Sweep Displacement: {e}")
 
+    try:
+        sig = strategy_mean_reversion_bb(c15, dxy_trend)
+        if sig:
+            if publish_signal(sig):
+                signals_found += 1
+            else:
+                print(f"  [6] Mean Reversion BB: señal detectada pero no publicada")
+        else:
+            print(f"  [6] Mean Reversion BB M15: sin setup (fuera de rango/banda, RSI no extremo, o ADX en tendencia)")
+    except Exception as e:
+        print(f"  [6] Error Mean Reversion BB: {e}")
+
     if signals_found > 0:
         print(f"  => {signals_found} señal(es) publicada(s) esta ronda")
     else:
@@ -2253,12 +2477,14 @@ def main():
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
     print(f"    4. EMA Pullback M5 (killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK}, M30+H1 obligatorio)")
     print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY obligatoria)")
+    print(f"    6. Mean Reversion BB M15 (Bollinger 20,2 + RSI, exige ADX < {MEAN_REV_ADX_MAX} en rango)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
     print(f"  Filtro volatilidad ATR: umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f} (hist={ATR_PROMEDIO_HISTORICO} x mult={ATR_MIN_MULTIPLIER})")
     print(f"  Killzone: BONO de score en estrategias 1/3 (ya no bloqueo obligatorio) | Estrategia 2 SIGUE exigiendo killzone")
     print(f"  EMA Pullback M5: killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK} (BLOCK_NYC_EMA_PULLBACK={BLOCK_NYC_EMA_PULLBACK}) + M30/H1 obligatorio")
+    print(f"  Mean Reversion BB M15: ADX < {MEAN_REV_ADX_MAX} obligatorio (mutuamente excluyente con EMA Pullback M5, ADX >= {ADX_MIN_TREND})")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -2275,6 +2501,7 @@ def main():
             f"Filtro volatilidad ATR activo (umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f})\n"
             f"Killzone: bono de score en 1/3, ya no bloqueo obligatorio\n"
             f"EMA Pullback M5: killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK} + M30/H1 obligatorio\n"
+            f"Mean Reversion BB M15: nueva, ADX < {MEAN_REV_ADX_MAX} obligatorio\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
