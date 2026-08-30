@@ -313,7 +313,7 @@ TRAILING_ATR_PERIOD = 14
 # EMA Pullback M5 tambien tuvieron stop-outs en 1-2 minutos por spikes
 # de spread/volatilidad que su ATR(14) promedio no alcanzo a capturar
 # a tiempo — se agregan aqui por el mismo motivo.
-SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1", "FVG Fill M5", "EMA Pullback M5"]
+SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1"]
 MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "35"))  # ajustar segun spread tipico real de GOLD en XMGlobal
 
 ALLOWED_STRATEGIES = [
@@ -1212,6 +1212,27 @@ def spread_actual_ok():
     return symbol.spread <= MAX_SPREAD_POINTS, symbol.spread
 
 
+def log_spread_actual():
+    """NUEVO 2026-08-28: registra el spread actual en Supabase en cada
+    ciclo (no solo cuando rechaza una orden), para poder analizar despues
+    la distribucion real del spread de GOLD en XMGlobal y calibrar
+    MAX_SPREAD_POINTS con datos en vez de con dos muestras sueltas.
+    No bloquea el ciclo si falla: es solo telemetria."""
+    symbol = mt5.symbol_info(MT5_SYMBOL)
+    if symbol is None or not SUPABASE_URL or not SUPABASE_KEY:
+        return
+
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/spread_log",
+            headers=headers(),
+            json={"spread_pts": symbol.spread},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"  [SPREAD_LOG] fallo al registrar spread: {e}")
+
+
 def calc_anti_hunt_sl(signal_type, original_sl):
     symbol = mt5.symbol_info(MT5_SYMBOL)
 
@@ -1396,6 +1417,8 @@ def run_cycle():
     global _loss_alert_sent_date
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    log_spread_actual()
 
     # ── FIX 2026-08-25 (bug critico: gestion de posicion saltada por limites) ──
     # ANTES: los 4 chequeos de limite (MAX_DAILY, MAX_LOSSES_PER_DAY,
