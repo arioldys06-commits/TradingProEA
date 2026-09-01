@@ -392,7 +392,43 @@ def agregar_resultado(trades):
     }
 
 
+def ya_existe_resultado_identico(strategy_label, timeframe, resultado):
+    """Evita duplicados exactos: si ya hay una fila de HOY con la misma
+    estrategia/timeframe y el mismo resultado numerico (total_trades,
+    winrate, profit_factor), es un re-run sin cambios en el codigo/rango
+    y no vale la pena guardarla de nuevo. Si algo cambio (nuevo parametro,
+    mas dias de historial), SI se guarda como fila nueva para conservar
+    la evolucion en el tiempo (la columna FECHA del dashboard esta pensada
+    para eso)."""
+    hoy_inicio = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/backtests",
+        headers=se.headers(),
+        params={
+            "select":       "id",
+            "strategy":     f"eq.{strategy_label}",
+            "timeframe":    f"eq.{timeframe}",
+            "total_trades": f"eq.{resultado['total_trades']}",
+            "winrate":      f"eq.{resultado['winrate']}",
+            "profit_factor": f"eq.{resultado['profit_factor']}" if resultado["profit_factor"] is not None else "is.null",
+            "created_at":   f"gte.{hoy_inicio}",
+            "limit":        "1",
+        },
+        timeout=15,
+    )
+    if r.status_code >= 400:
+        # Si el chequeo falla, no bloqueamos el backtest — mejor un
+        # duplicado ocasional que perder el resultado por un error de red.
+        print(f"  [WARN] no se pudo chequear duplicados: {r.status_code} {r.text[:150]}")
+        return False
+    return len(r.json()) > 0
+
+
 def insertar_backtest(strategy_label, timeframe, resultado):
+    if ya_existe_resultado_identico(strategy_label, timeframe, resultado):
+        print(f"    {strategy_label}: SKIP (resultado identico ya guardado hoy)")
+        return True
+
     payload = {
         "strategy":       strategy_label,
         "timeframe":      timeframe,
