@@ -28,6 +28,31 @@ CAMBIOS EN ESTA VERSION (trailing stop por ATR — fix de simulacion):
   solo tenemos velas M5 ya cerradas. Es una aproximacion mucho mas fiel
   que la version anterior, pero puede haber pequeñas diferencias de
   puntos exactos de cierre frente al ticket real en MT5.
+
+CAMBIO 2026-09-01 (cierre real prioritario sobre simulacion):
+- ANTES: run_cycle() SOLO cerraba una señal EXECUTING cuando la
+  simulacion vela-a-vela detectaba que el precio tocaba el SL/TP
+  original. Si Arioldys cerraba la posicion MANUAL desde MT5 antes de
+  que el precio simulado llegara a esos niveles (breakeven anticipado,
+  cierre discrecional, etc.), el trade real ya estaba cerrado en la
+  cuenta pero la señal se quedaba EXECUTING para siempre — la
+  simulacion nunca sabe que la posicion ya no existe, solo sigue
+  imprimiendo "[PEND] ... En progreso". Esto es lo que causaba las
+  señales EXECUTING colgadas detectadas en la auditoria (7 entre el
+  24-26 ago, y las de hoy 1 sept a las 16:54/17:17/18:25).
+- AHORA: get_real_close() consulta trades_ejecutados (que SI se
+  sincroniza correctamente por numero magico via sync_trades_supabase.py,
+  sin importar si el cierre fue del bot o manual) buscando un trade con
+  el mismo signal_id y close_time no nulo. Si existe, se usa el cierre
+  REAL (precio_cierre, profit_neto) para marcar la señal CLOSED de
+  inmediato, sin pasar por la simulacion de velas. Solo si NO hay
+  cierre real todavia se cae a la simulacion original (para señales
+  que de verdad siguen abiertas).
+- Limitacion conocida: esto depende de que signal_id este poblado en
+  trades_ejecutados. Hay ~21 trades historicos con signal_id NULL por
+  un problema de matching en sync_trades_supabase.py (pendiente aparte,
+  documentado en la auditoria del 2026-09-01) — esos casos puntuales
+  seguiran sin detectarse por esta via hasta que se corrija ese script.
 """
 
 import os
@@ -224,6 +249,37 @@ def get_pending_signals():
         print(f"  Error get_pending_signals: {r.status_code} {r.text}")
         return []
     return r.json()
+
+def get_real_close(sig_id):
+    """
+    Busca en trades_ejecutados si esta señal YA tiene un trade real
+    cerrado en MT5 (close_time no nulo), sin importar si el cierre fue
+    automatico (bot_engine.py via CHoCH/time-stop/TP/SL) o MANUAL
+    (Arioldys cerrando la posicion directo desde el terminal). Esa
+    tabla se sincroniza por numero magico via sync_trades_supabase.py
+    y por lo tanto SI refleja cierres manuales, a diferencia de la
+    simulacion de velas de este script.
+    Devuelve dict con precio_cierre/profit_neto/close_time, o None si
+    la posicion sigue realmente abierta (o el signal_id no esta
+    vinculado — ver limitacion en el docstring del archivo).
+    """
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/trades_ejecutados",
+        headers=headers(),
+        params={
+            "select":     "precio_cierre,profit_neto,close_time",
+            "signal_id":  f"eq.{sig_id}",
+            "close_time": "not.is.null",
+            "order":      "close_time.desc",
+            "limit":      "1",
+        },
+        timeout=15,
+    )
+    if r.status_code >= 400:
+        print(f"  [WARN] get_real_close {sig_id[:8]}: {r.status_code} {r.text[:150]}")
+        return None
+    rows = r.json()
+    return rows[0] if rows else None
 
 def get_candles_after(created_at, limit=200, context_before=CONTEXT_BEFORE):
     """
@@ -447,6 +503,28 @@ def run_cycle():
         tp1      = float(signal["take_profit_1"])
         tp2      = float(signal["take_profit_2"])
         created  = signal["created_at"]
+
+        # ── PRIORIDAD 1: cierre REAL en MT5 (bot o manual) ──────────
+        # Si ya existe un trade cerrado en trades_ejecutados vinculado
+        # a esta señal, usamos ESE resultado real en vez de simular.
+        # Esto es lo que resuelve las señales EXECUTING colgadas
+        # cuando Arioldys cierra manual antes de que el precio
+        # simulado toque el SL/TP original.
+        real = get_real_close(sig_id)
+        if real:
+            exit_price = float(real["precio_cierre"])
+            profit     = float(real.get("profit_neto") or 0)
+            result     = "WIN" if profit > 0 else "LOSS"
+            pnl_pts    = (exit_price - entry) if sig_type == "BUY" else (entry - exit_price)
+
+            update_signal(sig_id, result, exit_price)
+            if sig_id in breakeven_set:
+                breakeven_set.discard(sig_id)
+                save_breakeven_signals(breakeven_set)
+            send_telegram(telegram_result(signal, result, exit_price, pnl_pts))
+            icon = "WIN" if result == "WIN" else "LOSS"
+            print(f"  [{icon}] {sig_type} [{sig_id[:8]}] — cierre REAL (bot o manual) @ {exit_price:.2f} ({pnl_pts:+.1f} pts, ${profit:+.2f})")
+            continue  # ya resuelto, no hace falta simular
 
         if sig_type == "BUY":
             sl = sl - ANTI_HUNT_SL_EXTRA
