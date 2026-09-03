@@ -169,6 +169,7 @@ STRATEGY_TIMEFRAME = {
     "ema":          "M5",
     "sweep":        "M1",
     "mean_reversion": "M15",
+    "trend_continuation": "M5",
 }
 
 STRATEGY_LABEL = {
@@ -178,6 +179,7 @@ STRATEGY_LABEL = {
     "ema":            "EMA Pullback M5",
     "sweep":          "Sweep Displacement M1",
     "mean_reversion": "Mean Reversion BB M15",
+    "trend_continuation": "Trend Continuation M5",
 }
 
 STEP_BARS = {
@@ -324,6 +326,27 @@ def run_backtest_mean_reversion(m15, dxy_trend="NEUTRAL"):
     return trades
 
 
+def run_backtest_trend_continuation(m5, dxy_trend="NEUTRAL"):
+    """Backtest de la Estrategia 7 (2026-09-03). A diferencia de las
+    otras, necesita ventana >= 60 velas para EMA50 + ADX(14), por eso
+    el lookback es mayor (70) y el punto de partida i tambien."""
+    trades = []
+    i = 70
+    while i < len(m5) - 1:
+        c5_win = slice_up_to(m5, i, lookback=70)
+        try:
+            sig = se.strategy_trend_continuation(c5_win, dxy_trend)
+        except Exception:
+            sig = None
+        if sig:
+            resultado, r = simular_resultado(sig, m5[i + 1:])
+            trades.append((c5_win[-1]["time"], resultado, r))
+            i += 8
+        else:
+            i += 1
+    return trades
+
+
 # ── Agregacion de resultados ──────────────────────────────────────
 
 def agregar_resultado(trades):
@@ -459,8 +482,8 @@ def main():
     parser = argparse.ArgumentParser(description="Backtest de las estrategias de signal_engine.py")
     parser.add_argument("--days", type=int, default=30, help="Dias hacia atras a testear (default 30)")
     parser.add_argument(
-        "--strategies", type=str, default="scalping,killzone,fvg,ema,sweep,mean_reversion",
-        help="Lista separada por coma: scalping,killzone,fvg,ema,sweep,mean_reversion"
+        "--strategies", type=str, default="scalping,killzone,fvg,ema,sweep,mean_reversion,trend_continuation",
+        help="Lista separada por coma: scalping,killzone,fvg,ema,sweep,mean_reversion,trend_continuation"
     )
     args = parser.parse_args()
 
@@ -549,6 +572,16 @@ def main():
         res = agregar_resultado(trades)
         if res:
             resultados_finales.append(("mean_reversion", res))
+            print(f"      {res['total_trades']} trades | winrate {res['winrate']}% | PF {res['profit_factor']}")
+        else:
+            print("      Sin trades suficientes en el rango.")
+
+    if "trend_continuation" in seleccion:
+        print("\n  [7] Corriendo Trend Continuation M5...")
+        trades = run_backtest_trend_continuation(m5, dxy_trend)
+        res = agregar_resultado(trades)
+        if res:
+            resultados_finales.append(("trend_continuation", res))
             print(f"      {res['total_trades']} trades | winrate {res['winrate']}% | PF {res['profit_factor']}")
         else:
             print("      Sin trades suficientes en el rango.")
