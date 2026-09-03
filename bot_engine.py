@@ -329,6 +329,7 @@ ALLOWED_STRATEGIES = [
     "EMA Pullback M5",
     "TradingPro AI Elite",
     "Sweep Displacement M1",
+    "Trend Continuation M5",
 ]
 
 
