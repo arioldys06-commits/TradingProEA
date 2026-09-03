@@ -239,6 +239,17 @@ MEAN_REV_RSI_OVERBOUGHT = 65 # bajado de 70 a 65 (2026-08-30): idem
 # aceptar mercados con algo mas de direccionalidad como "rango".
 MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
 
+# ── Estrategia 7: Trend Continuation M5 (2026-09-03) ──
+# Ver conversacion: dias con movimiento muy direccional dejaban las
+# otras 6 estrategias sin ninguna señal por horas, porque
+# extension_agotada() (linea ~459) las bloquea a proposito cuando el
+# precio ya se alejo demasiado (>2x ATR) de su swing origen. Esta
+# estrategia es la contraparte: EXIGE tendencia fuerte confirmada
+# (ADX alto) en vez de rechazarla.
+TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "30"))
+TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
+TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
+
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
     rdh = ((now.hour - 4) + 24) % 24
@@ -1310,9 +1321,13 @@ def strategy_scalping_m5(c5, c30, ch1, dxy_trend="NEUTRAL"):
     }
 
 def strategy_killzone_breakout(c5, ch1, dxy_trend="NEUTRAL"):
-    # NO se toco — sigue exigiendo killzone obligatoria por diseño.
+    # CAMBIO 2026-09-02: killzone dejo de ser bloqueo obligatorio para
+    # esta estrategia, igual que ya paso con 1/3/4 el 2026-08-13.
+    # Ahora evalua el patron de ruptura tambien fuera de killzone; el
+    # bono de score "if is_killzone(): score += 10" (mas abajo, dos
+    # veces) sigue sumando solo cuando SI esta activa la ventana.
     if not is_killzone():
-        return None
+        print("  [2] Killzone Breakout: Fuera de Killzone — evaluando igual (killzone es bono de score, no bloqueo obligatorio)")
     if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
         print("  [2] Killzone Breakout: descartado — blackout de noticias de alto impacto")
         return None
@@ -2017,9 +2032,12 @@ def strategy_sweep_displacement(c15, c5, dxy_trend="NEUTRAL"):
     """Estrategia 5: Institutional Sweep & Displacement Scalp.
     Contexto en c15/c5, confirmacion y entrada en M1 (fetch propio)."""
 
-    # ── Filtro duro de horario: SOLO aperturas Londres/NY ──
+    # CAMBIO 2026-09-02: la ventana de apertura Londres/NY dejo de ser
+    # bloqueo obligatorio, igual que las demas estrategias. El bono de
+    # score de killzone (mas abajo) ahora es condicional a
+    # is_sweep_killzone() en vez de sumarse siempre.
     if not is_sweep_killzone():
-        return None
+        print("  [5] Sweep Displacement: Fuera de su ventana Londres/NY — evaluando igual (killzone es bono de score, no bloqueo obligatorio)")
 
     # ── Filtro duro de noticias de alto impacto (±5 min) ──
     if en_blackout_de_noticias(buffer_minutos=5):
@@ -2096,7 +2114,8 @@ def strategy_sweep_displacement(c15, c5, dxy_trend="NEUTRAL"):
     score += 15; reasons.append("Desplazamiento fuerte (cuerpo >= ATR x1.2)")
     score += 15; reasons.append("Volumen en spike")
     score += 15; reasons.append(f"Entrada en retroceso: {zona_desc}")
-    score += 5;  reasons.append("Killzone Londres/NY (apertura)")
+    if is_sweep_killzone():
+        score += 5; reasons.append("Killzone Londres/NY (apertura)")
 
     morfo_bonus, morfo_reason = score_morfologia_vela(c1, sig_type)
     if morfo_bonus != 0:
@@ -2324,6 +2343,147 @@ def strategy_mean_reversion_bb(c15, dxy_trend="NEUTRAL"):
     }
 
 
+def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
+    """Estrategia 7: Trend Continuation M5.
+    Contraparte deliberada de EMA Pullback/FVG Fill/etc: en vez de
+    rechazar el precio cuando ya se extendio mucho (extension_agotada),
+    EXIGE tendencia fuerte confirmada (ADX alto + EMA20/EMA50 alineadas)
+    y entra en la ruptura de una micro-pausa dentro del impulso, no en
+    la vela de impulso misma. SL mas ancho (ATR x2 minimo, o estructural
+    si es mayor) y TPs mas lejanos (1.5R / 3R) para dejar correr el
+    trade — el breakeven+trailing por ATR que ya existe en
+    bot_engine.py/result_tracker.py se encarga de administrarlo una vez
+    toca el 70% del camino a TP1, igual que las otras 6 estrategias.
+    A proposito NO usa extension_agotada() ni spike_reciente() — aqui la
+    extension y el impulso son la señal, no el motivo de rechazo.
+    """
+    if en_blackout_de_noticias(buffer_minutos=NEWS_BLACKOUT_MINUTES_GENERAL):
+        print("  [7] Trend Continuation: descartado — blackout de noticias de alto impacto")
+        return None
+
+    if len(c5) < 60:
+        return None
+
+    closes5 = [c["C"] for c in c5]
+    atr = calc_atr(c5[-20:])
+    if atr < 0.5:
+        return None
+
+    adx, _ = calc_adx(c5, period=ADX_PERIOD)
+    if adx is None:
+        return None
+    if adx < TREND_CONT_ADX_MIN:
+        print(f"  [7] Trend Continuation: descartado — ADX {adx:.1f} < {TREND_CONT_ADX_MIN} (tendencia no suficientemente fuerte)")
+        return None
+
+    ema_fast = ema(closes5, 20)
+    ema_slow = ema(closes5, 50)
+    if ema_fast is None or ema_slow is None:
+        return None
+
+    if ema_fast > ema_slow:
+        trend_dir = "BUY"
+    elif ema_fast < ema_slow:
+        trend_dir = "SELL"
+    else:
+        return None
+
+    # Micro-consolidacion: ¿las N velas antes de la ultima formaron una
+    # pausa angosta dentro del impulso? Evita comprar/vender literal
+    # sobre la vela de impulso mas grande — exige al menos una breve
+    # pausa que luego se rompe a favor de la tendencia.
+    n = TREND_CONT_CONSOLIDACION_N
+    if len(c5) < n + 2:
+        return None
+    consolidacion = c5[-(n + 1):-1]
+    ultima = c5[-1]
+
+    cons_high  = max(c["H"] for c in consolidacion)
+    cons_low   = min(c["L"] for c in consolidacion)
+    cons_rango = cons_high - cons_low
+
+    if cons_rango > atr * 1.3:
+        print(f"  [7] Trend Continuation: descartado — sin micro-consolidacion clara (rango {cons_rango:.2f} > 1.3x ATR)")
+        return None
+
+    if trend_dir == "BUY":
+        rompe = ultima["C"] > cons_high
+    else:
+        rompe = ultima["C"] < cons_low
+
+    if not rompe:
+        print(f"  [7] Trend Continuation: descartado — sin ruptura de la micro-consolidacion a favor de {trend_dir}")
+        return None
+
+    sig_type = trend_dir
+    score = 0
+    reasons = []
+
+    adx_exceso = adx - TREND_CONT_ADX_MIN
+    score += 30 + min(15, round(adx_exceso))
+    reasons.append(f"ADX {adx:.1f} confirma tendencia fuerte (>= {TREND_CONT_ADX_MIN})")
+
+    score += 20
+    reasons.append(f"EMA20 {'>' if trend_dir == 'BUY' else '<'} EMA50 en M5 — tendencia alineada")
+
+    score += 20
+    reasons.append(f"Ruptura de micro-consolidacion ({cons_rango:.2f} pts) a favor de {trend_dir}")
+
+    morfo_bonus, morfo_reason = score_morfologia_vela(c5, sig_type)
+    if morfo_bonus != 0:
+        score += morfo_bonus
+        if morfo_reason:
+            reasons.append(morfo_reason)
+
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
+    if is_killzone():
+        score += 5
+        reasons.append("Killzone activa (bono)")
+
+    score = max(0, min(score, 100))
+    if score < MIN_SCORE:
+        return None
+
+    entry = ultima["C"]
+
+    if sig_type == "BUY":
+        sl_estructural = cons_low - atr * 0.3
+        sl_atr = entry - atr * TREND_CONT_ATR_SL_MULT
+        sl = min(sl_estructural, sl_atr)  # el mas lejano de los dos (SL mas ancho, nunca mas angosto que ATR x mult)
+        sl_pts = entry - sl
+        tp1 = entry + sl_pts * 1.5
+        tp2 = entry + sl_pts * 3.0
+    else:
+        sl_estructural = cons_high + atr * 0.3
+        sl_atr = entry + atr * TREND_CONT_ATR_SL_MULT
+        sl = max(sl_estructural, sl_atr)
+        sl_pts = sl - entry
+        tp1 = entry - sl_pts * 1.5
+        tp2 = entry - sl_pts * 3.0
+
+    if sl_pts <= 0:
+        return None
+
+    return {
+        "signal_type":   sig_type,
+        "entry_price":   entry,
+        "stop_loss":     sl,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "confidence":    score,
+        "strategy":      "Trend Continuation M5",
+        "timeframe":     "M5",
+        "atr":           atr,
+        "reasons":       reasons,
+        "candle_time":   ultima["time"],
+    }
+
+
 def analyze():
     now_str = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{now_str}] Analizando mercado...")
@@ -2406,7 +2566,7 @@ def analyze():
             else:
                 print(f"  [2] Killzone Breakout: señal detectada pero no publicada")
         else:
-            kz_info = "activa" if is_killzone() else "inactiva (solo opera en KZ)"
+            kz_info = "activa" if is_killzone() else "inactiva (bono de score, no bloqueo)"
             print(f"  [2] Killzone Breakout: sin setup | KZ {kz_info}")
     except Exception as e:
         print(f"  [2] Error Killzone Breakout: {e}")
@@ -2459,6 +2619,18 @@ def analyze():
     except Exception as e:
         print(f"  [6] Error Mean Reversion BB: {e}")
 
+    try:
+        sig = strategy_trend_continuation(c5, dxy_trend)
+        if sig:
+            if publish_signal(sig):
+                signals_found += 1
+            else:
+                print(f"  [7] Trend Continuation: señal detectada pero no publicada")
+        else:
+            print(f"  [7] Trend Continuation M5: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
+    except Exception as e:
+        print(f"  [7] Error Trend Continuation: {e}")
+
     if signals_found > 0:
         print(f"  => {signals_found} señal(es) publicada(s) esta ronda")
     else:
@@ -2473,18 +2645,20 @@ def main():
     print(f"  Estrategias activas:")
     print(f"    AI. TradingPro AI Elite (Confluence Engine)")
     print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib + OB/FVG/liquidez)")
-    print(f"    2. Killzone Breakout (London/NY) con Pullback + VWAP")
+    print(f"    2. Killzone Breakout (London/NY) con Pullback + VWAP — killzone es bono de score, no bloqueo")
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
     print(f"    4. EMA Pullback M5 (killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK}, M30+H1 obligatorio)")
-    print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY obligatoria)")
+    print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY es bono de score, no bloqueo)")
     print(f"    6. Mean Reversion BB M15 (Bollinger 20,2 + RSI, exige ADX < {MEAN_REV_ADX_MAX} en rango)")
+    print(f"    7. Trend Continuation M5 (ADX >= {TREND_CONT_ADX_MIN} + EMA20/50 alineadas + ruptura de micro-consolidación)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
     print(f"  Filtro volatilidad ATR: umbral {ATR_PROMEDIO_HISTORICO * ATR_MIN_MULTIPLIER:.2f} (hist={ATR_PROMEDIO_HISTORICO} x mult={ATR_MIN_MULTIPLIER})")
-    print(f"  Killzone: BONO de score en estrategias 1/3 (ya no bloqueo obligatorio) | Estrategia 2 SIGUE exigiendo killzone")
+    print(f"  Killzone: BONO de score en TODAS las estrategias (1/2/3/5) — ya ninguna bloquea fuera de killzone")
     print(f"  EMA Pullback M5: killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK} (BLOCK_NYC_EMA_PULLBACK={BLOCK_NYC_EMA_PULLBACK}) + M30/H1 obligatorio")
     print(f"  Mean Reversion BB M15: ADX < {MEAN_REV_ADX_MAX} obligatorio (mutuamente excluyente con EMA Pullback M5, ADX >= {ADX_MIN_TREND})")
+    print(f"  Trend Continuation M5: NUEVA — ADX >= {TREND_CONT_ADX_MIN} obligatorio, SL ancho (ATR x{TREND_CONT_ATR_SL_MULT} min), sin extension_agotada/spike_reciente a propósito")
     print(f"{'='*55}\n")
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -2502,6 +2676,7 @@ def main():
             f"Killzone: bono de score en 1/3, ya no bloqueo obligatorio\n"
             f"EMA Pullback M5: killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK} + M30/H1 obligatorio\n"
             f"Mean Reversion BB M15: nueva, ADX < {MEAN_REV_ADX_MAX} obligatorio\n"
+            f"Trend Continuation M5: nueva, ADX >= {TREND_CONT_ADX_MIN} obligatorio\n"
             f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         if ok:
