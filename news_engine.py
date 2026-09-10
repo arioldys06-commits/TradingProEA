@@ -1,238 +1,250 @@
 """
 news_engine.py
---------------
-Filtro de noticias de alto impacto para TradingProEA.
+================
+Bloque de noticias para TradingProEA.
 
-Objetivo: evitar que el bot EJECUTE operaciones durante ventanas de
-alto impacto (NFP, CPI, FOMC/Powell, PPI, PIB, etc.) usando el
-calendario económico de Finnhub.
+Hace tres cosas:
+1. Jala el calendario macro de Forex Factory (gratis, sin API key).
+2. Jala titulares de noticias financieras de Alpha Vantage (gratis, 25 req/dia).
+3. Evalua cada evento/noticia con Claude para asignar un sesgo direccional
+   (alcista / bajista / neutral) sobre XAUUSD, con su justificacion.
 
-Uso típico dentro de bot_engine.py, justo antes de mandar la orden a MT5:
+IMPORTANTE: el sesgo de IA es CONTEXTO, no una senal de entrada. No dispara
+trades por si solo. Se guarda en la tabla `news_events` para que el bot y
+el dashboard lo usen como filtro/confirmacion adicional.
 
-    from news_engine import is_news_blackout
+Requiere (agregar a .env del proyecto):
+    SUPABASE_URL=...
+    SUPABASE_KEY=...
+    ALPHA_VANTAGE_API_KEY=...
+    ANTHROPIC_API_KEY=...
 
-    blocked, evento = is_news_blackout()
-    if blocked:
-        log(f"[NEWS] Orden bloqueada por evento de alto impacto: {evento['event']} "
-            f"({evento['minutes_to_event']} min)")
-        continue  # no ejecutar esta señal
-
-No bloquea la GENERACIÓN de señales (signal_engine.py sigue publicando
-normalmente en Telegram) — solo bloquea la EJECUCIÓN en bot_engine.py,
-según lo acordado.
-
-Requiere en el .env:
-    FINNHUB_API_KEY=tu_api_key_aqui
+Requiere (pip):
+    pip install requests supabase python-dotenv anthropic
 """
 
 import os
-import time
+import hashlib
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import anthropic
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # si ya cargas el .env en otro punto del sistema, no pasa nada
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [news_engine] %(levelname)s %(message)s",
+)
+log = logging.getLogger("news_engine")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+FF_CALENDAR_URL = "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json"
+AV_NEWS_URL = "https://www.alphavantage.co/query"
+
+# Monedas/activos relevantes para XAUUSD: USD mueve el oro directamente;
+# EUR/GBP/JPY se incluyen porque afectan el indice DXY que ya usas en signal_engine.py
+RELEVANT_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF"}
+RELEVANT_IMPACT = {"High", "Medium"}  # se descartan Low/Holiday
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
 
 # ------------------------------------------------------------------
-# CONFIGURACIÓN
+# 1) Calendario macro (Forex Factory, JSON gratis)
 # ------------------------------------------------------------------
+def fetch_forexfactory_calendar() -> list[dict]:
+    try:
+        resp = requests.get(FF_CALENDAR_URL, timeout=15)
+        resp.raise_for_status()
+        events = resp.json()
+    except Exception as e:
+        log.error(f"Fallo al jalar calendario ForexFactory: {e}")
+        return []
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-FINNHUB_URL = "https://finnhub.io/api/v1/calendar/economic"
+    filtered = []
+    for e in events:
+        currency = e.get("country") or e.get("currency")
+        impact = e.get("impact")
+        if currency not in RELEVANT_CURRENCIES:
+            continue
+        if impact not in RELEVANT_IMPACT:
+            continue
+        filtered.append(
+            {
+                "source": "ForexFactory",
+                "raw_type": "calendar_event",
+                "event_time": e.get("date"),
+                "currency": currency,
+                "impact": "Alto" if impact == "High" else "Medio",
+                "title": e.get("title"),
+                "summary": None,
+                "url": e.get("url"),
+                "forecast": e.get("forecast"),
+                "previous_value": e.get("previous"),
+                "actual_value": e.get("actual"),
+            }
+        )
+    log.info(f"Calendario ForexFactory: {len(filtered)} eventos relevantes")
+    return filtered
 
-# Ventana de bloqueo alrededor del evento (minutos)
-NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "30"))
-NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
-
-# Solo bloquear por estos niveles de impacto (Finnhub usa 1=bajo, 2=medio, 3=alto)
-NEWS_MIN_IMPACT = int(os.getenv("NEWS_MIN_IMPACT", "3"))
-
-# Solo eventos de este país (el oro reacciona principalmente a USD)
-NEWS_COUNTRY = os.getenv("NEWS_COUNTRY", "US")
-
-# Cada cuánto se refresca el calendario desde Finnhub (evita gastar rate limit)
-CACHE_REFRESH_MIN = int(os.getenv("NEWS_CACHE_REFRESH_MIN", "15"))
-
-# Cuántos días hacia adelante se piden en cada refresh
-CALENDAR_LOOKAHEAD_DAYS = int(os.getenv("NEWS_CALENDAR_LOOKAHEAD_DAYS", "2"))
-
-logger = logging.getLogger("news_engine")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("[%(asctime)s] [NEWS] %(message)s", "%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
 
 # ------------------------------------------------------------------
-# CACHE EN MEMORIA
+# 2) Noticias (Alpha Vantage NEWS_SENTIMENT, gratis)
 # ------------------------------------------------------------------
-
-_cache = {
-    "events": [],       # lista de eventos normalizados
-    "fetched_at": None, # datetime UTC del último fetch exitoso
-    "last_error": None, # último error de API, si lo hubo (para diagnóstico)
-}
-
-
-def _fetch_calendar_from_finnhub():
-    """Trae el calendario económico crudo de Finnhub. Puede lanzar excepción."""
-    if not FINNHUB_API_KEY:
-        raise RuntimeError("FINNHUB_API_KEY no configurada en el .env")
-
-    today = datetime.now(timezone.utc).date()
-    to_date = today + timedelta(days=CALENDAR_LOOKAHEAD_DAYS)
+def fetch_alphavantage_news(limit: int = 20) -> list[dict]:
+    if not ALPHA_VANTAGE_API_KEY:
+        log.warning("ALPHA_VANTAGE_API_KEY no configurada, se omite esta fuente")
+        return []
 
     params = {
-        "from": today.isoformat(),
-        "to": to_date.isoformat(),
-        "token": FINNHUB_API_KEY,
+        "function": "NEWS_SENTIMENT",
+        "topics": "economy_macro,financial_markets",
+        "apikey": ALPHA_VANTAGE_API_KEY,
+        "limit": limit,
     }
-
-    resp = requests.get(FINNHUB_URL, params=params, timeout=10)
-
-    if resp.status_code == 403:
-        raise PermissionError(
-            "Finnhub devolvió 403 en /calendar/economic — ese endpoint puede "
-            "requerir plan pago en tu cuenta. Revisa finnhub.io/pricing."
-        )
-    resp.raise_for_status()
-
-    data = resp.json()
-    raw_events = data.get("economicCalendar", data if isinstance(data, list) else [])
-
-    events = []
-    for ev in raw_events:
-        try:
-            country = ev.get("country", "")
-            impact = ev.get("impact", 0)
-            event_time_str = ev.get("time")  # formato típico: "2026-08-19 08:30:00"
-            if not event_time_str:
-                continue
-
-            event_time = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S")
-            event_time = event_time.replace(tzinfo=timezone.utc)
-
-            events.append({
-                "event": ev.get("event", "Evento sin nombre"),
-                "country": country,
-                "impact": impact,  # 1=bajo, 2=medio, 3=alto (según Finnhub)
-                "time_utc": event_time,
-            })
-        except (ValueError, TypeError):
-            continue  # evento con formato inesperado, se ignora
-
-    return events
-
-
-def _refresh_cache_if_needed(force=False):
-    now = datetime.now(timezone.utc)
-    needs_refresh = (
-        force
-        or _cache["fetched_at"] is None
-        or (now - _cache["fetched_at"]) > timedelta(minutes=CACHE_REFRESH_MIN)
-    )
-    if not needs_refresh:
-        return
-
     try:
-        events = _fetch_calendar_from_finnhub()
-        _cache["events"] = events
-        _cache["fetched_at"] = now
-        _cache["last_error"] = None
-        logger.info(f"Calendario actualizado — {len(events)} eventos cargados.")
+        resp = requests.get(AV_NEWS_URL, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        _cache["last_error"] = str(e)
-        # Fail-open: si Finnhub falla (403, timeout, rate limit, etc.) NO se
-        # bloquea el bot indefinidamente. Se loguea fuerte para que se note,
-        # pero se sigue operando con la última data buena que haya en cache.
-        logger.warning(f"No se pudo refrescar el calendario ({e}). "
-                        f"Usando cache anterior ({len(_cache['events'])} eventos).")
+        log.error(f"Fallo al jalar noticias Alpha Vantage: {e}")
+        return []
 
+    if "feed" not in data:
+        log.warning(f"Alpha Vantage sin datos util (posible limite diario): {data.get('Information', data)}")
+        return []
 
-def is_news_blackout(now=None):
-    """
-    Devuelve (bloqueado: bool, evento: dict|None).
-
-    bloqueado=True si `now` cae dentro de la ventana
-    [evento - NEWS_BLACKOUT_BEFORE_MIN, evento + NEWS_BLACKOUT_AFTER_MIN]
-    de algún evento de impacto >= NEWS_MIN_IMPACT en NEWS_COUNTRY.
-    """
-    _refresh_cache_if_needed()
-
-    if now is None:
-        now = datetime.now(timezone.utc)
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-
-    for ev in _cache["events"]:
-        if ev["country"] != NEWS_COUNTRY:
+    keywords = ("gold", "xau", "fed", "inflation", "rate", "dollar", "dxy")
+    articles = []
+    for item in data["feed"]:
+        title_lower = item.get("title", "").lower()
+        summary_lower = item.get("summary", "").lower()
+        if not any(k in title_lower or k in summary_lower for k in keywords):
             continue
-        if ev["impact"] < NEWS_MIN_IMPACT:
-            continue
-
-        window_start = ev["time_utc"] - timedelta(minutes=NEWS_BLACKOUT_BEFORE_MIN)
-        window_end = ev["time_utc"] + timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN)
-
-        if window_start <= now <= window_end:
-            minutes_to_event = round((ev["time_utc"] - now).total_seconds() / 60, 1)
-            return True, {
-                "event": ev["event"],
-                "country": ev["country"],
-                "impact": ev["impact"],
-                "time_utc": ev["time_utc"].isoformat(),
-                "minutes_to_event": minutes_to_event,
+        articles.append(
+            {
+                "source": "AlphaVantage",
+                "raw_type": "news_article",
+                "event_time": _parse_av_time(item.get("time_published")),
+                "currency": "USD",
+                "impact": None,
+                "title": item.get("title"),
+                "summary": item.get("summary"),
+                "url": item.get("url"),
+                "forecast": None,
+                "previous_value": None,
+                "actual_value": None,
             }
+        )
+    log.info(f"Alpha Vantage: {len(articles)} articulos relevantes filtrados")
+    return articles
 
-    return False, None
 
-
-def next_high_impact_event():
-    """Devuelve el próximo evento de alto impacto (o None), útil para dashboards/logs."""
-    _refresh_cache_if_needed()
-    now = datetime.now(timezone.utc)
-
-    upcoming = [
-        ev for ev in _cache["events"]
-        if ev["country"] == NEWS_COUNTRY
-        and ev["impact"] >= NEWS_MIN_IMPACT
-        and ev["time_utc"] >= now
-    ]
-    if not upcoming:
+def _parse_av_time(raw: str | None) -> str | None:
+    # Alpha Vantage entrega formato YYYYMMDDTHHMMSS
+    if not raw:
+        return None
+    try:
+        dt = datetime.strptime(raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
         return None
 
-    upcoming.sort(key=lambda e: e["time_utc"])
-    nearest = upcoming[0]
-    return {
-        "event": nearest["event"],
-        "time_utc": nearest["time_utc"].isoformat(),
-        "minutes_away": round((nearest["time_utc"] - now).total_seconds() / 60, 1),
-    }
+
+# ------------------------------------------------------------------
+# 3) Evaluacion con IA (Claude)
+# ------------------------------------------------------------------
+def evaluate_with_claude(item: dict) -> dict:
+    """Pide a Claude un sesgo direccional para XAUUSD, con justificacion corta.
+    No pide ni acepta porcentajes de probabilidad (evita falsa precision)."""
+
+    contexto = item["title"]
+    if item.get("summary"):
+        contexto += f"\n{item['summary']}"
+    if item.get("forecast") or item.get("previous_value"):
+        contexto += f"\nForecast: {item.get('forecast')} | Previo: {item.get('previous_value')}"
+
+    prompt = f"""Eres un analista macro enfocado en XAUUSD (oro).
+Evalua el siguiente evento/noticia SOLO en funcion de su impacto esperado sobre XAUUSD.
+
+Evento:
+{contexto}
+
+Responde EXCLUSIVAMENTE en este formato, sin texto adicional:
+SESGO: [alcista|bajista|neutral]
+CONFIANZA: [alta|media|baja]
+RAZON: [una frase corta, max 25 palabras, sin porcentajes]"""
+
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        bias, confidence, reason = "neutral", "baja", "No se pudo evaluar"
+        for line in text.splitlines():
+            if line.upper().startswith("SESGO:"):
+                bias = line.split(":", 1)[1].strip().lower()
+            elif line.upper().startswith("CONFIANZA:"):
+                confidence = line.split(":", 1)[1].strip().lower()
+            elif line.upper().startswith("RAZON:"):
+                reason = line.split(":", 1)[1].strip()
+        return {"ai_bias": bias, "ai_confidence": confidence, "ai_reasoning": reason}
+    except Exception as e:
+        log.error(f"Fallo evaluacion Claude para '{item['title'][:50]}': {e}")
+        return {"ai_bias": "neutral", "ai_confidence": "baja", "ai_reasoning": "Error de evaluacion"}
 
 
 # ------------------------------------------------------------------
-# PRUEBA MANUAL: python news_engine.py
+# 4) Guardado en Supabase (con dedup para evitar el bug de duplicados
+#    que ya vimos en backtest_engine.py)
 # ------------------------------------------------------------------
+def _dedup_key(item: dict) -> str:
+    raw = f"{item['source']}|{item['title']}|{item.get('event_time')}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def save_events(items: list[dict]) -> int:
+    saved = 0
+    for item in items:
+        item["dedup_key"] = _dedup_key(item)
+        try:
+            supabase.table("news_events").upsert(
+                item, on_conflict="dedup_key"
+            ).execute()
+            saved += 1
+        except Exception as e:
+            log.error(f"Fallo al guardar '{item['title'][:50]}': {e}")
+    return saved
+
+
+# ------------------------------------------------------------------
+# main
+# ------------------------------------------------------------------
+def run_once():
+    log.info("=== Iniciando ciclo de news_engine ===")
+    items = fetch_forexfactory_calendar() + fetch_alphavantage_news()
+
+    if not items:
+        log.info("Sin eventos/noticias nuevas relevantes")
+        return
+
+    for item in items:
+        item.update(evaluate_with_claude(item))
+
+    saved = save_events(items)
+    log.info(f"=== Ciclo terminado: {saved}/{len(items)} guardados ===")
+
+
 if __name__ == "__main__":
-    print("Probando news_engine.py...\n")
-    blocked, event = is_news_blackout()
-    if blocked:
-        print(f"BLOQUEADO ahora mismo por: {event['event']} "
-              f"({event['country']}, impacto {event['impact']}, "
-              f"faltan {event['minutes_to_event']} min)")
-    else:
-        print("Sin bloqueo de noticias en este momento.")
-
-    nxt = next_high_impact_event()
-    if nxt:
-        print(f"\nPróximo evento de alto impacto: {nxt['event']} "
-              f"en {nxt['minutes_away']} min ({nxt['time_utc']})")
-    else:
-        print("\nNo hay eventos de alto impacto próximos en la ventana consultada.")
-
-    if _cache["last_error"]:
-        print(f"\n[AVISO] Último error de Finnhub: {_cache['last_error']}")
+    run_once()
