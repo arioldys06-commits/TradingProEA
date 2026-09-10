@@ -280,8 +280,8 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     BROKER_UTC_OFFSET_HOURS (configurable en .env, ver nota arriba
     sobre por que no se puede detectar automaticamente en este broker).
     """
-    desde = datetime.now() - timedelta(days=dias_atras)
-    hasta = datetime.now()
+    desde = (datetime.now(timezone.utc) - timedelta(days=dias_atras)).replace(tzinfo=None)
+    hasta = datetime.now(timezone.utc).replace(tzinfo=None)
 
     cache_ok = cargar_signals_cache()
     if not cache_ok:
