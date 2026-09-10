@@ -313,7 +313,7 @@ TRAILING_ATR_PERIOD = 14
 # EMA Pullback M5 tambien tuvieron stop-outs en 1-2 minutos por spikes
 # de spread/volatilidad que su ATR(14) promedio no alcanzo a capturar
 # a tiempo — se agregan aqui por el mismo motivo.
-SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1"]
+SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1", "FVG Fill M5", "EMA Pullback M5"]
 MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "35"))  # ajustar segun spread tipico real de GOLD en XMGlobal
 
 ALLOWED_STRATEGIES = [
@@ -330,6 +330,7 @@ ALLOWED_STRATEGIES = [
     "TradingPro AI Elite",
     "Sweep Displacement M1",
     "Trend Continuation M5",
+    "Mean Reversion BB M15",
 ]
 
 
