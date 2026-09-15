@@ -229,6 +229,20 @@ LOT_SIZE_FALLBACK = 0.02  # solo se usa si el calculo dinamico falla (ver execut
 # calculo dinamico basado en RISK_PERCENT.
 USE_FIXED_LOT = os.getenv("USE_FIXED_LOT", "false").lower() == "true"
 FIXED_LOT_SIZE = float(os.getenv("FIXED_LOT_SIZE", "0.02"))
+
+# NUEVO 2026-09-13: lote fijo POR ESTRATEGIA (solo aplica si USE_FIXED_LOT=true).
+# Cualquier estrategia que no este en este diccionario usa FIXED_LOT_SIZE
+# como respaldo (para que una estrategia nueva no se quede sin lote definido).
+# Editar aqui directo para ajustar — no hace falta tocar el .env.
+LOT_POR_ESTRATEGIA = {
+    "Trend Continuation M5": 0.03,
+    "FVG Fill M5": 0.03,
+    "Mean Reversion BB M15": 0.02,
+    "EMA Pullback M5": 0.02,
+    "Liquidity Sweep": 0.02,
+    "Killzone Breakout": 0.02,
+    "Scalping M5 SMC": 0.02,
+}
 MIN_SCORE = 75
 MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
 MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas (limite general)
@@ -1314,8 +1328,8 @@ def execute_order(signal):
     account = mt5.account_info()
 
     if USE_FIXED_LOT:
-        lote = FIXED_LOT_SIZE
-        print(f"  [RIESGO] Lote fijo activado: {lote} (USE_FIXED_LOT=true)")
+        lote = LOT_POR_ESTRATEGIA.get(signal["strategy"], FIXED_LOT_SIZE)
+        print(f"  [RIESGO] Lote por estrategia: {lote} ({signal['strategy']}, USE_FIXED_LOT=true)")
     else:
         lote, detalle = calculate_lot_size(
             mt5=mt5,
@@ -1606,7 +1620,10 @@ def main():
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Simbolo MT5: {MT5_SYMBOL}")
     if USE_FIXED_LOT:
-        print(f"  Lote: FIJO {FIXED_LOT_SIZE} (USE_FIXED_LOT=true) | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
+        print(f"  Lote por estrategia (USE_FIXED_LOT=true, respaldo {FIXED_LOT_SIZE}):")
+        for estr, lot in LOT_POR_ESTRATEGIA.items():
+            print(f"    - {estr}: {lot}")
+        print(f"  Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     else:
         print(f"  Riesgo por operacion: {RISK_PERCENT}% del balance | Score min: {MIN_SCORE} | SL extra: {SL_EXTRA_PTS} pts")
     print(f"  Max diario: {MAX_DAILY} operaciones | Max perdidas/dia: {MAX_LOSSES_PER_DAY}")
