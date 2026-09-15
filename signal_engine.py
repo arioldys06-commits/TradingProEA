@@ -1843,10 +1843,16 @@ SWEEP_ENTRY_TOLERANCE_ATR = 0.5   # tolerancia (en ATR M1) para considerar preci
 # de volatilidad y spread que genera una noticia de alto impacto.
 NEWS_BLACKOUT_MINUTES_GENERAL = 15
 try:
-    from news_engine import get_high_impact_news_times
+    # FIX 2026-09-10: news_engine.py nunca expuso get_high_impact_news_times().
+    # La funcion real es is_news_blackout(), que ya calcula su propia ventana
+    # asimetrica (NEWS_BLACKOUT_BEFORE_MIN / NEWS_BLACKOUT_AFTER_MIN via .env)
+    # y devuelve (bloqueado: bool, evento: dict|None). El import anterior
+    # fallaba SIEMPRE con ImportError, tragado por el except generico de abajo,
+    # dejando NEWS_FILTER_AVAILABLE en False sin ningun aviso en consola.
+    from news_engine import is_news_blackout as _news_is_blackout
     NEWS_FILTER_AVAILABLE = True
 except Exception:
-    get_high_impact_news_times = None
+    _news_is_blackout = None
     NEWS_FILTER_AVAILABLE = False
 
 
@@ -1860,14 +1866,23 @@ def is_sweep_killzone():
 
 
 def en_blackout_de_noticias(buffer_minutos=5):
+    # NOTA: buffer_minutos ya NO se usa para calcular la ventana — is_news_blackout()
+    # trae su propia ventana asimetrica (NEWS_BLACKOUT_BEFORE_MIN/AFTER_MIN del .env
+    # de news_engine.py). Se deja el parametro por compatibilidad con las 7 llamadas
+    # existentes (Scalping, Killzone Breakout, FVG Fill, EMA Pullback, Sweep
+    # Displacement, Mean Reversion, Trend Continuation) para no tocar cada una.
+    # Si se necesita granularidad distinta por estrategia, hay que extender
+    # is_news_blackout() para aceptar before_min/after_min como parametros.
     if not NEWS_FILTER_AVAILABLE:
         return False
     try:
-        eventos = get_high_impact_news_times()  # se espera lista de datetime UTC
-        now = datetime.now(timezone.utc)
-        return any(abs((now - ev).total_seconds()) <= buffer_minutos * 60 for ev in eventos)
+        bloqueado, evento = _news_is_blackout()
+        if bloqueado:
+            print(f"  [NEWS] Blackout activo: {evento['event']} ({evento['country']}, "
+                  f"impacto {evento['impact']}, faltan {evento['minutes_to_event']} min)")
+        return bloqueado
     except Exception as e:
-        print(f"  [5] Aviso: no se pudo evaluar blackout de noticias ({e}) — filtro omitido este ciclo")
+        print(f"  [NEWS] Aviso: no se pudo evaluar blackout de noticias ({e}) — filtro omitido este ciclo")
         return False
 
 
