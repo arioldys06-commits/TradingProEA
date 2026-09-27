@@ -31,6 +31,7 @@ SUPA_KEY = os.getenv("SUPABASE_KEY")
 
 TIMEFRAMES = {
     "M1":  (mt5.TIMEFRAME_M1,  150),
+    "M3":  (mt5.TIMEFRAME_M3,  150),  # NUEVO 2026-09-27: Trend Continuation evalua en M3
     "M5":  (mt5.TIMEFRAME_M5,  150),
     "M15": (mt5.TIMEFRAME_M15, 150),
     "M30": (mt5.TIMEFRAME_M30, 150),

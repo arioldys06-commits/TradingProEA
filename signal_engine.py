@@ -249,6 +249,11 @@ MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
 TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "30"))
 TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
+# NUEVO 2026-09-27: timeframe de evaluacion configurable. M3 en vez de M5 para
+# que ADX(14), EMA20/50 y la micro-pausa de 3 velas reaccionen ~40% antes
+# (3 velas = 9 min en vez de 15; EMA50 = 150 min en vez de 250). Requiere que
+# data_engine.py suba velas "M3" a ohlc_candles. Volver a M5: TREND_CONT_TF=M5 en .env
+TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
 
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
@@ -2491,8 +2496,8 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
         "take_profit_1": tp1,
         "take_profit_2": tp2,
         "confidence":    score,
-        "strategy":      "Trend Continuation M5",
-        "timeframe":     "M5",
+        "strategy":      f"Trend Continuation {TREND_CONT_TF}",
+        "timeframe":     TREND_CONT_TF,
         "atr":           atr,
         "reasons":       reasons,
         "candle_time":   ultima["time"],
@@ -2635,14 +2640,20 @@ def analyze():
         print(f"  [6] Error Mean Reversion BB: {e}")
 
     try:
-        sig = strategy_trend_continuation(c5, dxy_trend)
+        # NUEVO 2026-09-27: evalua con velas de TREND_CONT_TF (M3 por defecto), no M5
+        c_tc = c5 if TREND_CONT_TF == "M5" else to_candles(get_candles(TREND_CONT_TF, 100))
+        if len(c_tc) < 60:
+            print(f"  [7] Trend Continuation {TREND_CONT_TF}: sin velas suficientes ({len(c_tc)}) — ¿data_engine.py ya sube {TREND_CONT_TF}?")
+            sig = None
+        else:
+            sig = strategy_trend_continuation(c_tc, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
             else:
                 print(f"  [7] Trend Continuation: señal detectada pero no publicada")
         else:
-            print(f"  [7] Trend Continuation M5: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
+            print(f"  [7] Trend Continuation {TREND_CONT_TF}: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
     except Exception as e:
         print(f"  [7] Error Trend Continuation: {e}")
 
@@ -2665,7 +2676,7 @@ def main():
     print(f"    4. EMA Pullback M5 (killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK}, M30+H1 obligatorio)")
     print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY es bono de score, no bloqueo)")
     print(f"    6. Mean Reversion BB M15 (Bollinger 20,2 + RSI, exige ADX < {MEAN_REV_ADX_MAX} en rango)")
-    print(f"    7. Trend Continuation M5 (ADX >= {TREND_CONT_ADX_MIN} + EMA20/50 alineadas + ruptura de micro-consolidación)")
+    print(f"    7. Trend Continuation {TREND_CONT_TF} (ADX >= {TREND_CONT_ADX_MIN} + EMA20/50 alineadas + ruptura de micro-consolidación)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")

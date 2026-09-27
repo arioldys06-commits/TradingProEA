@@ -169,7 +169,7 @@ STRATEGY_TIMEFRAME = {
     "ema":          "M5",
     "sweep":        "M1",
     "mean_reversion": "M15",
-    "trend_continuation": "M5",
+    "trend_continuation": se.TREND_CONT_TF,
 }
 
 STRATEGY_LABEL = {
@@ -179,7 +179,7 @@ STRATEGY_LABEL = {
     "ema":            "EMA Pullback M5",
     "sweep":          "Sweep Displacement M1",
     "mean_reversion": "Mean Reversion BB M15",
-    "trend_continuation": "Trend Continuation M5",
+    "trend_continuation": f"Trend Continuation {se.TREND_CONT_TF}",
 }
 
 STEP_BARS = {
@@ -578,7 +578,8 @@ def main():
 
     if "trend_continuation" in seleccion:
         print("\n  [7] Corriendo Trend Continuation M5...")
-        trades = run_backtest_trend_continuation(m5, dxy_trend)
+        c_tc = m5 if se.TREND_CONT_TF == "M5" else fetch_historical_candles(se.TREND_CONT_TF, start_iso, end_iso)
+        trades = run_backtest_trend_continuation(c_tc, dxy_trend)
         res = agregar_resultado(trades)
         if res:
             resultados_finales.append(("trend_continuation", res))

@@ -236,6 +236,7 @@ FIXED_LOT_SIZE = float(os.getenv("FIXED_LOT_SIZE", "0.02"))
 # Editar aqui directo para ajustar — no hace falta tocar el .env.
 LOT_POR_ESTRATEGIA = {
     "Trend Continuation M5": 0.03,
+    "Trend Continuation M3": 0.03,  # NUEVO 2026-09-27
     "FVG Fill M5": 0.03,
     "Mean Reversion BB M15": 0.02,
     "EMA Pullback M5": 0.02,
@@ -344,6 +345,7 @@ ALLOWED_STRATEGIES = [
     "TradingPro AI Elite",
     "Sweep Displacement M1",
     "Trend Continuation M5",
+    "Trend Continuation M3",  # NUEVO 2026-09-27
     "Mean Reversion BB M15",
 ]
 
