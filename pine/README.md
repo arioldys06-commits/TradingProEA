@@ -22,6 +22,22 @@ Cada señal dibuja la entrada, el SL (detrás del extremo barrido + 0.30) y el T
 2. Usa un gráfico de XAUUSD con volumen (por ejemplo OANDA:XAUUSD o el feed de tu broker). Si el símbolo no tiene volumen, el VWAP no se dibuja.
 3. Alertas: **Create alert → TP Scalper → "Any alert() function call"** y recibes la entrada, el SL y el TP en el mensaje.
 
+## 1b. `TradingPro_Scalper_XAU_Strategy.pine` (backtest)
+
+Es la misma lógica del indicador, pero como `strategy()`, para medirla en el **Strategy Tester** de TradingView.
+
+- **Tamaño:** 1 % de riesgo por operación (como `RISK_PER_TRADE_PERCENT`) o un tamaño fijo.
+- **Límites diarios del bot:** máximo 3 operaciones y 2 pérdidas por día (día en hora RD).
+- **Costos por defecto:** 0.15 USD por onza por lado (≈ 0.30 de spread ida y vuelta) + 2 ticks de slippage. Cámbialos en *Propiedades* a lo que cobra tu broker.
+- **Entrada:** en la apertura de la vela siguiente a la señal (no al cierre), para no inflar los resultados.
+- **Opciones:** activar o desactivar cada señal, solo compras o solo ventas, rango de fechas y cierre al terminar la killzone.
+
+### Cómo leer el resultado
+1. Ponlo en XAUUSD M5 (y después en M1). Mira **Net Profit, Profit Factor, Max Drawdown, % Profitable y Total Trades**.
+2. Prueba cada señal por separado (desactiva la otra) para saber cuál aporta y cuál resta.
+3. Con menos de ~100 operaciones el resultado no es concluyente. TradingView solo carga un número limitado de velas en M1/M5 según tu plan.
+4. No optimices hasta que todo salga verde: separa un periodo para probar (por ejemplo, el último mes) que no hayas usado para ajustar.
+
 ## 2. Indicadores públicos recomendados (gratis, código abierto)
 
 | # | Indicador | Para qué sirve en scalping de oro | Cuidado con |
