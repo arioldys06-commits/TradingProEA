@@ -1250,17 +1250,33 @@ function isSignalFreshForTopScore(sig) {
 }
 
 async function refreshAll() {
-  const [a, s, candles] = await Promise.all([
+  // M5 y H1 en consultas separadas: antes venian mezcladas sin la columna
+  // timeframe, asi que todo se trataba como M5 (ATR mezclado, Asia vacio).
+  const [a, s, m5r, h1r, h4] = await Promise.all([
     sb.from('analysis_results').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle(),
     sb.from('signals').select('*').order('created_at', { ascending: false }).limit(20),
-    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').in('timeframe', ['M5', 'H1']).order('candle_time', { ascending: false }).limit(100)
+    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'M5').order('candle_time', { ascending: false }).limit(100),
+    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'H1').order('candle_time', { ascending: false }).limit(100),
+    deskCloses('XAUUSD', 'H4', 200)
   ]);
-  currentAnalysis = a.data;
   currentSignals = s.data || [];
-  const c = candles.data || [];
+  const m5 = m5r.data || [];
+  const h1 = h1r.data || [];
+  const c = m5.concat(h1);
 
-  const m5 = c.filter(x => x.timeframe === 'M5' || !x.timeframe);
-  const h1 = c.filter(x => x.timeframe === 'H1');
+  // analysis_results esta vacia (ningun proceso la llena): si no hay fila,
+  // se arma el analisis con las velas para que sesgo/PDH/PDL no queden en "-".
+  currentAnalysis = a.data;
+  if (!currentAnalysis && h1.length) {
+    const lastC = +(m5[0] || h1[0]).close;
+    const d1 = deskD1Bias(h4, lastC);
+    const pd = deskPrevDay(h1.slice().reverse());
+    currentAnalysis = {
+      trend: d1 === 'BUY' ? 'ALCISTA' : d1 === 'SELL' ? 'BAJISTA' : 'LATERAL',
+      weekly_high: pd ? pd.high : null,
+      weekly_low: pd ? pd.low : null
+    };
+  }
   const latest = m5[0] || h1[0] || c[0];
   if (latest) {
     const price = n(latest.close);
@@ -1828,8 +1844,9 @@ async function loadScalpingM5() {
   document.getElementById('s5-ob').textContent = obs.length + ' detectados';
   document.getElementById('s5-kz').innerHTML = isInKillzone() ? '<span style="color:var(--green)">ACTIVA</span>' : '<span style="color:var(--dim)">No</span>';
 
-  const bias = currentAnalysis?.trend || '-';
-  document.getElementById('s5-bias').innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : '<span style="color:var(--yellow)">LATERAL</span>';
+  // Antes leia analysis_results (tabla vacia) y siempre mostraba LATERAL.
+  const d1 = deskD1Bias(await deskCloses('XAUUSD', 'H4', 200), last.C);
+  document.getElementById('s5-bias').innerHTML = d1 ? colorDir(d1) : '<span style="color:var(--dim)">Faltan velas</span>';
 
   // ★ EMA SMC cell
   const emaSmc = document.getElementById('s5-ema-smc');
@@ -2032,8 +2049,115 @@ function calcDeskRisk() {
   document.getElementById('dk-tps').textContent = tp1 + ' / ' + tp2;
 }
 
+// ── Sesgo macro del Trading Desk ──
+// Se calcula en el navegador con las velas de Supabase (antes dependia de
+// la tabla analysis_results, que ningun proceso llena y quedaba en "-").
+const DESK_DOLLAR_PAIRS = ['EURUSD', 'GBPUSD', 'USDCHF', 'USDJPY'];
+const DESK_DOLLAR_INVERSOS = new Set(['EURUSD', 'GBPUSD']);
+
+async function deskCloses(instrument, timeframe, limit, cols = 'candle_time,close') {
+  const { data } = await sb.from('ohlc_candles').select(cols).eq('instrument', instrument).eq('timeframe', timeframe).order('candle_time', { ascending: false }).limit(limit);
+  return (data || []).slice().reverse();
+}
+
+// Mismo criterio que get_dxy_trend() de signal_engine.py: EMA9 vs EMA20 en
+// M30 de cada par; 3+ votos = dolar FUERTE, 1 o menos = DEBIL.
+async function deskDxyTrend() {
+  const rows = await Promise.all(DESK_DOLLAR_PAIRS.map(p => deskCloses(p, 'M30', 60)));
+  let votos = 0, evaluados = 0;
+  rows.forEach((r, i) => {
+    const closes = r.map(c => +c.close);
+    if (closes.length < 20) return;
+    const e9 = emaVal(closes, 9), e20 = emaVal(closes, 20);
+    if (e9 == null || e20 == null) return;
+    evaluados++;
+    const up = e9 > e20;
+    if (DESK_DOLLAR_INVERSOS.has(DESK_DOLLAR_PAIRS[i]) ? !up : up) votos++;
+  });
+  if (evaluados < 3) return 'NEUTRAL';
+  return votos >= 3 ? 'FUERTE' : votos <= 1 ? 'DÉBIL' : 'NEUTRAL';
+}
+
+// Sesgo D1: cierres diarios armados con velas H4 (orden ascendente), precio
+// vs EMA20 diaria y su pendiente. Devuelve BUY / SELL / NEUTRAL, o null si faltan velas.
+// Maximo y minimo del dia de trading anterior con velas H1 (orden ascendente).
+// El dia de oro abre a las 22:00 UTC, por eso se corre la fecha 2 horas.
+function deskPrevDay(h1) {
+  const dayOf = c => new Date(new Date(c.candle_time).getTime() + 2 * 3600 * 1000).toISOString().slice(0, 10);
+  if (!h1.length) return null;
+  const today = dayOf(h1[h1.length - 1]);
+  const prev = h1.filter(c => dayOf(c) < today);
+  if (!prev.length) return null;
+  const pDay = dayOf(prev[prev.length - 1]);
+  const rows = prev.filter(c => dayOf(c) === pDay);
+  return { high: Math.max(...rows.map(c => +c.high)), low: Math.min(...rows.map(c => +c.low)) };
+}
+
+function deskD1Bias(h4, last) {
+  const days = {};
+  h4.forEach(c => { days[c.candle_time.slice(0, 10)] = +c.close; });
+  const dCloses = Object.keys(days).sort().map(k => days[k]);
+  const d20 = emaVal(dCloses, 20), d20prev = emaVal(dCloses.slice(0, -1), 20);
+  if (d20 == null || d20prev == null || !last) return null;
+  if (last > d20 && d20 > d20prev) return 'BUY';
+  if (last < d20 && d20 < d20prev) return 'SELL';
+  return 'NEUTRAL';
+}
+
+async function loadDeskMacro(price) {
+  const [dxy, h1, h4] = await Promise.all([
+    deskDxyTrend(),
+    deskCloses('XAUUSD', 'H1', 250, 'candle_time,high,low,close'),
+    deskCloses('XAUUSD', 'H4', 200)
+  ]);
+  const last = price || (h1.length ? +h1[h1.length - 1].close : 0);
+
+  // DXY sintetico
+  const dxyEl = document.getElementById('dk-dxy');
+  if (dxyEl) {
+    dxyEl.textContent = dxy;
+    dxyEl.style.color = dxy === 'FUERTE' ? 'var(--red)' : dxy === 'DÉBIL' ? 'var(--green)' : 'var(--yellow)';
+  }
+
+  // Precio vs EMA200 H1
+  const e200 = emaVal(h1.map(c => +c.close), 200);
+  const emaDir = e200 == null || !last ? null : last > e200 ? 'BUY' : 'SELL';
+  const e200El = document.getElementById('dk-ema200');
+  if (e200El) e200El.innerHTML = e200 == null ? '<span style="color:var(--dim)">Faltan velas</span>' : colorDir(emaDir) + ' <span style="font-size:10px;color:var(--dim)">' + n(e200) + '</span>';
+
+  const d1Dir = deskD1Bias(h4, last);
+  const biasEl = document.getElementById('dk-bias');
+  if (biasEl) biasEl.innerHTML = d1Dir ? colorDir(d1Dir) : '<span style="color:var(--dim)">Faltan velas</span>';
+
+  // Zona: posicion del precio dentro del rango de los ultimos 5 dias (120 velas H1).
+  const wk = h1.slice(-120);
+  let zone = null;
+  if (wk.length >= 24 && last) {
+    const hi = Math.max(...wk.map(c => +c.high)), lo = Math.min(...wk.map(c => +c.low));
+    const pos = (last - lo) / Math.max(hi - lo, 1e-9);
+    zone = pos < 0.35 ? 'DISCOUNT' : pos > 0.65 ? 'PREMIUM' : 'EQUILIBRIO';
+  }
+  const zoneEl = document.getElementById('dk-zone');
+  if (zoneEl) {
+    zoneEl.textContent = zone || '-';
+    zoneEl.style.color = zone === 'DISCOUNT' ? 'var(--green)' : zone === 'PREMIUM' ? 'var(--red)' : 'var(--yellow)';
+  }
+
+  // Lectura: dolar debil favorece BUY en oro; dolar fuerte favorece SELL.
+  const votosBuy = [d1Dir === 'BUY', emaDir === 'BUY', dxy === 'DÉBIL'].filter(Boolean).length;
+  const votosSell = [d1Dir === 'SELL', emaDir === 'SELL', dxy === 'FUERTE'].filter(Boolean).length;
+  const zTxt = zone ? ' Precio en ' + zone + '.' : '';
+  let read;
+  if (votosBuy >= 2 && votosSell === 0) read = 'Sesgo alcista (' + votosBuy + '/3 filtros).' + zTxt + (zone === 'PREMIUM' ? ' Esperar retroceso a discount para BUY.' : ' Priorizar BUY.');
+  else if (votosSell >= 2 && votosBuy === 0) read = 'Sesgo bajista (' + votosSell + '/3 filtros).' + zTxt + (zone === 'DISCOUNT' ? ' Esperar rebote a premium para SELL.' : ' Priorizar SELL.');
+  else read = 'Filtros mezclados (BUY ' + votosBuy + ' / SELL ' + votosSell + ').' + zTxt + ' Esperar confirmación, reducir tamaño o no operar.';
+  const readEl = document.getElementById('dk-macro-read');
+  if (readEl) readEl.textContent = read;
+}
+
 async function loadDesk() {
-  const { data: latest } = await sb.from('ohlc_candles').select('candle_time,close').order('candle_time', { ascending: false }).limit(1).maybeSingle();
+  // Solo XAUUSD: la tabla tambien guarda EURUSD/GBPUSD/USDCHF/USDJPY.
+  const { data: latest } = await sb.from('ohlc_candles').select('candle_time,close').eq('instrument', 'XAUUSD').order('candle_time', { ascending: false }).limit(1).maybeSingle();
   const price = latest ? parseFloat(latest.close) : 0;
   if (price) document.getElementById('dk-price').textContent = n(price);
 
@@ -2054,12 +2178,12 @@ async function loadDesk() {
     : '<div style="padding:6px 10px;background:var(--bg2);border:1px solid var(--b1);border-radius:var(--r);color:var(--dim);font-size:12px">Fuera de killzone — próxima: ' + (t < 300 ? 'London 3 AM' : t < 900 ? 'NY 9 AM' : 'London mañana') + ' RD</div>';
 
   const { data: h1raw } = await sb.from('ohlc_candles').select('candle_time,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'H1').order('candle_time', { ascending: false }).limit(50);
-  if (h1raw && h1raw.length >= 24) {
-    const yesterday = h1raw.slice(24, 48);
-    const pdh = Math.max(...yesterday.map(c => +c.high));
-    const pdl = Math.min(...yesterday.map(c => +c.low));
-    document.getElementById('dk-pdh').textContent = n(pdh);
-    document.getElementById('dk-pdl').textContent = n(pdl);
+  // Dia de trading anterior real (antes tomaba "24 a 48 velas atras", que
+  // tras un fin de semana caia en el jueves).
+  const pd = deskPrevDay((h1raw || []).slice().reverse());
+  if (pd) {
+    document.getElementById('dk-pdh').textContent = n(pd.high);
+    document.getElementById('dk-pdl').textContent = n(pd.low);
   }
 
   const { data: m5raw } = await sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'M5').order('candle_time', { ascending: false }).limit(30);
@@ -2071,25 +2195,13 @@ async function loadDesk() {
     calcDeskRisk();
   }
 
-  if (currentAnalysis) {
-    const bias = currentAnalysis.trend;
-    const biasEl = document.getElementById('dk-bias');
-    if (biasEl) biasEl.innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : bias;
-    const dxyEl = document.getElementById('dk-dxy');
-    if (dxyEl) { dxyEl.textContent = bias === 'BAJISTA' ? 'FUERTE' : 'DÉBIL'; dxyEl.style.color = bias === 'BAJISTA' ? 'var(--red)' : 'var(--green)'; }
-    const high = +currentAnalysis.weekly_high, low = +currentAnalysis.weekly_low;
-    const pos = price ? (price - low) / Math.max(high - low, 1) : 0.5;
-    const zone = pos < 0.35 ? 'DISCOUNT' : pos > 0.65 ? 'PREMIUM' : 'EQUILIBRIO';
-    const zoneEl = document.getElementById('dk-zone');
-    if (zoneEl) { zoneEl.textContent = zone; zoneEl.style.color = zone === 'DISCOUNT' ? 'var(--green)' : zone === 'PREMIUM' ? 'var(--red)' : 'var(--yellow)'; }
-    const e200El = document.getElementById('dk-ema200');
-    if (e200El) e200El.innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : '-';
-    const readEl = document.getElementById('dk-macro-read');
-    if (readEl) readEl.textContent = bias === 'ALCISTA' ? 'Sesgo alcista. Precio en ' + zone + '. Priorizar BUY en discount.' : bias === 'BAJISTA' ? 'Sesgo bajista. Precio en ' + zone + '. Priorizar SELL en premium.' : 'Mercado lateral. Esperar ruptura confirmada.';
-  }
+  await loadDeskMacro(price);
 
-  const today = new Date().toDateString();
-  const todayT = (currentSignals || []).filter(s => new Date(s.created_at).toDateString() === today && s.status === 'CLOSED').length;
+  // Trades de oro ejecutados hoy (hora RD), leidos directo de Supabase.
+  const rdNow = new Date(Date.now() - 4 * 3600 * 1000);
+  const dayStart = new Date(Date.UTC(rdNow.getUTCFullYear(), rdNow.getUTCMonth(), rdNow.getUTCDate(), 4)).toISOString();
+  const { data: todaySigs } = await sb.from('signals').select('id,instrument,status').gte('created_at', dayStart).in('status', ['EXECUTING', 'CLOSED']);
+  const todayT = (todaySigs || []).filter(s => !s.instrument || s.instrument === 'XAUUSD').length;
   const tt = document.getElementById('dk-trades');
   if (tt) { tt.textContent = todayT + '/3'; tt.style.color = todayT >= 3 ? 'var(--red)' : todayT >= 2 ? 'var(--yellow)' : 'var(--green)'; }
 }
