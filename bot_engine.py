@@ -236,17 +236,18 @@ FIXED_LOT_SIZE = float(os.getenv("FIXED_LOT_SIZE", "0.02"))
 # Editar aqui directo para ajustar — no hace falta tocar el .env.
 LOT_POR_ESTRATEGIA = {
     "Trend Continuation M5": 0.03,
+    "Trend Continuation M3": 0.03,
     "FVG Fill M5": 0.03,
     "Mean Reversion BB M15": 0.02,
-    "EMA Pullback M5": 0.02,
     "Liquidity Sweep": 0.02,
     "Killzone Breakout": 0.02,
     "Scalping M5 SMC": 0.02,
+    "CRT Kill Zone NY": 0.02,
 }
 MIN_SCORE = 75
 MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
 MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas (limite general)
-SL_EXTRA_PTS = 20
+SL_EXTRA_PTS = 30
 MAGIC_NUMBER = 20260601
 DEVIATION = 20
 DAILY_FILE = "bot_daily_count.txt"
@@ -291,7 +292,7 @@ MAX_LOSSES_OUTSIDE_KILLZONE = int(os.getenv("MAX_LOSSES_OUTSIDE_KILLZONE", "2"))
 # Estrategias que, mientras tienen una posicion real abierta, se
 # monitorean en cada ciclo por si aparece un CHoCH en contra — de ser
 # asi, se cierra la posicion completa antes de esperar SL/TP1.
-EARLY_EXIT_STRATEGIES = ["EMA Pullback M5"]
+EARLY_EXIT_STRATEGIES = ["CRT Kill Zone NY"]  # EMA Pullback M5 pausada 2026-09-15
 # Misma ventana que usa signal_engine.py para detectar CHoCH (20 velas M5).
 CHOCH_WINDOW = 20
 
@@ -300,7 +301,7 @@ CHOCH_WINDOW = 20
 # ~15-20 min; los perdedores se alargan 35-100+ min sin llegar a
 # breakeven. Si a los TIME_STOP_MINUTES no llego al 70% del camino a
 # TP1, se cierra en vez de dejarla sangrar mas tiempo.
-TIME_STOP_STRATEGIES = ["EMA Pullback M5"]
+TIME_STOP_STRATEGIES = []  # EMA Pullback M5 pausada 2026-09-15 (unico miembro)
 TIME_STOP_MINUTES = int(os.getenv("TIME_STOP_MINUTES", "25"))
 
 # ── Breakeven real al 70% del camino a TP1 ──
@@ -327,7 +328,7 @@ TRAILING_ATR_PERIOD = 14
 # EMA Pullback M5 tambien tuvieron stop-outs en 1-2 minutos por spikes
 # de spread/volatilidad que su ATR(14) promedio no alcanzo a capturar
 # a tiempo — se agregan aqui por el mismo motivo.
-SPREAD_FILTER_STRATEGIES = ["Sweep Displacement M1", "FVG Fill M5", "EMA Pullback M5"]
+SPREAD_FILTER_STRATEGIES = ["FVG Fill M5", "CRT Kill Zone NY"]  # Sweep Displacement M1 y EMA Pullback M5 pausadas 2026-09-15
 MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "35"))  # ajustar segun spread tipico real de GOLD en XMGlobal
 
 ALLOWED_STRATEGIES = [
@@ -340,11 +341,11 @@ ALLOWED_STRATEGIES = [
     "Scalping M5 SMC",
     "Killzone Breakout",
     "FVG Fill M5",
-    "EMA Pullback M5",
     "TradingPro AI Elite",
-    "Sweep Displacement M1",
     "Trend Continuation M5",
+    "Trend Continuation M3",
     "Mean Reversion BB M15",
+    "CRT Kill Zone NY",
 ]
 
 
