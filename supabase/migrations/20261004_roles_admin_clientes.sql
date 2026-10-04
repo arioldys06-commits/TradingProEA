@@ -71,3 +71,12 @@ drop policy if exists "Permitir lectura publica de trades" on public.trades_ejec
 drop policy if exists "Leer trades admin" on public.trades_ejecutados;
 create policy "Leer trades admin" on public.trades_ejecutados for select to authenticated
   using (public.is_admin());
+
+-- Las vistas de reporte corrian con permisos del creador (security definer)
+-- y anon podia leerlas, saltandose el RLS de trades_ejecutados.
+alter view public.v_reporte_diario_trades set (security_invoker = true);
+alter view public.v_reporte_diario_resumen set (security_invoker = true);
+alter view public.v_reporte_diario_resumen_bot set (security_invoker = true);
+alter view public.v_news_block_resumen set (security_invoker = true);
+revoke execute on function public.is_admin() from anon;
+revoke execute on function public.is_cliente_activo() from anon;
