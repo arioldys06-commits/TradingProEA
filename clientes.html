@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Señales Trading Pro</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+:root{
+  --bg:#f6f7f9;--bg1:#ffffff;--bg2:#f1f3f5;--b1:#e3e6ea;
+  --text:#1f2933;--muted:#5f6b7a;--dim:#8a95a3;
+  --gold:#c98a04;--green:#15924a;--red:#d93a3a;--blue:#2563eb;--yellow:#b7791f;
+  --mono:'JetBrains Mono',monospace;--sans:'Inter',sans-serif;--r:6px;--r2:10px;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#060a12;--bg1:#0d1117;--bg2:#161b22;--b1:#21262d;
+    --text:#e6edf3;--muted:#8b949e;--dim:#5c6570;
+    --gold:#f0b429;--green:#22c55e;--red:#ef4444;--blue:#3b82f6;--yellow:#eab308;
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45}
+.wrap{max-width:960px;margin:0 auto;padding:20px 16px 40px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}
+.brand{font-weight:600;font-size:16px}
+.brand small{display:block;font-weight:400;color:var(--dim);font-size:12px}
+.btn{background:var(--bg1);color:var(--text);border:1px solid var(--b1);border-radius:var(--r);padding:7px 12px;font-size:13px;cursor:pointer}
+.btn.primary{background:var(--green);border-color:var(--green);color:#fff;font-weight:600}
+.card{background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px}
+.label{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.stat{font-family:var(--mono);font-size:22px;font-weight:600}
+.sec{margin-bottom:16px}
+.sec h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;font-weight:600}
+.sig{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;align-items:center}
+.sig + .sig{margin-top:10px;padding-top:10px;border-top:1px solid var(--b1)}
+.k{font-size:11px;color:var(--dim)}
+.v{font-family:var(--mono);font-weight:600}
+.buy{color:var(--green)}.sell{color:var(--red)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-size:11px;color:var(--dim);font-weight:600;text-transform:uppercase;padding:6px 8px;border-bottom:1px solid var(--b1)}
+td{padding:7px 8px;border-bottom:1px solid var(--bg2)}
+td.m{font-family:var(--mono)}
+.tbl{overflow-x:auto}
+.empty{color:var(--dim);padding:10px 0}
+.login{max-width:360px;margin:12vh auto 0}
+.login input{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--b1);border-radius:var(--r);padding:10px;font-size:14px;margin-bottom:10px}
+.login .btn{width:100%;padding:10px}
+.msg{font-size:12px;margin-top:10px;color:var(--muted);min-height:16px}
+.msg.err{color:var(--red)}
+.link{background:none;border:none;color:var(--blue);cursor:pointer;font-size:13px;margin-top:12px}
+.note{font-size:11px;color:var(--dim);margin-top:24px;line-height:1.5}
+.pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:var(--bg2);color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">Trading Pro · Señales<small>XAUUSD y EURUSD</small></div>
+    <button class="btn" id="logoutBtn" style="display:none" onclick="logout()">Salir</button>
+  </div>
+
+  <!-- LOGIN / REGISTRO -->
+  <div id="loginView" class="login card" style="display:none">
+    <div class="label" id="loginTitle">Entrar</div>
+    <input id="em" type="email" placeholder="tu@email.com" autocomplete="email">
+    <input id="pw" type="password" placeholder="Contraseña" autocomplete="current-password">
+    <button class="btn primary" id="loginBtn" onclick="submitAuth()">Entrar</button>
+    <div class="msg" id="loginMsg"></div>
+    <button class="link" id="toggleBtn" onclick="toggleMode()">¿No tienes cuenta? Crear una</button>
+  </div>
+
+  <!-- PENDIENTE -->
+  <div id="pendingView" class="card" style="display:none;max-width:480px;margin:10vh auto 0">
+    <div class="label">Cuenta pendiente</div>
+    <p>Tu cuenta <b id="pendingEmail"></b> está creada, pero todavía no tiene acceso a las señales.</p>
+    <p style="margin-top:8px;color:var(--muted)">Cuando el administrador la apruebe, recarga esta página.</p>
+  </div>
+
+  <!-- SEÑALES -->
+  <div id="appView" style="display:none">
+    <div class="grid">
+      <div class="card"><div class="label">Precio oro</div><div class="stat" id="price">-</div></div>
+      <div class="card"><div class="label">Winrate 30 días</div><div class="stat" id="wr">-</div></div>
+      <div class="card"><div class="label">Ganadas / Perdidas</div><div class="stat"><span class="buy" id="wins">-</span> / <span class="sell" id="losses">-</span></div></div>
+      <div class="card"><div class="label">Señales hoy</div><div class="stat" id="today">-</div></div>
+    </div>
+
+    <div class="sec card">
+      <h2>Señales activas</h2>
+      <div id="active"><div class="empty">Cargando...</div></div>
+    </div>
+
+    <div class="sec card">
+      <h2>Historial reciente</h2>
+      <div class="tbl"><table>
+        <thead><tr><th>Fecha</th><th>Mercado</th><th>Tipo</th><th>Entrada</th><th>SL</th><th>TP1</th><th>Resultado</th></tr></thead>
+        <tbody id="hist"><tr><td colspan="7" class="empty">Cargando...</td></tr></tbody>
+      </table></div>
+    </div>
+
+    <div style="font-size:12px;color:var(--dim)" id="updated"></div>
+    <p class="note">Las señales son informativas y no constituyen asesoría financiera. Operar oro y divisas conlleva alto riesgo; no arriesgues dinero que no puedas perder. Resultados pasados no garantizan resultados futuros.</p>
+  </div>
+</div>
+
+<script>
+const SUPA_URL = "https://qilvrvnwdtpbkcfwktqs.supabase.co";
+const SUPA_KEY = "sb_publishable_pb10ZXfNyiSkTQIYkGfjKA_Bd6ItcPY";
+const sb = supabase.createClient(SUPA_URL, SUPA_KEY);
+let signupMode = false, timer = null;
+
+const show = id => ['loginView', 'pendingView', 'appView'].forEach(v => document.getElementById(v).style.display = v === id ? '' : 'none');
+const fmt = (v, inst) => v == null || isNaN(+v) ? '-' : (+v).toFixed(inst === 'EURUSD' ? 5 : 2);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+
+function toggleMode() {
+  signupMode = !signupMode;
+  document.getElementById('loginTitle').textContent = signupMode ? 'Crear cuenta' : 'Entrar';
+  document.getElementById('loginBtn').textContent = signupMode ? 'Crear cuenta' : 'Entrar';
+  document.getElementById('toggleBtn').textContent = signupMode ? '¿Ya tienes cuenta? Entrar' : '¿No tienes cuenta? Crear una';
+  document.getElementById('loginMsg').textContent = '';
+}
+
+async function submitAuth() {
+  const email = document.getElementById('em').value.trim();
+  const password = document.getElementById('pw').value;
+  const msg = document.getElementById('loginMsg');
+  msg.className = 'msg';
+  if (!email || !password) { msg.textContent = 'Escribe tu correo y contraseña.'; msg.className = 'msg err'; return; }
+  msg.textContent = 'Conectando...';
+  const { data, error } = signupMode
+    ? await sb.auth.signUp({ email, password })
+    : await sb.auth.signInWithPassword({ email, password });
+  if (error) { msg.textContent = error.message; msg.className = 'msg err'; return; }
+  if (signupMode && !data.session) { msg.textContent = 'Cuenta creada. Revisa tu correo para confirmarla y luego entra.'; return; }
+  start(data.session || (await sb.auth.getSession()).data.session);
+}
+
+async function logout() {
+  clearInterval(timer);
+  await sb.auth.signOut();
+  location.reload();
+}
+
+async function hasAccess(email) {
+  // El admin ve esta pagina tambien; un cliente necesita estar activo.
+  const [adm, cli] = await Promise.all([
+    sb.from('admins').select('email').eq('email', email).maybeSingle(),
+    sb.from('clientes').select('activo').eq('email', email).maybeSingle()
+  ]);
+  return !!adm.data || !!(cli.data && cli.data.activo);
+}
+
+async function start(session) {
+  if (!session) { show('loginView'); return; }
+  document.getElementById('logoutBtn').style.display = '';
+  const email = session.user.email.toLowerCase();
+  if (!(await hasAccess(email))) {
+    document.getElementById('pendingEmail').textContent = email;
+    show('pendingView');
+    return;
+  }
+  show('appView');
+  await load();
+  clearInterval(timer);
+  timer = setInterval(load, 30000);
+}
+
+async function load() {
+  const since30 = new Date(Date.now() - 30 * 86400000).toISOString();
+  const [act, hist, stats, px] = await Promise.all([
+    sb.from('signals').select('created_at,instrument,strategy,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,status')
+      .in('status', ['PENDING', 'EXECUTING']).gte('created_at', new Date(Date.now() - 6 * 3600000).toISOString())
+      .order('created_at', { ascending: false }).limit(10),
+    sb.from('signals').select('created_at,instrument,signal_type,entry_price,stop_loss,take_profit_1,status,result')
+      .eq('status', 'CLOSED').order('created_at', { ascending: false }).limit(20),
+    sb.from('signals').select('created_at,result').eq('status', 'CLOSED').gte('created_at', since30).limit(1000),
+    sb.from('ohlc_candles').select('close').eq('instrument', 'XAUUSD').order('candle_time', { ascending: false }).limit(1).maybeSingle()
+  ]);
+
+  if (px.data) document.getElementById('price').textContent = (+px.data.close).toFixed(2);
+
+  const closed = stats.data || [];
+  const w = closed.filter(s => s.result === 'WIN').length, l = closed.filter(s => s.result === 'LOSS').length;
+  document.getElementById('wins').textContent = w;
+  document.getElementById('losses').textContent = l;
+  document.getElementById('wr').textContent = w + l ? (100 * w / (w + l)).toFixed(1) + '%' : '-';
+  const rd = new Date(Date.now() - 4 * 3600000);
+  const dayStart = Date.UTC(rd.getUTCFullYear(), rd.getUTCMonth(), rd.getUTCDate(), 4);
+  document.getElementById('today').textContent = closed.filter(s => new Date(s.created_at).getTime() >= dayStart).length +
+    (act.data || []).length;
+
+  const a = act.data || [];
+  document.getElementById('active').innerHTML = a.length ? a.map(s => {
+    const cls = s.signal_type === 'BUY' ? 'buy' : 'sell';
+    const inst = s.instrument || 'XAUUSD';
+    return `<div class="sig">
+      <div><div class="k">${esc(inst)} · ${new Date(s.created_at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}</div><div class="v ${cls}">${esc(s.signal_type)}</div></div>
+      <div><div class="k">Entrada</div><div class="v">${fmt(s.entry_price, inst)}</div></div>
+      <div><div class="k">Stop Loss</div><div class="v sell">${fmt(s.stop_loss, inst)}</div></div>
+      <div><div class="k">TP1</div><div class="v buy">${fmt(s.take_profit_1, inst)}</div></div>
+      <div><div class="k">TP2</div><div class="v buy">${fmt(s.take_profit_2, inst)}</div></div>
+      <div><span class="pill">${s.status === 'EXECUTING' ? 'En curso' : 'Nueva'}</span></div>
+    </div>`;
+  }).join('') : '<div class="empty">No hay señales activas ahora. Esta página se actualiza sola cada 30 segundos.</div>';
+
+  const h = hist.data || [];
+  document.getElementById('hist').innerHTML = h.length ? h.map(s => {
+    const inst = s.instrument || 'XAUUSD';
+    const res = s.result === 'WIN' ? '<span class="buy">Ganada</span>' : s.result === 'LOSS' ? '<span class="sell">Perdida</span>' : '<span style="color:var(--dim)">-</span>';
+    return `<tr>
+      <td>${new Date(s.created_at).toLocaleString('es', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</td>
+      <td>${esc(inst)}</td>
+      <td class="${s.signal_type === 'BUY' ? 'buy' : 'sell'}">${esc(s.signal_type)}</td>
+      <td class="m">${fmt(s.entry_price, inst)}</td><td class="m">${fmt(s.stop_loss, inst)}</td><td class="m">${fmt(s.take_profit_1, inst)}</td>
+      <td>${res}</td></tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">Sin señales cerradas todavía.</td></tr>';
+
+  document.getElementById('updated').textContent = 'Actualizado: ' + new Date().toLocaleTimeString('es');
+}
+
+document.getElementById('pw').addEventListener('keydown', e => { if (e.key === 'Enter') submitAuth(); });
+sb.auth.getSession().then(({ data }) => start(data.session));
+</script>
+</body>
+</html>
