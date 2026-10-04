@@ -1828,8 +1828,9 @@ async function loadScalpingM5() {
   document.getElementById('s5-ob').textContent = obs.length + ' detectados';
   document.getElementById('s5-kz').innerHTML = isInKillzone() ? '<span style="color:var(--green)">ACTIVA</span>' : '<span style="color:var(--dim)">No</span>';
 
-  const bias = currentAnalysis?.trend || '-';
-  document.getElementById('s5-bias').innerHTML = bias === 'ALCISTA' ? colorDir('BUY') : bias === 'BAJISTA' ? colorDir('SELL') : '<span style="color:var(--yellow)">LATERAL</span>';
+  // Antes leia analysis_results (tabla vacia) y siempre mostraba LATERAL.
+  const d1 = deskD1Bias(await deskCloses('XAUUSD', 'H4', 200), last.C);
+  document.getElementById('s5-bias').innerHTML = d1 ? colorDir(d1) : '<span style="color:var(--dim)">Faltan velas</span>';
 
   // ★ EMA SMC cell
   const emaSmc = document.getElementById('s5-ema-smc');
@@ -2061,6 +2062,19 @@ async function deskDxyTrend() {
   return votos >= 3 ? 'FUERTE' : votos <= 1 ? 'DÉBIL' : 'NEUTRAL';
 }
 
+// Sesgo D1: cierres diarios armados con velas H4 (orden ascendente), precio
+// vs EMA20 diaria y su pendiente. Devuelve BUY / SELL / NEUTRAL, o null si faltan velas.
+function deskD1Bias(h4, last) {
+  const days = {};
+  h4.forEach(c => { days[c.candle_time.slice(0, 10)] = +c.close; });
+  const dCloses = Object.keys(days).sort().map(k => days[k]);
+  const d20 = emaVal(dCloses, 20), d20prev = emaVal(dCloses.slice(0, -1), 20);
+  if (d20 == null || d20prev == null || !last) return null;
+  if (last > d20 && d20 > d20prev) return 'BUY';
+  if (last < d20 && d20 < d20prev) return 'SELL';
+  return 'NEUTRAL';
+}
+
 async function loadDeskMacro(price) {
   const [dxy, h1, h4] = await Promise.all([
     deskDxyTrend(),
@@ -2082,17 +2096,7 @@ async function loadDeskMacro(price) {
   const e200El = document.getElementById('dk-ema200');
   if (e200El) e200El.innerHTML = e200 == null ? '<span style="color:var(--dim)">Faltan velas</span>' : colorDir(emaDir) + ' <span style="font-size:10px;color:var(--dim)">' + n(e200) + '</span>';
 
-  // Sesgo D1: cierres diarios armados con velas H4, precio vs EMA20 diaria y su pendiente.
-  const days = {};
-  h4.forEach(c => { days[c.candle_time.slice(0, 10)] = +c.close; });
-  const dCloses = Object.keys(days).sort().map(k => days[k]);
-  const d20 = emaVal(dCloses, 20), d20prev = emaVal(dCloses.slice(0, -1), 20);
-  let d1Dir = null;
-  if (d20 != null && d20prev != null && last) {
-    if (last > d20 && d20 > d20prev) d1Dir = 'BUY';
-    else if (last < d20 && d20 < d20prev) d1Dir = 'SELL';
-    else d1Dir = 'NEUTRAL';
-  }
+  const d1Dir = deskD1Bias(h4, last);
   const biasEl = document.getElementById('dk-bias');
   if (biasEl) biasEl.innerHTML = d1Dir ? colorDir(d1Dir) : '<span style="color:var(--dim)">Faltan velas</span>';
 
