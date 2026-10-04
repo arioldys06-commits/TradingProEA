@@ -283,6 +283,20 @@ LOT_POR_ESTRATEGIA = {
 # Semana 28 sep-2 oct, Trend Continuation: con tope $20 el neto quedaba
 # igual (+$67) y el peor trade bajaba de -$99 a -$33. 0 = desactivado.
 MAX_RISK_USD_TRADE = float(os.getenv("MAX_RISK_USD_TRADE", "20"))
+# Alternativa en % del balance: si MAX_RISK_PERCENT_TRADE > 0, el tope es
+# balance * % / 100 (crece o baja con la cuenta) y reemplaza al de dolares.
+MAX_RISK_PERCENT_TRADE = float(os.getenv("MAX_RISK_PERCENT_TRADE", "0"))
+
+
+def tope_riesgo_usd():
+    """Tope de perdida por trade en dolares segun el .env (0 = sin tope)."""
+    if MAX_RISK_PERCENT_TRADE > 0:
+        account = mt5.account_info()
+        if account is not None and account.balance > 0:
+            return account.balance * MAX_RISK_PERCENT_TRADE / 100
+    return MAX_RISK_USD_TRADE
+
+
 MIN_SCORE = 75
 MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
 MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas (limite general)
@@ -1424,25 +1438,26 @@ def validate_signal(signal):
 
 def ajustar_lote_por_riesgo_usd(lote, price, sl, symbol_name=None):
     """Baja el lote (en pasos del broker) si la perdida hasta el SL supera
-    MAX_RISK_USD_TRADE. Usa trade_tick_value/trade_tick_size de MT5 para
+    el tope de tope_riesgo_usd(). Usa trade_tick_value/trade_tick_size de MT5 para
     convertir distancia de precio a dolares. Si no hay datos del simbolo,
     deja el lote como viene (fail-open, igual que spread_actual_ok)."""
-    if MAX_RISK_USD_TRADE <= 0:
+    tope = tope_riesgo_usd()
+    if tope <= 0:
         return lote
     symbol = mt5.symbol_info(symbol_name or MT5_SYMBOL)
     if symbol is None or not symbol.trade_tick_size or not symbol.trade_tick_value:
         return lote
     distancia = abs(price - sl)
     perdida_por_lote = distancia / symbol.trade_tick_size * symbol.trade_tick_value
-    if perdida_por_lote <= 0 or lote * perdida_por_lote <= MAX_RISK_USD_TRADE:
+    if perdida_por_lote <= 0 or lote * perdida_por_lote <= tope:
         return lote
     step = symbol.volume_step or 0.01
     minimo = symbol.volume_min or step
-    pasos = int((MAX_RISK_USD_TRADE / perdida_por_lote) / step + 1e-9)
+    pasos = int((tope / perdida_por_lote) / step + 1e-9)
     nuevo = max(minimo, round(pasos * step, 2))
     print(
         f"  [RIESGO] SL a {distancia:.{symbol.digits}f} — con {lote} lote perderia ${lote * perdida_por_lote:.2f} "
-        f"(> tope ${MAX_RISK_USD_TRADE:.0f}). Lote ajustado a {nuevo} (${nuevo * perdida_por_lote:.2f})"
+        f"(> tope ${tope:.2f}). Lote ajustado a {nuevo} (${nuevo * perdida_por_lote:.2f})"
     )
     return nuevo
 
