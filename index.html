@@ -922,13 +922,18 @@ a{color:#148d60!important}
     <div class="page-title" style="margin:0">Backtests — Historial de rendimiento</div>
     <button onclick="loadBacktests()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Cargar</button>
   </div>
+  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;color:var(--muted)">
+    <span>Estrategia</span>
+    <select id="bt-strategy" onchange="renderBacktestCards()" style="background:var(--bg1);color:var(--text);border:1px solid var(--b1);border-radius:var(--r);padding:5px 8px;font-size:12px"></select>
+    <span id="bt-meta" style="color:var(--dim)"></span>
+  </div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px">
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Total trades</div><div style="font-size:22px;font-weight:600;font-family:var(--mono)" id="bt-total">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Ganadoras</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--green)" id="bt-wins">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Perdedoras</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--red)" id="bt-losses">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Winrate</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--gold)" id="bt-wr">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Profit factor</div><div style="font-size:22px;font-weight:600;font-family:var(--mono)" id="bt-pf">-</div></div>
-    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Drawdown</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--red)" id="bt-dd">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px" title="Máximo de pérdidas consecutivas en el backtest">Racha pérdidas</div><div style="font-size:22px;font-weight:600;font-family:var(--mono);color:var(--red)" id="bt-dd">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Mejor hora</div><div style="font-size:22px;font-weight:600;font-family:var(--mono)" id="bt-hour">-</div></div>
   </div>
   <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px">
@@ -942,7 +947,7 @@ a{color:#148d60!important}
           <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Total</th>
           <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Winrate</th>
           <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">PF</th>
-          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">DD</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Racha pérd.</th>
           <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;font-weight:600;text-transform:uppercase">Mejor hora</th>
         </tr></thead>
         <tbody id="bt-table"></tbody>
@@ -2628,34 +2633,85 @@ async function loadNews() {
 // ════════════════════════════════════════
 // BACKTESTS
 // ════════════════════════════════════════
+let btRows = [];
+
 async function loadBacktests() {
-  const { data, error } = await sb.from('backtests').select('*').order('created_at', { ascending: false }).limit(30);
+  const { data, error } = await sb.from('backtests').select('*').order('created_at', { ascending: false }).limit(60);
+  const tbody = document.getElementById('bt-table');
   if (error || !data || !data.length) {
-    const tbody = document.getElementById('bt-table');
+    btRows = [];
     if (tbody) tbody.innerHTML = '<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--dim)">No hay backtests guardados todavía.</td></tr>';
     return;
   }
-  const latest = data[0];
-  document.getElementById('bt-total').textContent = latest.total_trades || '-';
-  document.getElementById('bt-wins').textContent = latest.winning_trades || '-';
-  document.getElementById('bt-losses').textContent = latest.losing_trades || '-';
-  const wr = document.getElementById('bt-wr');
-  if (wr) { wr.textContent = (latest.winrate || 0) + '%'; wr.style.color = latest.winrate >= 60 ? 'var(--green)' : latest.winrate >= 50 ? 'var(--yellow)' : 'var(--red)'; }
-  const pf = document.getElementById('bt-pf');
-  if (pf) { pf.textContent = latest.profit_factor || '-'; pf.style.color = latest.profit_factor >= 1.5 ? 'var(--green)' : latest.profit_factor >= 1 ? 'var(--yellow)' : 'var(--red)'; }
-  document.getElementById('bt-dd').textContent = latest.drawdown || '-';
-  document.getElementById('bt-hour').textContent = latest.best_hour || '-';
-  const tbody = document.getElementById('bt-table');
-  if (tbody) tbody.innerHTML = data.map(b => `<tr style="border-bottom:1px solid var(--bg2)">
+  btRows = data;
+
+  // Las tarjetas muestran UNA estrategia (antes tomaban la ultima fila sin
+  // decir de cual estrategia era). El selector lista la corrida mas
+  // reciente de cada estrategia.
+  const sel = document.getElementById('bt-strategy');
+  const prev = sel.value;
+  const names = [...new Set(data.map(b => b.strategy || '-'))];
+  sel.innerHTML = names.map(nm => `<option value="${nm}">${nm}</option>`).join('');
+  sel.value = names.includes(prev) ? prev : names[0];
+  renderBacktestCards();
+
+  if (tbody) tbody.innerHTML = data.slice(0, 30).map(b => {
+    const ev = btEdge(b);
+    return `<tr style="border-bottom:1px solid var(--bg2)">
     <td style="padding:6px 8px;color:var(--dim)">${new Date(b.created_at).toLocaleDateString('es')}</td>
     <td style="padding:6px 8px;color:var(--text)">${b.strategy || '-'}</td>
     <td style="padding:6px 8px;font-family:var(--mono)">${b.timeframe || '-'}</td>
-    <td style="padding:6px 8px;font-family:var(--mono)">${b.total_trades || 0}</td>
-    <td style="padding:6px 8px;font-family:var(--mono);color:${(b.winrate || 0) >= 60 ? 'var(--green)' : 'var(--yellow)'}">${b.winrate || 0}%</td>
-    <td style="padding:6px 8px;font-family:var(--mono)">${b.profit_factor || 0}</td>
-    <td style="padding:6px 8px;font-family:var(--mono);color:var(--red)">${b.drawdown || 0}</td>
+    <td style="padding:6px 8px;font-family:var(--mono)">${b.total_trades ?? 0}${(b.total_trades ?? 0) < BT_MIN_SAMPLE ? ' <span style="color:var(--dim)" title="Muestra pequeña">*</span>' : ''}</td>
+    <td style="padding:6px 8px;font-family:var(--mono);color:${ev.color}">${b.winrate ?? 0}%</td>
+    <td style="padding:6px 8px;font-family:var(--mono)">${b.profit_factor ?? 'N/D'}</td>
+    <td style="padding:6px 8px;font-family:var(--mono);color:var(--red)">${b.drawdown ?? 0}</td>
     <td style="padding:6px 8px;font-family:var(--mono)">${b.best_hour || '-'}</td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
+}
+
+const BT_MIN_SAMPLE = 20;
+
+// Con PF y wins/losses se deduce la ganancia media en R y el winrate de
+// equilibrio: un 44% puede ser rentable si cada ganadora paga 1.5R.
+function btEdge(b) {
+  const w = +b.winning_trades || 0, l = +b.losing_trades || 0, pf = b.profit_factor == null ? null : +b.profit_factor;
+  if (pf == null || !w || !l) return { be: null, color: 'var(--dim)' };
+  const avgWinR = pf * l / w;
+  const be = 100 / (1 + avgWinR);
+  const wr = +b.winrate || 0;
+  const color = (w + l) < BT_MIN_SAMPLE ? 'var(--dim)' : wr >= be + 5 ? 'var(--green)' : wr >= be ? 'var(--yellow)' : 'var(--red)';
+  return { be, avgWinR, color };
+}
+
+function renderBacktestCards() {
+  const name = document.getElementById('bt-strategy').value;
+  const b = btRows.find(x => (x.strategy || '-') === name);
+  if (!b) return;
+  const total = b.total_trades ?? 0;
+  const ev = btEdge(b);
+  document.getElementById('bt-total').textContent = total;
+  document.getElementById('bt-wins').textContent = b.winning_trades ?? 0;
+  document.getElementById('bt-losses').textContent = b.losing_trades ?? 0;
+
+  const wr = document.getElementById('bt-wr');
+  wr.innerHTML = (b.winrate ?? 0) + '%' + (ev.be != null ? `<div style="font-size:10px;font-weight:400;color:var(--dim);margin-top:2px">equilibrio ${ev.be.toFixed(1)}%</div>` : '');
+  wr.style.color = ev.color;
+
+  const pf = document.getElementById('bt-pf');
+  const pfv = b.profit_factor == null ? null : +b.profit_factor;
+  pf.textContent = pfv == null ? 'N/D' : pfv;
+  pf.title = pfv == null ? 'Sin pérdidas en la muestra: no se puede calcular' : 'Ganancia total en R / pérdida total en R';
+  pf.style.color = pfv == null ? 'var(--dim)' : pfv >= 1.5 ? 'var(--green)' : pfv >= 1 ? 'var(--yellow)' : 'var(--red)';
+
+  document.getElementById('bt-dd').textContent = (b.drawdown ?? 0) + ' seguidas';
+  document.getElementById('bt-hour').textContent = b.best_hour || '-';
+
+  const days = Math.floor((Date.now() - new Date(b.created_at).getTime()) / 86400000);
+  const warn = [];
+  if (total < BT_MIN_SAMPLE) warn.push(`<span style="color:var(--yellow)">muestra pequeña (${total} trades), no es confiable</span>`);
+  if (days > 14) warn.push(`<span style="color:var(--yellow)">backtest de hace ${days} días, conviene correrlo de nuevo</span>`);
+  document.getElementById('bt-meta').innerHTML = `${b.timeframe || ''} · ${new Date(b.created_at).toLocaleDateString('es')}` + (warn.length ? ' · ' + warn.join(' · ') : '');
 }
 
 // ════════════════════════════════════════
