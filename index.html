@@ -1204,6 +1204,7 @@ function switchPage(id) {
   }
   if (id === 'signals') renderSignalsPage();
   if (id === 'pnl') loadPnlPage();
+  if (id === 'backtest') loadBacktests();
 }
 
 function rpTab(id, btn) {
@@ -2636,11 +2637,13 @@ async function loadNews() {
 let btRows = [];
 
 async function loadBacktests() {
-  const { data, error } = await sb.from('backtests').select('*').order('created_at', { ascending: false }).limit(60);
   const tbody = document.getElementById('bt-table');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--dim)">Cargando backtests...</td></tr>';
+  const { data, error } = await sb.from('backtests').select('*').order('created_at', { ascending: false }).limit(60);
   if (error || !data || !data.length) {
     btRows = [];
-    if (tbody) tbody.innerHTML = '<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--dim)">No hay backtests guardados todavía.</td></tr>';
+    const msg = error ? 'Error al leer backtests: ' + (error.message || error) : 'No hay backtests guardados todavía.';
+    if (tbody) tbody.innerHTML = `<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--dim)">${msg}</td></tr>`;
     return;
   }
   btRows = data;
