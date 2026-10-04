@@ -329,7 +329,22 @@ TRAILING_ATR_PERIOD = 14
 # de spread/volatilidad que su ATR(14) promedio no alcanzo a capturar
 # a tiempo — se agregan aqui por el mismo motivo.
 SPREAD_FILTER_STRATEGIES = ["FVG Fill M5", "CRT Kill Zone NY"]  # Sweep Displacement M1 y EMA Pullback M5 pausadas 2026-09-15
-MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "35"))  # ajustar segun spread tipico real de GOLD en XMGlobal
+# CAMBIO 2026-10-04: el spread real de GOLD en XMGlobal (tabla spread_log,
+# 14 dias) tiene mediana 55 pts y nunca bajo de 30 — con el tope fijo de 35
+# FVG Fill M5 quedo 0 ejecutadas / 15 FAILED en 30 dias. Ahora el filtro es
+# RELATIVO al riesgo de la señal: se rechaza solo si el spread (en precio)
+# supera SPREAD_MAX_RISK_RATIO de la distancia entry-SL original. Se mantiene
+# un tope absoluto MAX_SPREAD_POINTS como red de seguridad para spikes reales.
+MAX_SPREAD_POINTS = int(os.getenv("MAX_SPREAD_POINTS", "80"))
+SPREAD_MAX_RISK_RATIO = float(os.getenv("SPREAD_MAX_RISK_RATIO", "0.15"))
+
+# NUEVO 2026-10-04: rotacion entre estrategias. Antes el bot tomaba siempre
+# la señal de mayor confidence, y Trend Continuation (scores ~91-100) dejaba
+# a las demas vencer en la cola. Ahora, entre las señales que estan a
+# ROTATION_SCORE_WINDOW puntos o menos del mejor score, se prefiere la
+# estrategia que lleva mas tiempo sin abrir una operacion.
+ROTATION_SCORE_WINDOW = int(os.getenv("ROTATION_SCORE_WINDOW", "5"))
+_last_exec_by_strategy = {}  # {strategy: datetime UTC de su ultima orden abierta en esta sesion}
 
 ALLOWED_STRATEGIES = [
     "Scalping M5",
@@ -1207,6 +1222,29 @@ def get_pending_signals(current_price=None):
     return filtered
 
 
+def elegir_senal_con_rotacion(signals):
+    """signals viene ordenada por confidence desc. Entre las que estan a
+    ROTATION_SCORE_WINDOW puntos o menos de la mejor, elige la estrategia
+    que lleva mas tiempo sin abrir orden (nunca operada en esta sesion =
+    maxima prioridad). Empate: se respeta el orden original (score)."""
+    top_score = signals[0].get("confidence") or 0
+    candidatas = [
+        s for s in signals
+        if (s.get("confidence") or 0) >= top_score - ROTATION_SCORE_WINDOW
+    ]
+    nunca = datetime.min.replace(tzinfo=timezone.utc)
+    elegida = min(
+        candidatas,
+        key=lambda s: _last_exec_by_strategy.get(s.get("strategy"), nunca),
+    )
+    if elegida is not signals[0]:
+        print(
+            f"  [ROTACION] Se prefiere {elegida['strategy']} ({elegida['confidence']}) "
+            f"sobre {signals[0]['strategy']} ({signals[0]['confidence']}) — lleva mas tiempo sin operar"
+        )
+    return elegida
+
+
 def get_current_price():
     tick = mt5.symbol_info_tick(MT5_SYMBOL)
 
@@ -1216,17 +1254,32 @@ def get_current_price():
     return tick.ask, tick.bid
 
 
-def spread_actual_ok():
+def spread_actual_ok(signal):
     """Lee el spread actual del simbolo en puntos (ya calculado por MT5
     en symbol_info().spread, no hace falta recalcular ask-bid a mano).
-    Devuelve (ok, spread_points). Si no se puede leer el simbolo, se
-    deja pasar (fail-open) en vez de bloquear por un problema de datos
-    — mismo criterio que ya usa calc_anti_hunt_sl() cuando symbol_info
-    devuelve None."""
+    Devuelve (ok, spread_points, motivo). Rechaza si el spread supera el
+    tope absoluto MAX_SPREAD_POINTS o si, en precio, supera
+    SPREAD_MAX_RISK_RATIO de la distancia entry-SL de la señal. Si no se
+    puede leer el simbolo, se deja pasar (fail-open) en vez de bloquear
+    por un problema de datos — mismo criterio que ya usa
+    calc_anti_hunt_sl() cuando symbol_info devuelve None."""
     symbol = mt5.symbol_info(MT5_SYMBOL)
     if symbol is None:
-        return True, None
-    return symbol.spread <= MAX_SPREAD_POINTS, symbol.spread
+        return True, None, ""
+    spread_pts = symbol.spread
+    if spread_pts > MAX_SPREAD_POINTS:
+        return False, spread_pts, f"{spread_pts} pts > tope absoluto {MAX_SPREAD_POINTS} pts"
+    try:
+        riesgo = abs(float(signal["entry_price"]) - float(signal["stop_loss"]))
+    except (KeyError, TypeError, ValueError):
+        return True, spread_pts, ""
+    spread_precio = spread_pts * symbol.point
+    if riesgo > 0 and spread_precio > riesgo * SPREAD_MAX_RISK_RATIO:
+        return False, spread_pts, (
+            f"spread {spread_precio:.2f} > {SPREAD_MAX_RISK_RATIO:.0%} del riesgo "
+            f"de la señal ({riesgo:.2f})"
+        )
+    return True, spread_pts, ""
 
 
 def log_spread_actual():
@@ -1313,10 +1366,10 @@ def execute_order(signal):
     # cualquier otro fallo de execute_order() (ver run_cycle: marca
     # FAILED recien despues de que execute_order devuelve None).
     if signal["strategy"] in SPREAD_FILTER_STRATEGIES:
-        spread_ok, spread_pts = spread_actual_ok()
+        spread_ok, spread_pts, motivo = spread_actual_ok(signal)
         if not spread_ok:
-            print(f"  Spread actual {spread_pts} pts > maximo {MAX_SPREAD_POINTS} pts para {signal['strategy']} — orden rechazada")
-            return None, f"Spread demasiado ancho ({spread_pts} pts > {MAX_SPREAD_POINTS} max) para {signal['strategy']}"
+            print(f"  Spread actual {spread_pts} pts demasiado ancho para {signal['strategy']} ({motivo}) — orden rechazada")
+            return None, f"Spread demasiado ancho para {signal['strategy']}: {motivo}"
 
     signal_type = signal["signal_type"]
     original_sl = float(signal["stop_loss"])
@@ -1550,7 +1603,7 @@ def run_cycle():
         print(f"  [{now_str}] Sin señales pendientes con score suficiente, estrategia permitida y vigentes.")
         return
 
-    best = signals[0]
+    best = elegir_senal_con_rotacion(signals)
     sig_id = best["id"]
     sig_type = best["signal_type"]
     score = best["confidence"]
@@ -1580,6 +1633,7 @@ def run_cycle():
     tp1 = float(best["take_profit_1"])
 
     update_signal_status(sig_id, "EXECUTING")
+    _last_exec_by_strategy[strategy] = datetime.now(timezone.utc)
 
     print("\n  ORDEN EJECUTADA:")
     print(f"    Ticket: {result.order}")

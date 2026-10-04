@@ -177,6 +177,10 @@ MIN_SCORE        = 75    # Score mínimo para publicar señal (igualado a bot_en
 MAX_DAILY        = 12    # Máximo señales por día (bajado de 20 a 12, 2026-08-18: 20 era ruido excesivo en Supabase/Telegram; bot_engine.py tiene su PROPIO MAX_DAILY de ejecucion, este solo limita cuantas señales se publican)
 LOOP_INTERVAL    = 30    # Segundos entre cada análisis
 SIGNAL_COOLDOWN  = 300   # subido de 120 a 300s (2026-08-18): 120s dejaba abierta la ventana a 2-3 señales de la misma estrategia en la misma zona de liquidez antes de que cierre una vela M5
+# NUEVO 2026-10-04: tope diario POR ESTRATEGIA. Trend Continuation M3
+# publicaba 9-14 señales/dia y llenaba solo el MAX_DAILY de 12, dejando a
+# las demas sin poder publicar. Con este tope cada estrategia tiene su cupo.
+MAX_DAILY_PER_STRATEGY = int(os.getenv("MAX_DAILY_PER_STRATEGY", "4"))
 
 # Pares usados para construir el indice sintetico de fuerza del dolar.
 # Deben coincidir con los que data_engine.py sube a ohlc_candles.
@@ -268,6 +272,7 @@ def is_nyc_killzone():
 last_signal_time = {}    # {strategy: datetime} — cooldown por estrategia
 daily_count      = 0
 last_day         = None
+daily_count_by_strategy = {}  # {strategy: señales publicadas hoy}
 # ──────────────────────────────────────────────────────────────
 
 def headers():
@@ -1084,12 +1089,13 @@ def in_cooldown(strategy):
     return elapsed < SIGNAL_COOLDOWN
 
 def publish_signal(sig):
-    global daily_count, last_day, last_signal_time
+    global daily_count, last_day, last_signal_time, daily_count_by_strategy
 
     today = datetime.now(timezone.utc).date()
     if last_day != today:
         daily_count = 0
         last_day    = today
+        daily_count_by_strategy = {}
 
     if daily_count >= MAX_DAILY:
         print(f"  [SKIP] Límite diario {MAX_DAILY} señales alcanzado.")
@@ -1099,6 +1105,10 @@ def publish_signal(sig):
             f"Score: {sig['confidence']}/100 | Entry: {sig['entry_price']:.2f}\n"
             f"SL: {sig['stop_loss']:.2f} | TP1: {sig['take_profit_1']:.2f}"
         )
+        return False
+
+    if daily_count_by_strategy.get(sig["strategy"], 0) >= MAX_DAILY_PER_STRATEGY:
+        print(f"  [SKIP] {sig['strategy']} ya publico {MAX_DAILY_PER_STRATEGY} señales hoy (tope por estrategia).")
         return False
 
     if in_cooldown(sig["strategy"]):
@@ -1143,6 +1153,7 @@ def publish_signal(sig):
         return False
 
     daily_count += 1
+    daily_count_by_strategy[sig["strategy"]] = daily_count_by_strategy.get(sig["strategy"], 0) + 1
     last_signal_time[sig["strategy"]] = datetime.now(timezone.utc)
 
     msg   = telegram_signal(sig)
