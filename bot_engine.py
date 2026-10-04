@@ -244,6 +244,13 @@ LOT_POR_ESTRATEGIA = {
     "Scalping M5 SMC": 0.02,
     "CRT Kill Zone NY": 0.02,
 }
+# NUEVO 2026-10-04: tope de perdida en dolares por trade (solo con
+# USE_FIXED_LOT=true). Si con el lote de la estrategia el SL real (con
+# anti-hunt) costaria mas de MAX_RISK_USD_TRADE, se baja el lote hasta que
+# quepa, nunca por debajo del minimo del broker. No se salta ninguna señal.
+# Semana 28 sep-2 oct, Trend Continuation: con tope $20 el neto quedaba
+# igual (+$67) y el peor trade bajaba de -$99 a -$33. 0 = desactivado.
+MAX_RISK_USD_TRADE = float(os.getenv("MAX_RISK_USD_TRADE", "20"))
 MIN_SCORE = 75
 MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
 MAX_LOSSES_PER_DAY = int(os.getenv("MAX_LOSSES_PER_DAY", "2"))  # corta el dia tras N perdidas (limite general)
@@ -1348,6 +1355,31 @@ def validate_signal(signal):
     return True, "OK"
 
 
+def ajustar_lote_por_riesgo_usd(lote, price, sl):
+    """Baja el lote (en pasos del broker) si la perdida hasta el SL supera
+    MAX_RISK_USD_TRADE. Usa trade_tick_value/trade_tick_size de MT5 para
+    convertir distancia de precio a dolares. Si no hay datos del simbolo,
+    deja el lote como viene (fail-open, igual que spread_actual_ok)."""
+    if MAX_RISK_USD_TRADE <= 0:
+        return lote
+    symbol = mt5.symbol_info(MT5_SYMBOL)
+    if symbol is None or not symbol.trade_tick_size or not symbol.trade_tick_value:
+        return lote
+    distancia = abs(price - sl)
+    perdida_por_lote = distancia / symbol.trade_tick_size * symbol.trade_tick_value
+    if perdida_por_lote <= 0 or lote * perdida_por_lote <= MAX_RISK_USD_TRADE:
+        return lote
+    step = symbol.volume_step or 0.01
+    minimo = symbol.volume_min or step
+    pasos = int((MAX_RISK_USD_TRADE / perdida_por_lote) / step + 1e-9)
+    nuevo = max(minimo, round(pasos * step, 2))
+    print(
+        f"  [RIESGO] SL a {distancia:.2f} — con {lote} lote perderia ${lote * perdida_por_lote:.2f} "
+        f"(> tope ${MAX_RISK_USD_TRADE:.0f}). Lote ajustado a {nuevo} (${nuevo * perdida_por_lote:.2f})"
+    )
+    return nuevo
+
+
 def execute_order(signal):
     is_valid, reason = validate_signal(signal)
     if not is_valid:
@@ -1384,6 +1416,7 @@ def execute_order(signal):
     if USE_FIXED_LOT:
         lote = LOT_POR_ESTRATEGIA.get(signal["strategy"], FIXED_LOT_SIZE)
         print(f"  [RIESGO] Lote por estrategia: {lote} ({signal['strategy']}, USE_FIXED_LOT=true)")
+        lote = ajustar_lote_por_riesgo_usd(lote, price, sl)
     else:
         lote, detalle = calculate_lot_size(
             mt5=mt5,
