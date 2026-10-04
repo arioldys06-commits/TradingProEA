@@ -340,7 +340,7 @@ button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px soli
 #nb-chart::before{content:"⌁"}#nb-signals::before{content:"◈"}#nb-desk::before{content:"◎"}
 #nb-scalping::before{content:"ϟ"}#nb-smc::before{content:"◇"}#nb-multitf::before{content:"▥"}
 #nb-bot::before{content:"BOT";font-size:8px}#nb-backtest::before{content:"∿"}#nb-ai::before{content:"AI";font-size:9px}
-#nb-news::before{content:"≡"}#nb-risk::before{content:"%"}#nb-pnl::before{content:"$"}
+#nb-news::before{content:"≡"}#nb-risk::before{content:"%"}#nb-pnl::before{content:"$"}#nb-clientes::before{content:"CL";font-size:9px}
 .nav-btn:hover{background:var(--bg2);color:var(--text);transform:translateX(1px)}
 .nav-btn.active{background:linear-gradient(145deg,rgba(244,185,66,.2),rgba(244,185,66,.08));color:var(--gold);box-shadow:inset 0 0 0 1px rgba(244,185,66,.2),0 8px 20px rgba(0,0,0,.18)}
 .nav-btn.active::after{content:"";position:absolute;left:-11px;width:3px;height:18px;border-radius:3px;background:var(--gold);box-shadow:0 0 12px rgba(244,185,66,.45)}
@@ -536,6 +536,7 @@ a{color:#148d60!important}
       <button class="nav-btn" id="nb-news" title="Noticias" onclick="switchPage('news')">📰</button>
       <button class="nav-btn" id="nb-risk" title="Gestión riesgo" onclick="switchPage('risk')">🧮</button>
       <button class="nav-btn" id="nb-pnl" title="P&amp;L Real" onclick="switchPage('pnl')">💰</button>
+      <button class="nav-btn" id="nb-clientes" title="Clientes" onclick="switchPage('clientes')">👥</button>
     </nav>
 
     <!-- MAIN CONTENT -->
@@ -1077,6 +1078,33 @@ a{color:#148d60!important}
   </div>
 </div>
 
+      <div id="page-clientes" class="page" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <div class="page-title" style="margin:0">Clientes — acceso a señales</div>
+    <button onclick="loadClientes()" style="background:var(--gold);color:#000;border:none;border-radius:var(--r);padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">↻ Cargar</button>
+  </div>
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px;margin-bottom:12px;font-size:12px;color:var(--muted);line-height:1.6">
+    Los clientes entran en <b id="cl-url" style="font-family:var(--mono)"></b>, crean su cuenta y aquí apruebas su correo. Solo ven señales activas, historial y winrate; no ven tu P&amp;L, el bot ni los backtests.
+  </div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+    <input id="cl-email" type="email" placeholder="correo@cliente.com" style="flex:1;min-width:200px;background:var(--bg);color:var(--text);border:1px solid var(--b1);border-radius:var(--r);padding:7px 10px;font-size:12px">
+    <input id="cl-nombre" type="text" placeholder="Nombre (opcional)" style="flex:1;min-width:150px;background:var(--bg);color:var(--text);border:1px solid var(--b1);border-radius:var(--r);padding:7px 10px;font-size:12px">
+    <button onclick="addCliente()" style="background:var(--green);color:#fff;border:none;border-radius:var(--r);padding:7px 14px;font-size:12px;font-weight:600;cursor:pointer">Aprobar correo</button>
+  </div>
+  <div id="cl-msg" style="font-size:12px;color:var(--muted);margin-bottom:8px"></div>
+  <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px;overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="border-bottom:1px solid var(--b1)">
+        <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase">Correo</th>
+        <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase">Nombre</th>
+        <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase">Desde</th>
+        <th style="padding:6px 8px;text-align:left;color:var(--dim);font-size:10px;text-transform:uppercase">Acceso</th>
+      </tr></thead>
+      <tbody id="cl-table"></tbody>
+    </table>
+  </div>
+      </div>
+
       <div id="page-pnl" class="page" style="display:none">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
     <div class="page-title" style="margin:0">P&amp;L Real — Trades ejecutados</div>
@@ -1133,6 +1161,10 @@ async function doLogin() {
   msg.textContent = 'Conectando...'; msg.className = 'login-msg';
   const { data, error } = await sb.auth.signInWithPassword({ email: em, password: pw });
   if (error) { msg.textContent = error.message; msg.className = 'login-msg err'; return; }
+  // Solo el admin usa el panel completo; los clientes van a la vista de señales.
+  // Si la tabla admins todavia no existe (migracion sin correr) se deja pasar.
+  const adm = await sb.from('admins').select('email').eq('email', data.user.email.toLowerCase()).maybeSingle();
+  if (!adm.error && !adm.data) { location.href = '/clientes.html'; return; }
   document.getElementById('loginWrap').style.display = 'none';
   document.getElementById('app').classList.add('active');
   document.getElementById('topUser').textContent = data.user.email.split('@')[0];
@@ -1205,6 +1237,7 @@ function switchPage(id) {
   if (id === 'signals') renderSignalsPage();
   if (id === 'pnl') loadPnlPage();
   if (id === 'backtest') loadBacktests();
+  if (id === 'clientes') loadClientes();
 }
 
 function rpTab(id, btn) {
@@ -2715,6 +2748,44 @@ function renderBacktestCards() {
   if (total < BT_MIN_SAMPLE) warn.push(`<span style="color:var(--yellow)">muestra pequeña (${total} trades), no es confiable</span>`);
   if (days > 14) warn.push(`<span style="color:var(--yellow)">backtest de hace ${days} días, conviene correrlo de nuevo</span>`);
   document.getElementById('bt-meta').innerHTML = `${b.timeframe || ''} · ${new Date(b.created_at).toLocaleDateString('es')}` + (warn.length ? ' · ' + warn.join(' · ') : '');
+}
+
+// ════════════════════════════════════════
+// CLIENTES (acceso a la vista de señales)
+// ════════════════════════════════════════
+const escHtml = v => String(v ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+
+async function loadClientes() {
+  document.getElementById('cl-url').textContent = location.origin + '/clientes.html';
+  const tbody = document.getElementById('cl-table');
+  const { data, error } = await sb.from('clientes').select('*').order('created_at', { ascending: false });
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="4" style="padding:14px;color:var(--dim)">No se pudo leer la tabla clientes: ${escHtml(error.message)}. ¿Ya corriste la migración de roles en Supabase?</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.length ? data.map(c => `<tr style="border-bottom:1px solid var(--bg2)">
+    <td style="padding:6px 8px;font-family:var(--mono)">${escHtml(c.email)}</td>
+    <td style="padding:6px 8px">${escHtml(c.nombre) || '-'}</td>
+    <td style="padding:6px 8px;color:var(--dim)">${new Date(c.created_at).toLocaleDateString('es')}</td>
+    <td style="padding:6px 8px"><button data-email="${escHtml(c.email)}" data-activo="${c.activo ? '1' : '0'}" onclick="toggleCliente(this)" style="background:${c.activo ? 'rgba(34,197,94,.12)' : 'var(--bg2)'};color:${c.activo ? 'var(--green)' : 'var(--dim)'};border:1px solid var(--b1);border-radius:var(--r);padding:4px 10px;font-size:11px;cursor:pointer">${c.activo ? 'Activo — quitar' : 'Sin acceso — activar'}</button></td>
+  </tr>`).join('') : '<tr><td colspan="4" style="padding:14px;color:var(--dim)">Todavía no hay clientes aprobados.</td></tr>';
+}
+
+async function addCliente() {
+  const email = document.getElementById('cl-email').value.trim().toLowerCase();
+  const nombre = document.getElementById('cl-nombre').value.trim() || null;
+  const msg = document.getElementById('cl-msg');
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { msg.textContent = 'Escribe un correo válido.'; return; }
+  const { error } = await sb.from('clientes').upsert({ email, nombre, activo: true });
+  msg.textContent = error ? 'Error: ' + error.message : email + ' aprobado. Ya puede entrar a ver señales.';
+  if (!error) { document.getElementById('cl-email').value = ''; document.getElementById('cl-nombre').value = ''; loadClientes(); }
+}
+
+async function toggleCliente(btn) {
+  const email = btn.dataset.email, activo = btn.dataset.activo !== '1';
+  const { error } = await sb.from('clientes').update({ activo }).eq('email', email);
+  document.getElementById('cl-msg').textContent = error ? 'Error: ' + error.message : email + (activo ? ' activado.' : ' sin acceso.');
+  loadClientes();
 }
 
 // ════════════════════════════════════════
