@@ -1250,17 +1250,33 @@ function isSignalFreshForTopScore(sig) {
 }
 
 async function refreshAll() {
-  const [a, s, candles] = await Promise.all([
+  // M5 y H1 en consultas separadas: antes venian mezcladas sin la columna
+  // timeframe, asi que todo se trataba como M5 (ATR mezclado, Asia vacio).
+  const [a, s, m5r, h1r, h4] = await Promise.all([
     sb.from('analysis_results').select('*').order('created_at', { ascending: false }).limit(1).maybeSingle(),
     sb.from('signals').select('*').order('created_at', { ascending: false }).limit(20),
-    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').in('timeframe', ['M5', 'H1']).order('candle_time', { ascending: false }).limit(100)
+    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'M5').order('candle_time', { ascending: false }).limit(100),
+    sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'H1').order('candle_time', { ascending: false }).limit(100),
+    deskCloses('XAUUSD', 'H4', 200)
   ]);
-  currentAnalysis = a.data;
   currentSignals = s.data || [];
-  const c = candles.data || [];
+  const m5 = m5r.data || [];
+  const h1 = h1r.data || [];
+  const c = m5.concat(h1);
 
-  const m5 = c.filter(x => x.timeframe === 'M5' || !x.timeframe);
-  const h1 = c.filter(x => x.timeframe === 'H1');
+  // analysis_results esta vacia (ningun proceso la llena): si no hay fila,
+  // se arma el analisis con las velas para que sesgo/PDH/PDL no queden en "-".
+  currentAnalysis = a.data;
+  if (!currentAnalysis && h1.length) {
+    const lastC = +(m5[0] || h1[0]).close;
+    const d1 = deskD1Bias(h4, lastC);
+    const pd = deskPrevDay(h1.slice().reverse());
+    currentAnalysis = {
+      trend: d1 === 'BUY' ? 'ALCISTA' : d1 === 'SELL' ? 'BAJISTA' : 'LATERAL',
+      weekly_high: pd ? pd.high : null,
+      weekly_low: pd ? pd.low : null
+    };
+  }
   const latest = m5[0] || h1[0] || c[0];
   if (latest) {
     const price = n(latest.close);
@@ -2064,6 +2080,19 @@ async function deskDxyTrend() {
 
 // Sesgo D1: cierres diarios armados con velas H4 (orden ascendente), precio
 // vs EMA20 diaria y su pendiente. Devuelve BUY / SELL / NEUTRAL, o null si faltan velas.
+// Maximo y minimo del dia de trading anterior con velas H1 (orden ascendente).
+// El dia de oro abre a las 22:00 UTC, por eso se corre la fecha 2 horas.
+function deskPrevDay(h1) {
+  const dayOf = c => new Date(new Date(c.candle_time).getTime() + 2 * 3600 * 1000).toISOString().slice(0, 10);
+  if (!h1.length) return null;
+  const today = dayOf(h1[h1.length - 1]);
+  const prev = h1.filter(c => dayOf(c) < today);
+  if (!prev.length) return null;
+  const pDay = dayOf(prev[prev.length - 1]);
+  const rows = prev.filter(c => dayOf(c) === pDay);
+  return { high: Math.max(...rows.map(c => +c.high)), low: Math.min(...rows.map(c => +c.low)) };
+}
+
 function deskD1Bias(h4, last) {
   const days = {};
   h4.forEach(c => { days[c.candle_time.slice(0, 10)] = +c.close; });
@@ -2149,12 +2178,12 @@ async function loadDesk() {
     : '<div style="padding:6px 10px;background:var(--bg2);border:1px solid var(--b1);border-radius:var(--r);color:var(--dim);font-size:12px">Fuera de killzone — próxima: ' + (t < 300 ? 'London 3 AM' : t < 900 ? 'NY 9 AM' : 'London mañana') + ' RD</div>';
 
   const { data: h1raw } = await sb.from('ohlc_candles').select('candle_time,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'H1').order('candle_time', { ascending: false }).limit(50);
-  if (h1raw && h1raw.length >= 24) {
-    const yesterday = h1raw.slice(24, 48);
-    const pdh = Math.max(...yesterday.map(c => +c.high));
-    const pdl = Math.min(...yesterday.map(c => +c.low));
-    document.getElementById('dk-pdh').textContent = n(pdh);
-    document.getElementById('dk-pdl').textContent = n(pdl);
+  // Dia de trading anterior real (antes tomaba "24 a 48 velas atras", que
+  // tras un fin de semana caia en el jueves).
+  const pd = deskPrevDay((h1raw || []).slice().reverse());
+  if (pd) {
+    document.getElementById('dk-pdh').textContent = n(pd.high);
+    document.getElementById('dk-pdl').textContent = n(pd.low);
   }
 
   const { data: m5raw } = await sb.from('ohlc_candles').select('candle_time,open,high,low,close').eq('instrument', 'XAUUSD').eq('timeframe', 'M5').order('candle_time', { ascending: false }).limit(30);
