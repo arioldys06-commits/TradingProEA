@@ -219,6 +219,37 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@XAUUSD_Signals_DR")
 MT5_SYMBOL = os.getenv("MT5_SYMBOL", "GOLD")
 
+# ── Multi-mercado (NUEVO 2026-10-04) ──
+# El bot puede tener UNA posicion abierta POR MERCADO al mismo tiempo
+# (ej. una en oro y otra en EURUSD), nunca dos en el mismo mercado.
+# La columna `instrument` de la tabla signals dice a que mercado va
+# cada señal (default XAUUSD). Los limites diarios (MAX_DAILY, perdidas
+# por dia/killzone) siguen siendo UNO SOLO para toda la cuenta.
+MT5_SYMBOL_EURUSD = os.getenv("MT5_SYMBOL_EURUSD", "EURUSD")
+INSTRUMENT_TO_MT5 = {"XAUUSD": MT5_SYMBOL, "EURUSD": MT5_SYMBOL_EURUSD}
+MT5_TO_INSTRUMENT = {v: k for k, v in INSTRUMENT_TO_MT5.items()}
+BOT_INSTRUMENTS = [
+    x.strip().upper()
+    for x in os.getenv("BOT_INSTRUMENTS", "XAUUSD,EURUSD").split(",")
+    if x.strip()
+]
+# Anti-hunt en PRECIO para EURUSD. El de oro (SL_EXTRA_PTS * point * 10 =
+# $3) en EURUSD equivaldria a 300 pips. Default 2 pips.
+SL_EXTRA_PRICE_EURUSD = float(os.getenv("SL_EXTRA_PRICE_EURUSD", "0.0002"))
+
+
+def mt5_symbol_for(instrument):
+    return INSTRUMENT_TO_MT5.get((instrument or "XAUUSD").upper(), MT5_SYMBOL)
+
+
+def instrument_for_symbol(symbol_name):
+    return MT5_TO_INSTRUMENT.get(symbol_name, "XAUUSD")
+
+
+def symbol_digits(symbol_name):
+    info = mt5.symbol_info(symbol_name)
+    return info.digits if info is not None else 2
+
 # ─── PARAMETROS DEL BOT ───────────────────────────────────────
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))  # % del balance arriesgado por operacion
 LOT_SIZE_FALLBACK = 0.02  # solo se usa si el calculo dinamico falla (ver execute_order)
@@ -237,6 +268,7 @@ FIXED_LOT_SIZE = float(os.getenv("FIXED_LOT_SIZE", "0.02"))
 LOT_POR_ESTRATEGIA = {
     "Trend Continuation M5": 0.03,
     "Trend Continuation M3": 0.03,
+    "Trend Continuation M3 EURUSD": float(os.getenv("LOT_EURUSD", "0.01")),
     "FVG Fill M5": 0.03,
     "Mean Reversion BB M15": 0.02,
     "Liquidity Sweep": 0.02,
@@ -366,6 +398,7 @@ ALLOWED_STRATEGIES = [
     "TradingPro AI Elite",
     "Trend Continuation M5",
     "Trend Continuation M3",
+    "Trend Continuation M3 EURUSD",
     "Mean Reversion BB M15",
     "CRT Kill Zone NY",
 ]
@@ -533,6 +566,19 @@ def connect_mt5():
         if not selected:
             raise RuntimeError(f"No se pudo activar el simbolo {MT5_SYMBOL}.")
 
+    # Mercados extra: si no existen en el broker se avisa y se sigue
+    # operando oro normalmente (no se tumba el bot por esto).
+    for instrument in BOT_INSTRUMENTS:
+        sym = mt5_symbol_for(instrument)
+        if sym == MT5_SYMBOL:
+            continue
+        info = mt5.symbol_info(sym)
+        if info is None:
+            print(f"  AVISO: simbolo {sym} ({instrument}) no existe en MT5 — revisa MT5_SYMBOL_{instrument} en .env")
+            continue
+        if not info.visible and not mt5.symbol_select(sym, True):
+            print(f"  AVISO: no se pudo activar {sym} ({instrument}) en Market Watch")
+
     return account
 
 
@@ -618,8 +664,10 @@ def get_outside_killzone_losses():
     return total - london_losses - nyc_losses
 
 
-def get_open_positions():
-    positions = mt5.positions_get(symbol=MT5_SYMBOL)
+def get_open_positions(symbol=None):
+    """Posiciones abiertas del bot (MAGIC_NUMBER). symbol=None trae las
+    de todos los mercados."""
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
 
     if positions is None:
         return []
@@ -629,7 +677,7 @@ def get_open_positions():
 
 # ── Gestion de salida por cambio de estructura (CHoCH) ─────────
 
-def get_recent_m5_candles(limit=30):
+def get_recent_m5_candles(limit=30, instrument="XAUUSD"):
     """Trae las ultimas velas M5 de Supabase (mismo origen que usa
     signal_engine.py) para poder evaluar CHoCH sobre una posicion
     ya abierta."""
@@ -641,7 +689,7 @@ def get_recent_m5_candles(limit=30):
             headers=headers(),
             params={
                 "select":     "candle_time,high,low,close",
-                "instrument": "eq.XAUUSD",
+                "instrument": f"eq.{instrument}",
                 "timeframe":  "eq.M5",
                 "order":      "candle_time.desc",
                 "limit":      str(limit),
@@ -764,7 +812,7 @@ def close_position_market(position, motivo=""):
     en contra, y para el cierre por tiempo (time-stop) — no espera a
     que el precio toque SL o TP1.
     """
-    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    tick = mt5.symbol_info_tick(position.symbol)
     if tick is None:
         return False, None, "Sin precio disponible en MT5 para cerrar la posicion"
 
@@ -773,7 +821,7 @@ def close_position_market(position, motivo=""):
 
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
-        "symbol":       MT5_SYMBOL,
+        "symbol":       position.symbol,
         "volume":       position.volume,
         "type":         mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
         "position":     position.ticket,
@@ -825,12 +873,13 @@ def calc_atr_m5(candles, period=14):
 def modify_position_sltp(position, new_sl, new_tp=None):
     """Modifica el SL (y opcionalmente TP) de una posicion real ya
     abierta en MT5, sin cerrarla."""
+    digits = symbol_digits(position.symbol)
     request = {
         "action":   mt5.TRADE_ACTION_SLTP,
-        "symbol":   MT5_SYMBOL,
+        "symbol":   position.symbol,
         "position": position.ticket,
-        "sl":       round(new_sl, 2),
-        "tp":       round(new_tp if new_tp is not None else position.tp, 2),
+        "sl":       round(new_sl, digits),
+        "tp":       round(new_tp if new_tp is not None else position.tp, digits),
     }
     result = mt5.order_send(request)
 
@@ -866,10 +915,12 @@ def check_breakeven(position, side, now_str):
     # retroceso real de proteccion. Ahora se reconoce "ya protegido"
     # si el SL esta EN O MAS ALLA de la entrada (a favor del trade),
     # sin importar cuanto haya avanzado el trailing.
+    info = mt5.symbol_info(position.symbol)
+    tol = info.point if info is not None else 0.01  # 0.01 en oro, igual que antes
     if position.sl:
         ya_protegido = (
-            (side == "BUY" and position.sl >= entry - 0.01) or
-            (side == "SELL" and position.sl <= entry + 0.01)
+            (side == "BUY" and position.sl >= entry - tol) or
+            (side == "SELL" and position.sl <= entry + tol)
         )
         if ya_protegido:
             _breakeven_applied.add(position.ticket)
@@ -882,7 +933,7 @@ def check_breakeven(position, side, now_str):
     if distancia_total <= 0:
         return False
 
-    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    tick = mt5.symbol_info_tick(position.symbol)
     if tick is None:
         return False
 
@@ -931,14 +982,15 @@ def check_trailing_stop(position, side, now_str):
     if position.ticket not in _breakeven_applied:
         return False
 
-    candles = get_recent_m5_candles(30)
+    candles = get_recent_m5_candles(30, instrument_for_symbol(position.symbol))
     atr = calc_atr_m5(candles, TRAILING_ATR_PERIOD)
     if atr <= 0:
         return False
 
-    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    tick = mt5.symbol_info_tick(position.symbol)
     if tick is None:
         return False
+    digits = symbol_digits(position.symbol)
 
     entry = position.price_open
     precio_actual = tick.bid if side == "BUY" else tick.ask
@@ -958,13 +1010,13 @@ def check_trailing_stop(position, side, now_str):
     #   2. la base de comparacion tambien se corrige a "al menos la
     #      entrada", para no comparar contra el SL viejo desactualizado.
     if side == "BUY":
-        nuevo_sl = round(precio_actual - distancia, 2)
+        nuevo_sl = round(precio_actual - distancia, digits)
         nuevo_sl = max(nuevo_sl, entry)  # nunca peor que breakeven
         sl_base = max(position.sl, entry) if position.sl else entry
         if nuevo_sl <= sl_base:
             return False
     else:
-        nuevo_sl = round(precio_actual + distancia, 2)
+        nuevo_sl = round(precio_actual + distancia, digits)
         nuevo_sl = min(nuevo_sl, entry)  # nunca peor que breakeven
         sl_base = min(position.sl, entry) if position.sl else entry
         if nuevo_sl >= sl_base:
@@ -1087,7 +1139,7 @@ def check_choch_exit(position, side, sig_id, strategy, now_str):
     if strategy not in EARLY_EXIT_STRATEGIES:
         return False
 
-    candles = get_recent_m5_candles(30)
+    candles = get_recent_m5_candles(30, instrument_for_symbol(position.symbol))
     choch = detect_choch(candles)
 
     if not choch or choch == side:
@@ -1166,7 +1218,7 @@ def is_signal_stale(signal, current_price):
     return False, "OK"
 
 
-def get_pending_signals(current_price=None):
+def get_pending_signals(instrumentos_libres=None):
     """Obtiene señales PENDING con confidence >= MIN_SCORE, estrategia permitida y vigentes."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("ERROR: Faltan SUPABASE_URL o SUPABASE_KEY en .env")
@@ -1177,7 +1229,7 @@ def get_pending_signals(current_price=None):
         f"?status=eq.PENDING"
         f"&result=is.null"
         f"&confidence=gte.{MIN_SCORE}"
-        f"&select=id,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at"
+        f"&select=id,instrument,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at"
         f"&order=confidence.desc,created_at.desc"
         f"&limit=10"
     )
@@ -1204,6 +1256,16 @@ def get_pending_signals(current_price=None):
             excluded.append(strategy)
             continue
 
+        instrument = (signal.get("instrument") or "XAUUSD").upper()
+        if instrument not in BOT_INSTRUMENTS:
+            excluded.append(f"{strategy} [{instrument} no habilitado]")
+            continue
+        # Mercado con posicion abierta: la señal se deja PENDING (puede
+        # vencer sola por edad) — no se ejecuta mientras ese mercado este ocupado.
+        if instrumentos_libres is not None and instrument not in instrumentos_libres:
+            continue
+
+        current_price = get_current_price(mt5_symbol_for(instrument))[0]
         is_stale, reason = is_signal_stale(signal, current_price)
         if is_stale:
             stale.append((signal.get("id", "")[:8], reason))
@@ -1252,8 +1314,8 @@ def elegir_senal_con_rotacion(signals):
     return elegida
 
 
-def get_current_price():
-    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+def get_current_price(symbol_name=None):
+    tick = mt5.symbol_info_tick(symbol_name or MT5_SYMBOL)
 
     if tick is None:
         return None, None
@@ -1261,7 +1323,7 @@ def get_current_price():
     return tick.ask, tick.bid
 
 
-def spread_actual_ok(signal):
+def spread_actual_ok(signal, symbol_name=None):
     """Lee el spread actual del simbolo en puntos (ya calculado por MT5
     en symbol_info().spread, no hace falta recalcular ask-bid a mano).
     Devuelve (ok, spread_points, motivo). Rechaza si el spread supera el
@@ -1270,7 +1332,7 @@ def spread_actual_ok(signal):
     puede leer el simbolo, se deja pasar (fail-open) en vez de bloquear
     por un problema de datos — mismo criterio que ya usa
     calc_anti_hunt_sl() cuando symbol_info devuelve None."""
-    symbol = mt5.symbol_info(MT5_SYMBOL)
+    symbol = mt5.symbol_info(symbol_name or MT5_SYMBOL)
     if symbol is None:
         return True, None, ""
     spread_pts = symbol.spread
@@ -1283,8 +1345,8 @@ def spread_actual_ok(signal):
     spread_precio = spread_pts * symbol.point
     if riesgo > 0 and spread_precio > riesgo * SPREAD_MAX_RISK_RATIO:
         return False, spread_pts, (
-            f"spread {spread_precio:.2f} > {SPREAD_MAX_RISK_RATIO:.0%} del riesgo "
-            f"de la señal ({riesgo:.2f})"
+            f"spread {spread_precio:.{symbol.digits}f} > {SPREAD_MAX_RISK_RATIO:.0%} del riesgo "
+            f"de la señal ({riesgo:.{symbol.digits}f})"
         )
     return True, spread_pts, ""
 
@@ -1310,18 +1372,23 @@ def log_spread_actual():
         print(f"  [SPREAD_LOG] fallo al registrar spread: {e}")
 
 
-def calc_anti_hunt_sl(signal_type, original_sl):
-    symbol = mt5.symbol_info(MT5_SYMBOL)
+def calc_anti_hunt_sl(signal_type, original_sl, symbol_name=None):
+    symbol_name = symbol_name or MT5_SYMBOL
+    symbol = mt5.symbol_info(symbol_name)
 
     if symbol is None:
         return round(original_sl, 2)
 
-    extra = SL_EXTRA_PTS * symbol.point * 10
+    digits = symbol.digits
+    if symbol_name == MT5_SYMBOL:
+        extra = SL_EXTRA_PTS * symbol.point * 10  # oro: igual que siempre
+    else:
+        extra = SL_EXTRA_PRICE_EURUSD
 
     if signal_type == "BUY":
-        return round(original_sl - extra, 2)
+        return round(original_sl - extra, digits)
 
-    return round(original_sl + extra, 2)
+    return round(original_sl + extra, digits)
 
 
 def validate_signal(signal):
@@ -1355,14 +1422,14 @@ def validate_signal(signal):
     return True, "OK"
 
 
-def ajustar_lote_por_riesgo_usd(lote, price, sl):
+def ajustar_lote_por_riesgo_usd(lote, price, sl, symbol_name=None):
     """Baja el lote (en pasos del broker) si la perdida hasta el SL supera
     MAX_RISK_USD_TRADE. Usa trade_tick_value/trade_tick_size de MT5 para
     convertir distancia de precio a dolares. Si no hay datos del simbolo,
     deja el lote como viene (fail-open, igual que spread_actual_ok)."""
     if MAX_RISK_USD_TRADE <= 0:
         return lote
-    symbol = mt5.symbol_info(MT5_SYMBOL)
+    symbol = mt5.symbol_info(symbol_name or MT5_SYMBOL)
     if symbol is None or not symbol.trade_tick_size or not symbol.trade_tick_value:
         return lote
     distancia = abs(price - sl)
@@ -1374,7 +1441,7 @@ def ajustar_lote_por_riesgo_usd(lote, price, sl):
     pasos = int((MAX_RISK_USD_TRADE / perdida_por_lote) / step + 1e-9)
     nuevo = max(minimo, round(pasos * step, 2))
     print(
-        f"  [RIESGO] SL a {distancia:.2f} — con {lote} lote perderia ${lote * perdida_por_lote:.2f} "
+        f"  [RIESGO] SL a {distancia:.{symbol.digits}f} — con {lote} lote perderia ${lote * perdida_por_lote:.2f} "
         f"(> tope ${MAX_RISK_USD_TRADE:.0f}). Lote ajustado a {nuevo} (${nuevo * perdida_por_lote:.2f})"
     )
     return nuevo
@@ -1386,7 +1453,8 @@ def execute_order(signal):
         print(f"  Señal invalida: {reason}")
         return None, f"Señal invalida: {reason}"
 
-    ask, bid = get_current_price()
+    sym = mt5_symbol_for(signal.get("instrument"))
+    ask, bid = get_current_price(sym)
     if ask is None or bid is None:
         print("  Sin precio disponible en MT5.")
         return None, "Sin precio disponible en MT5 (symbol_info_tick devolvio None)"
@@ -1398,7 +1466,7 @@ def execute_order(signal):
     # cualquier otro fallo de execute_order() (ver run_cycle: marca
     # FAILED recien despues de que execute_order devuelve None).
     if signal["strategy"] in SPREAD_FILTER_STRATEGIES:
-        spread_ok, spread_pts, motivo = spread_actual_ok(signal)
+        spread_ok, spread_pts, motivo = spread_actual_ok(signal, sym)
         if not spread_ok:
             print(f"  Spread actual {spread_pts} pts demasiado ancho para {signal['strategy']} ({motivo}) — orden rechazada")
             return None, f"Spread demasiado ancho para {signal['strategy']}: {motivo}"
@@ -1406,7 +1474,7 @@ def execute_order(signal):
     signal_type = signal["signal_type"]
     original_sl = float(signal["stop_loss"])
     tp1 = float(signal["take_profit_1"])
-    sl = calc_anti_hunt_sl(signal_type, original_sl)
+    sl = calc_anti_hunt_sl(signal_type, original_sl, sym)
 
     order_type = mt5.ORDER_TYPE_BUY if signal_type == "BUY" else mt5.ORDER_TYPE_SELL
     price = ask if signal_type == "BUY" else bid
@@ -1416,11 +1484,11 @@ def execute_order(signal):
     if USE_FIXED_LOT:
         lote = LOT_POR_ESTRATEGIA.get(signal["strategy"], FIXED_LOT_SIZE)
         print(f"  [RIESGO] Lote por estrategia: {lote} ({signal['strategy']}, USE_FIXED_LOT=true)")
-        lote = ajustar_lote_por_riesgo_usd(lote, price, sl)
+        lote = ajustar_lote_por_riesgo_usd(lote, price, sl, sym)
     else:
         lote, detalle = calculate_lot_size(
             mt5=mt5,
-            symbol=MT5_SYMBOL,
+            symbol=sym,
             entry_price=price,
             stop_loss=sl,
             balance=account.balance if account else 0,
@@ -1442,7 +1510,7 @@ def execute_order(signal):
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": MT5_SYMBOL,
+        "symbol": sym,
         "volume": lote,
         "type": order_type,
         "price": price,
@@ -1540,12 +1608,13 @@ def run_cycle():
     # NUEVAS, nunca la gestion de una posicion que ya esta en curso —
     # de hecho, es justo cuando el bot esta "pausado" por limites que mas
     # importa que la posicion abierta siga protegida activamente.
+    # CAMBIO 2026-10-04 (multi-mercado): se gestionan TODAS las posiciones
+    # abiertas del bot (una por mercado como maximo), no solo la primera.
     open_positions = get_open_positions()
-    if open_positions:
-        pos = open_positions[0]
+    for pos in open_positions:
         side = "BUY" if pos.type == 0 else "SELL"
         print(
-            f"  [{now_str}] Posicion abierta: ticket {pos.ticket} | {side} | "
+            f"  [{now_str}] Posicion abierta: {pos.symbol} | ticket {pos.ticket} | {side} | "
             f"Profit: ${round(pos.profit, 2)}"
         )
 
@@ -1564,9 +1633,13 @@ def run_cycle():
         if not cerrada_por_tiempo and strategy in EARLY_EXIT_STRATEGIES:
             check_choch_exit(pos, side, sig_id, strategy, now_str)
 
+    # Mercados sin posicion abierta del bot: solo en esos se puede abrir.
+    ocupados = {instrument_for_symbol(p.symbol) for p in open_positions}
+    instrumentos_libres = [i for i in BOT_INSTRUMENTS if i not in ocupados]
+    if not instrumentos_libres:
         return
 
-    # ── A partir de aqui NO hay posicion abierta: los limites solo
+    # ── A partir de aqui hay al menos un mercado libre: los limites solo
     # deciden si se permite ABRIR una operacion nueva. ──
 
     daily_count = get_daily_count()
@@ -1631,9 +1704,12 @@ def run_cycle():
                 _kz_loss_alert_sent[alert_key] = True
             return
 
-    signals = get_pending_signals(current_price=get_current_price()[0])
+    signals = get_pending_signals(instrumentos_libres)
     if not signals:
-        print(f"  [{now_str}] Sin señales pendientes con score suficiente, estrategia permitida y vigentes.")
+        print(
+            f"  [{now_str}] Sin señales pendientes con score suficiente, estrategia permitida y vigentes "
+            f"(mercados libres: {', '.join(instrumentos_libres)})."
+        )
         return
 
     best = elegir_senal_con_rotacion(signals)
@@ -1641,8 +1717,10 @@ def run_cycle():
     sig_type = best["signal_type"]
     score = best["confidence"]
     strategy = best["strategy"]
+    instrument = (best.get("instrument") or "XAUUSD").upper()
+    sym = mt5_symbol_for(instrument)
 
-    print(f"\n  [{now_str}] Señal encontrada: {sig_type} | Score: {score}/100 | {strategy}")
+    print(f"\n  [{now_str}] Señal encontrada: {instrument} {sig_type} | Score: {score}/100 | {strategy}")
     print("  Ejecutando orden en MT5...")
 
     result, error_detail = execute_order(best)
@@ -1652,7 +1730,7 @@ def run_cycle():
         log_error_to_file(f"Señal {sig_id[:8]} ({sig_type}, score {score}, {strategy}): {error_detail}")
         update_signal_status(sig_id, "FAILED")
         send_telegram(
-            f"[BOT] ORDEN FALLIDA - {sig_type} XAUUSD\n"
+            f"[BOT] ORDEN FALLIDA - {sig_type} {instrument}\n"
             f"Score: {score}/100 | Estrategia: {strategy}\n"
             f"Motivo: {error_detail}\n"
             f"Hora: {now_str}"
@@ -1660,9 +1738,9 @@ def run_cycle():
         return
 
     count = increment_daily_count()
-    ask, bid = get_current_price()
+    ask, bid = get_current_price(sym)
     price = ask if sig_type == "BUY" else bid
-    sl = calc_anti_hunt_sl(sig_type, float(best["stop_loss"]))
+    sl = calc_anti_hunt_sl(sig_type, float(best["stop_loss"]), sym)
     tp1 = float(best["take_profit_1"])
 
     update_signal_status(sig_id, "EXECUTING")
@@ -1670,15 +1748,16 @@ def run_cycle():
 
     print("\n  ORDEN EJECUTADA:")
     print(f"    Ticket: {result.order}")
+    print(f"    Mercado: {instrument} ({sym})")
     print(f"    Tipo:   {sig_type}")
     print(f"    Precio: {price}")
-    print(f"    SL:     {sl} (anti-hunt +{SL_EXTRA_PTS} pts)")
+    print(f"    SL:     {sl} (anti-hunt)")
     print(f"    TP1:    {tp1}")
     print(f"    Lote:   {result.volume}")
     print(f"    Hoy:    {count}/{MAX_DAILY}")
 
     send_telegram(
-        f"[BOT] ORDEN ABIERTA - {sig_type} XAUUSD\n"
+        f"[BOT] ORDEN ABIERTA - {sig_type} {instrument}\n"
         f"Ticket: {result.order}\n"
         f"Precio entrada: {price}\n"
         f"Stop Loss: {sl} (anti-hunt)\n"
@@ -1707,6 +1786,7 @@ def main():
     print(f"  BOT ENGINE - TradingProEA - {now_str}")
     print(f"  URL: {SUPABASE_URL}")
     print(f"  Simbolo MT5: {MT5_SYMBOL}")
+    print(f"  Mercados habilitados: {', '.join(f'{i} ({mt5_symbol_for(i)})' for i in BOT_INSTRUMENTS)} — max 1 posicion por mercado")
     if USE_FIXED_LOT:
         print(f"  Lote por estrategia (USE_FIXED_LOT=true, respaldo {FIXED_LOT_SIZE}):")
         for estr, lot in LOT_POR_ESTRATEGIA.items():

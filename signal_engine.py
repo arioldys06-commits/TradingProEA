@@ -262,6 +262,18 @@ TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
 TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
 
+# ── Trend Continuation en EURUSD (NUEVO 2026-10-04) ──
+# Misma logica que en oro, sobre velas EURUSD del mismo timeframe
+# (data_engine.py tiene que subirlas). Se publica con instrument=EURUSD
+# y nombre propio, asi tiene su propio cooldown/tope diario y el bot
+# la enruta al simbolo EURUSD de MT5. El ATR minimo de oro (0.5) no
+# aplica a EURUSD: se usa TREND_CONT_MIN_ATR_EURUSD (en precio).
+TREND_CONT_EURUSD           = os.getenv("TREND_CONT_EURUSD", "true").lower() == "true"
+TREND_CONT_MIN_ATR = {
+    "XAUUSD": 0.5,
+    "EURUSD": float(os.getenv("TREND_CONT_MIN_ATR_EURUSD", "0.00008")),
+}
+
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
     rdh = ((now.hour - 4) + 24) % 24
@@ -315,15 +327,17 @@ def telegram_signal(sig):
             latencia = f"Publicado: {publish_time}\n"
     else:
         latencia = f"Publicado: {publish_time}\n"
+    instrument = sig.get("instrument", "XAUUSD")
+    d = 2 if instrument == "XAUUSD" else 5
     return (
-        f"[SENAL {arrow}] XAUUSD\n"
+        f"[SENAL {arrow}] {instrument}\n"
         f"Estrategia: {sig['strategy']}\n"
-        f"Entrada: {sig['entry_price']:.2f}\n"
-        f"Stop Loss: {sig['stop_loss']:.2f}\n"
-        f"TP1: {sig['take_profit_1']:.2f}\n"
-        f"TP2: {sig['take_profit_2']:.2f}\n"
+        f"Entrada: {sig['entry_price']:.{d}f}\n"
+        f"Stop Loss: {sig['stop_loss']:.{d}f}\n"
+        f"TP1: {sig['take_profit_1']:.{d}f}\n"
+        f"TP2: {sig['take_profit_2']:.{d}f}\n"
         f"Score: {sig['confidence']}/100\n"
-        f"ATR: {sig.get('atr', 0):.2f} pts\n"
+        f"ATR: {sig.get('atr', 0):.{d}f}\n"
         f"{ote_line}"
         f"{latencia}"
         f"---\n"
@@ -1116,7 +1130,7 @@ def publish_signal(sig):
         return False
 
     try:
-        rows = get_candles("M5", 1)
+        rows = get_candles("M5", 1, instrument=sig.get("instrument", "XAUUSD"))
         if rows:
             precio_actual = float(rows[0]["close"])
             if not señal_vigente(sig, precio_actual):
@@ -1124,16 +1138,18 @@ def publish_signal(sig):
     except:
         pass
 
+    dec = 2 if sig.get("instrument", "XAUUSD") == "XAUUSD" else 5
     payload = {
         "id":            str(uuid.uuid4()),
         "signal_type":   sig["signal_type"],
-        "entry_price":   round(sig["entry_price"], 2),
-        "stop_loss":     round(sig["stop_loss"], 2),
-        "take_profit_1": round(sig["take_profit_1"], 2),
-        "take_profit_2": round(sig["take_profit_2"], 2),
+        "entry_price":   round(sig["entry_price"], dec),
+        "stop_loss":     round(sig["stop_loss"], dec),
+        "take_profit_1": round(sig["take_profit_1"], dec),
+        "take_profit_2": round(sig["take_profit_2"], dec),
         "confidence":    sig["confidence"],
         "strategy":      sig["strategy"],
         "timeframe":     sig.get("timeframe", "M5"),
+        "instrument":    sig.get("instrument", "XAUUSD"),
         "status":        "PENDING",
         "created_at":    datetime.now(timezone.utc).isoformat(),
     }
@@ -2538,7 +2554,7 @@ def strategy_mean_reversion_bb(c15, dxy_trend="NEUTRAL"):
     }
 
 
-def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
+def strategy_trend_continuation(c5, dxy_trend="NEUTRAL", instrument="XAUUSD"):
     """Estrategia 7: Trend Continuation M5.
     Contraparte deliberada de EMA Pullback/FVG Fill/etc: en vez de
     rechazar el precio cuando ya se extendio mucho (extension_agotada),
@@ -2561,7 +2577,7 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
 
     closes5 = [c["C"] for c in c5]
     atr = calc_atr(c5[-20:])
-    if atr < 0.5:
+    if atr < TREND_CONT_MIN_ATR.get(instrument, 0.5):
         return None
 
     adx, _ = calc_adx(c5, period=ADX_PERIOD)
@@ -2671,8 +2687,9 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
         "take_profit_1": tp1,
         "take_profit_2": tp2,
         "confidence":    score,
-        "strategy":      f"Trend Continuation {TREND_CONT_TF}",
+        "strategy":      f"Trend Continuation {TREND_CONT_TF}" + ("" if instrument == "XAUUSD" else f" {instrument}"),
         "timeframe":     TREND_CONT_TF,
+        "instrument":    instrument,
         "atr":           atr,
         "reasons":       reasons,
         "candle_time":   ultima["time"],
@@ -2836,6 +2853,24 @@ def analyze():
             print(f"  [7] Trend Continuation {TREND_CONT_TF}: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
     except Exception as e:
         print(f"  [7] Error Trend Continuation: {e}")
+
+    if TREND_CONT_EURUSD:
+        try:
+            c_eu = to_candles(get_candles(TREND_CONT_TF, 100, instrument="EURUSD"))
+            if len(c_eu) < 60:
+                print(f"  [7-EU] Trend Continuation {TREND_CONT_TF} EURUSD: sin velas suficientes ({len(c_eu)}) — ¿data_engine sube EURUSD {TREND_CONT_TF}?")
+                sig = None
+            else:
+                sig = strategy_trend_continuation(c_eu, dxy_trend, instrument="EURUSD")
+            if sig:
+                if publish_signal(sig):
+                    signals_found += 1
+                else:
+                    print(f"  [7-EU] Trend Continuation EURUSD: señal detectada pero no publicada")
+            elif len(c_eu) >= 60:
+                print(f"  [7-EU] Trend Continuation {TREND_CONT_TF} EURUSD: sin setup")
+        except Exception as e:
+            print(f"  [7-EU] Error Trend Continuation EURUSD: {e}")
 
     try:
         sig = strategy_crt_killzone(ch1, c5, dxy_trend)
