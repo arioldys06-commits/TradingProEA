@@ -54,6 +54,15 @@ DOLLAR_TIMEFRAMES = {
 # USDCHF/USDJPY: USD es la moneda base    -> si el par SUBE, el USD se fortalece.
 DOLLAR_SYMBOLS = ["EURUSD", "GBPUSD", "USDCHF", "USDJPY"]
 
+# NUEVO 2026-10-04: EURUSD tambien se OPERA (Trend Continuation M3 EURUSD
+# en signal_engine.py), asi que ademas de los TFs del DXY necesita M3.
+# MT5_SYMBOL_EURUSD es el nombre del simbolo en el broker (igual que en
+# bot_engine.py); en Supabase siempre se guarda como "EURUSD".
+MT5_SYMBOL_EURUSD = os.getenv("MT5_SYMBOL_EURUSD", "EURUSD")
+EXTRA_TIMEFRAMES_POR_PAR = {
+    "EURUSD": {"M3": (mt5.TIMEFRAME_M3, 150)},
+}
+
 SYMBOL   = os.getenv("MT5_SYMBOL", "GOLD")  # Nombre del símbolo en MT5 (XMGlobal)
 INTERVAL = 60        # Segundos entre cada ciclo
 # ──────────────────────────────────────────────────────────────
@@ -179,9 +188,11 @@ def fetch_and_upload(sb):
 
     # ── NUEVO: pares del dolar para el indice sintetico DXY ──
     for par in DOLLAR_SYMBOLS:
-        if not ensure_symbol_visible(par):
+        simbolo_mt5 = MT5_SYMBOL_EURUSD if par == "EURUSD" else par
+        if not ensure_symbol_visible(simbolo_mt5):
             continue
-        rows_por_tf = fetch_symbol_candles(par, par, DOLLAR_TIMEFRAMES)
+        tfs = {**DOLLAR_TIMEFRAMES, **EXTRA_TIMEFRAMES_POR_PAR.get(par, {})}
+        rows_por_tf = fetch_symbol_candles(simbolo_mt5, par, tfs)
         upload_rows(sb, par, rows_por_tf)
 
 
@@ -198,6 +209,8 @@ def main():
     print(f"[URL]   {SUPA_URL}")
     print(f"[TFs]   XAUUSD: {list(TIMEFRAMES.keys())}")
     print(f"[TFs]   Pares dolar ({', '.join(DOLLAR_SYMBOLS)}): {list(DOLLAR_TIMEFRAMES.keys())}")
+    for par, extra in EXTRA_TIMEFRAMES_POR_PAR.items():
+        print(f"[TFs]   {par} ademas: {list(extra.keys())} (para operar)")
 
     while True:
         now = datetime.now().strftime("%H:%M:%S")
