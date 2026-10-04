@@ -8,6 +8,26 @@ REQUISITOS:
 - Variables de entorno ya existentes: SUPABASE_URL, SUPABASE_KEY (o SERVICE_ROLE_KEY),
   MT5_MAGIC (20260601), MT5_SYMBOL (GOLD)
 
+FIX 2026-09-28 (origen BOT_MANUAL):
+  - Antes `origen` se calculaba SOLO con el magic del deal de CIERRE. Cuando
+    el bot abria una operacion (magic 20260601, comentario TradingPro_xxx)
+    y Arioldys la cerraba a mano en MT5, el deal de cierre llega con
+    magic 0 y la operacion quedaba como "MANUAL", aunque venia de una
+    señal del bot. Confirmado el 2026-09-28: 9 operaciones de Trend
+    Continuation (con signal_id) estaban guardadas como MANUAL.
+  - Ahora se mira QUIEN ABRIO y QUIEN CERRO:
+      abrio el bot + cerro el bot (SL/TP/trailing/CHoCH) -> "BOT"
+      abrio el bot + cerro a mano                        -> "BOT_MANUAL"
+      abrio a mano (sin señal)                           -> "MANUAL"
+      magic desconocido                                  -> "OTRO(magic=N)"
+    "Abrio el bot" = el deal de apertura tiene magic del bot O la
+    operacion quedo vinculada a una señal (signal_id).
+  - Si no se encuentra el deal de apertura (posicion abierta antes de la
+    ventana de dias_atras) y el cierre fue a mano sin señal vinculada, no
+    se puede saber quien la abrio: en ese caso `origen` se OMITE del
+    upsert (misma regla que signal_id/strategy) para no pisar un
+    BOT_MANUAL ya guardado en un ciclo anterior.
+
 FIX EN ESTA VERSION (incluir operaciones manuales para P&L mensual):
   - Hasta ahora, tanto `aperturas` como `deals_cierre` filtraban
     exclusivamente por `d.magic == MAGIC`. Las operaciones abiertas a
@@ -254,6 +274,23 @@ def determinar_origen(magic: int) -> str:
     return f"OTRO(magic={magic})"
 
 
+def determinar_origen_completo(magic_apertura, magic_cierre, tiene_signal):
+    """
+    Clasifica la operacion mirando quien la ABRIO y quien la CERRO
+    (ver FIX 2026-09-28 en el docstring del modulo).
+    Devuelve None cuando no se puede determinar con seguridad (apertura
+    fuera de ventana + cierre manual + sin señal): en ese caso quien
+    llama debe OMITIR `origen` del upsert para no pisar un valor bueno.
+    """
+    abrio_bot = tiene_signal or magic_apertura == MAGIC
+    if abrio_bot:
+        return "BOT" if magic_cierre == MAGIC else "BOT_MANUAL"
+    if magic_apertura is None and magic_cierre == 0:
+        return None  # no se sabe quien la abrio
+    magic_ref = magic_apertura if magic_apertura is not None else magic_cierre
+    return determinar_origen(magic_ref)
+
+
 def sincronizar_trades_cerrados(dias_atras: int = 3):
     """
     Lee los deals de MT5 de los últimos `dias_atras` días, separa los de
@@ -304,7 +341,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     # filtra por magic == MAGIC aqui, para tambien capturar la apertura
     # de operaciones manuales (magic 0) y poder tomarles open_time/precio.
     aperturas = {
-        d.position_id: {"comment": d.comment, "time": d.time, "price": d.price, "type": d.type}
+        d.position_id: {"comment": d.comment, "time": d.time, "price": d.price, "type": d.type, "magic": d.magic}
         for d in deals
         if d.symbol == SYMBOL and d.entry == mt5.DEAL_ENTRY_IN
     }
@@ -333,8 +370,12 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         if signal_id:
             vinculados += 1
 
-        origen = determinar_origen(d.magic)
-        if origen == "MANUAL":
+        origen = determinar_origen_completo(
+            apertura.get("magic") if apertura else None,
+            d.magic,
+            bool(signal_id),
+        )
+        if origen in ("MANUAL", "BOT_MANUAL"):
             manuales += 1
 
         # FIX 2026-08-18 (tipo de operacion invertido): MT5 cierra una
@@ -360,7 +401,6 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         registro = {
             "ticket": d.ticket,
             "magic": d.magic,
-            "origen": origen,  # "BOT" / "MANUAL" / "OTRO(magic=N)" — siempre presente
             "symbol": d.symbol or SYMBOL,
             "tipo": tipo,
             "volumen": d.volume,
@@ -380,6 +420,10 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
         # de un ciclo anterior nunca se corrompe por un fallo de match
         # (deal de apertura fuera de ventana, señal no encontrada, etc.)
         # en un ciclo posterior — ver FIX en el docstring del modulo.
+        # origen: "BOT" / "BOT_MANUAL" / "MANUAL" / "OTRO(magic=N)".
+        # Se omite solo cuando no se puede determinar (ver FIX 2026-09-28).
+        if origen is not None:
+            registro["origen"] = origen
         if apertura:
             registro["open_time"] = epoch_broker_to_utc_iso(apertura["time"])
             registro["precio_apertura"] = apertura["price"]
@@ -409,7 +453,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
 
     print(
         f"[sync_trades] {len(registros)} trades sincronizados hacia Supabase "
-        f"({vinculados} vinculados a su señal/estrategia original, {manuales} manuales)."
+        f"({vinculados} vinculados a su señal/estrategia original, {manuales} manuales o cerradas a mano)."
     )
     return len(registros)
 
@@ -428,7 +472,7 @@ def loop_continuo(intervalo_segundos: int = None):
 
     print(f"\n{'='*55}")
     print(f"  SYNC TRADES SUPABASE — Loop continuo")
-    print(f"  Magic: {MAGIC} | Simbolo: {SYMBOL} (incluye BOT + MANUAL)")
+    print(f"  Magic: {MAGIC} | Simbolo: {SYMBOL} (incluye BOT + BOT_MANUAL + MANUAL)")
     print(f"  Sincroniza cada {intervalo_segundos}s — Ctrl+C para detener")
     print(f"{'='*55}\n")
 
