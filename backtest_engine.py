@@ -169,7 +169,7 @@ STRATEGY_TIMEFRAME = {
     "ema":          "M5",
     "sweep":        "M1",
     "mean_reversion": "M15",
-    "trend_continuation": "M5",
+    "trend_continuation": None,  # se fija abajo con TREND_TF
 }
 
 STRATEGY_LABEL = {
@@ -179,8 +179,37 @@ STRATEGY_LABEL = {
     "ema":            "EMA Pullback M5",
     "sweep":          "Sweep Displacement M1",
     "mean_reversion": "Mean Reversion BB M15",
-    "trend_continuation": "Trend Continuation M5",
+    "trend_continuation": None,  # se fija abajo con TREND_TF
 }
+
+# Trend Continuation corre en el timeframe que use signal_engine.py
+# (TREND_CONT_TF, M3 en produccion). Antes el backtest la corria siempre en
+# M5 y la guardaba como "Trend Continuation M5", asi que la version M3 que
+# opera el bot nunca aparecia en el panel de Backtests.
+TREND_TF = str(getattr(se, "TREND_CONT_TF", os.getenv("TREND_CONT_TF", "M3"))).upper()
+STRATEGY_TIMEFRAME["trend_continuation"] = TREND_TF
+STRATEGY_LABEL["trend_continuation"] = f"Trend Continuation {TREND_TF}"
+
+
+def resample_minutes(m1, minutes):
+    """Arma velas de N minutos a partir de M1 (alineadas al minuto multiplo
+    de N, como MT5). Sirve cuando el timeframe N tiene poco historial en
+    Supabase (M3 empezo a guardarse hace pocos dias; M1 tiene semanas)."""
+    out = []
+    cur_key = None
+    for c in m1:
+        t = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+        start = t.replace(minute=t.minute - t.minute % minutes, second=0, microsecond=0)
+        if start != cur_key:
+            cur_key = start
+            out.append({"time": start.isoformat(), "O": c["O"], "H": c["H"], "L": c["L"], "C": c["C"], "V": c.get("V", 0)})
+        else:
+            b = out[-1]
+            b["H"] = max(b["H"], c["H"])
+            b["L"] = min(b["L"], c["L"])
+            b["C"] = c["C"]
+            b["V"] += c.get("V", 0)
+    return out
 
 STEP_BARS = {
     # Evitar recalcular cada vela ahorra tiempo sin perder señal real,
@@ -505,7 +534,8 @@ def main():
     m15 = fetch_historical_candles("M15", start_iso, end_iso)
     m30 = fetch_historical_candles("M30", start_iso, end_iso)
     h1  = fetch_historical_candles("H1",  start_iso, end_iso)
-    m1  = fetch_historical_candles("M1",  start_iso, end_iso) if "sweep" in seleccion else []
+    necesita_m1 = "sweep" in seleccion or ("trend_continuation" in seleccion and TREND_TF not in ("M5", "M15", "M30", "H1"))
+    m1  = fetch_historical_candles("M1",  start_iso, end_iso) if necesita_m1 else []
     print(f"  M5: {len(m5)} velas | M15: {len(m15)} | M30: {len(m30)} | H1: {len(h1)} | M1: {len(m1)}")
 
     if len(m5) < 200:
@@ -577,8 +607,18 @@ def main():
             print("      Sin trades suficientes en el rango.")
 
     if "trend_continuation" in seleccion:
-        print("\n  [7] Corriendo Trend Continuation M5...")
-        trades = run_backtest_trend_continuation(m5, dxy_trend)
+        tf_map = {"M5": m5, "M15": m15, "M30": m30, "H1": h1}
+        if TREND_TF in tf_map:
+            c_tc = tf_map[TREND_TF]
+        else:
+            # Usa la serie mas larga: velas guardadas del TF o armadas desde M1.
+            guardadas = fetch_historical_candles(TREND_TF, start_iso, end_iso)
+            armadas = resample_minutes(m1, int(TREND_TF[1:])) if TREND_TF.startswith("M") and m1 else []
+            c_tc = armadas if len(armadas) > len(guardadas) else guardadas
+            origen = "armadas desde M1" if c_tc is armadas else "guardadas"
+            print(f"\n  {TREND_TF}: {len(c_tc)} velas ({origen})")
+        print(f"\n  [7] Corriendo Trend Continuation {TREND_TF}...")
+        trades = run_backtest_trend_continuation(c_tc, dxy_trend)
         res = agregar_resultado(trades)
         if res:
             resultados_finales.append(("trend_continuation", res))
