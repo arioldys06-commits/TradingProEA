@@ -157,6 +157,11 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")  # usa service_role si vas a hacer upsert desde script local
 MAGIC = int(os.getenv("MT5_MAGIC", "20260601"))
 SYMBOL = os.getenv("MT5_SYMBOL", "GOLD")
+# NUEVO 2026-10-04 (multi-mercado): el bot tambien opera EURUSD, asi que se
+# sincronizan los deals de TODOS los simbolos que opera (oro + EURUSD).
+# Mismo nombre de variable que en bot_engine.py / data_engine.py.
+MT5_SYMBOL_EURUSD = os.getenv("MT5_SYMBOL_EURUSD", "EURUSD")
+SYMBOLS = {SYMBOL, MT5_SYMBOL_EURUSD}
 LOOP_INTERVAL = int(os.getenv("SYNC_LOOP_INTERVAL", "90"))  # segundos entre cada sincronizacion
 # Offset del servidor del broker respecto a UTC real, en horas. XMGlobal
 # corre en EEST (UTC+3) en horario de verano europeo, EET (UTC+2) en
@@ -343,7 +348,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     aperturas = {
         d.position_id: {"comment": d.comment, "time": d.time, "price": d.price, "type": d.type, "magic": d.magic}
         for d in deals
-        if d.symbol == SYMBOL and d.entry == mt5.DEAL_ENTRY_IN
+        if d.symbol in SYMBOLS and d.entry == mt5.DEAL_ENTRY_IN
     }
 
     # Deals de SALIDA (cierre de posición) de este simbolo — de CUALQUIER
@@ -351,7 +356,7 @@ def sincronizar_trades_cerrados(dias_atras: int = 3):
     # P&L. entry == 1 significa DEAL_ENTRY_OUT (cierre); entry == 0 apertura.
     deals_cierre = [
         d for d in deals
-        if d.symbol == SYMBOL and d.entry == mt5.DEAL_ENTRY_OUT
+        if d.symbol in SYMBOLS and d.entry == mt5.DEAL_ENTRY_OUT
     ]
 
     if not deals_cierre:
@@ -472,7 +477,7 @@ def loop_continuo(intervalo_segundos: int = None):
 
     print(f"\n{'='*55}")
     print(f"  SYNC TRADES SUPABASE — Loop continuo")
-    print(f"  Magic: {MAGIC} | Simbolo: {SYMBOL} (incluye BOT + BOT_MANUAL + MANUAL)")
+    print(f"  Magic: {MAGIC} | Simbolos: {', '.join(sorted(SYMBOLS))} (incluye BOT + BOT_MANUAL + MANUAL)")
     print(f"  Sincroniza cada {intervalo_segundos}s — Ctrl+C para detener")
     print(f"{'='*55}\n")
 
