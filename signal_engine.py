@@ -261,6 +261,15 @@ TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "30"))
 TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
 TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
+# NUEVO 2026-10-05: filtro de sesgo H1. La estrategia solo miraba EMA20/50
+# y ADX en M3 (~2.5 h de historia), asi que en un oro bajista en H1 un
+# rebote de M3 cruzaba las EMAs y salia BUY (ej. 05-oct 00:49 y 08:28,
+# ambas LOSS). Ahora exige que el cierre de la ultima vela H1 CERRADA este
+# del lado correcto de la EMA100 H1: BUY solo por encima, SELL solo por
+# debajo. Sobre 47 trades cerrados (07-sep a 05-oct): a favor 30 trades
+# 19W +$63; en contra 17 trades 7W -$107 (esos son los que se bloquean).
+TREND_CONT_FILTRO_H1        = os.getenv("TREND_CONT_FILTRO_H1", "true").lower() == "true"
+TREND_CONT_H1_EMA           = int(os.getenv("TREND_CONT_H1_EMA", "100"))
 
 # ── Trend Continuation en EURUSD (NUEVO 2026-10-04) ──
 # Misma logica que en oro, sobre velas EURUSD del mismo timeframe
@@ -2554,6 +2563,21 @@ def strategy_mean_reversion_bb(c15, dxy_trend="NEUTRAL"):
     }
 
 
+def sesgo_h1(instrument="XAUUSD"):
+    """Sesgo de H1 para Trend Continuation: "BUY" si el cierre de la ultima
+    vela H1 cerrada esta sobre la EMA TREND_CONT_H1_EMA, "SELL" si esta
+    debajo, None si no hay velas suficientes (en ese caso no se filtra).
+    data_engine.py sube tambien la vela H1 en curso (copy_rates_from_pos
+    desde 0), por eso se descarta la ultima."""
+    ch1 = to_candles(get_candles("H1", TREND_CONT_H1_EMA * 3, instrument=instrument))
+    ch1 = ch1[:-1]
+    if len(ch1) < TREND_CONT_H1_EMA:
+        return None
+    e = ema([c["C"] for c in ch1], TREND_CONT_H1_EMA)
+    if e is None:
+        return None
+    return "BUY" if ch1[-1]["C"] > e else "SELL"
+
 def strategy_trend_continuation(c5, dxy_trend="NEUTRAL", instrument="XAUUSD"):
     """Estrategia 7: Trend Continuation M5.
     Contraparte deliberada de EMA Pullback/FVG Fill/etc: en vez de
@@ -2626,9 +2650,19 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL", instrument="XAUUSD"):
         print(f"  [7] Trend Continuation: descartado — sin ruptura de la micro-consolidacion a favor de {trend_dir}")
         return None
 
+    if TREND_CONT_FILTRO_H1:
+        sesgo = sesgo_h1(instrument)
+        if sesgo is None:
+            print(f"  [7] Trend Continuation: sin velas H1 suficientes para el filtro de sesgo ({instrument}) — no se filtra")
+        elif sesgo != trend_dir:
+            print(f"  [7] Trend Continuation: descartado — {trend_dir} en M3 contra el sesgo H1 ({sesgo}, EMA{TREND_CONT_H1_EMA})")
+            return None
+
     sig_type = trend_dir
     score = 0
     reasons = []
+    if TREND_CONT_FILTRO_H1 and sesgo is not None:
+        reasons.append(f"H1 a favor (precio {'sobre' if sesgo == 'BUY' else 'bajo'} EMA{TREND_CONT_H1_EMA})")
 
     adx_exceso = adx - TREND_CONT_ADX_MIN
     score += 30 + min(15, round(adx_exceso))
