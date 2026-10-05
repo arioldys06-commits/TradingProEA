@@ -1,0 +1,204 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// TradingPro Scalper XAU — versión STRATEGY para backtest en el Strategy Tester.
+// Misma lógica que TradingPro_Scalper_XAU.pine (indicador):
+//   Sweep + MSS con desplazamiento, Pullback a EMA, killzones en hora RD y sesgo M15.
+// Agrega: tamaño por % de riesgo, límites diarios del bot (3 trades / 2 pérdidas),
+// rango de fechas y cierre opcional al terminar la killzone.
+// Costos por defecto: 0.15 USD por onza por lado (≈ 0.30 de spread ida y vuelta) + 2 ticks de slippage.
+// Ajústalos en Propiedades a lo que cobra tu broker.
+//@version=6
+strategy("TradingPro Scalper XAU [Backtest]", shorttitle = "TP Scalper BT", overlay = true,
+     initial_capital = 10000, currency = currency.USD, pyramiding = 0,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.15,
+     slippage = 2, process_orders_on_close = false, calc_on_every_tick = false,
+     max_lines_count = 200, max_labels_count = 200)
+
+// ─────────────────────────── INPUTS ───────────────────────────
+grpT = "Tendencia"
+emaFastLen  = input.int(9, "EMA rápida", minval = 1, group = grpT)
+emaSlowLen  = input.int(21, "EMA lenta", minval = 1, group = grpT)
+emaTrendLen = input.int(200, "EMA tendencia", minval = 1, group = grpT)
+htfTf       = input.timeframe("15", "Timeframe del sesgo", group = grpT)
+htfEmaLen   = input.int(50, "EMA del sesgo (en ese timeframe)", minval = 1, group = grpT)
+useBias     = input.bool(true, "Filtrar señales con el sesgo HTF", group = grpT)
+
+grpS = "Sesiones (hora RD)"
+tz       = input.string("America/Santo_Domingo", "Zona horaria", group = grpS)
+kzLondon = input.session("0300-0600", "Killzone Londres", group = grpS)
+kzNY     = input.session("0900-1200", "Killzone Nueva York", group = grpS)
+onlyKZ   = input.bool(true, "Entradas solo dentro de killzone", group = grpS)
+closeEOK = input.bool(false, "Cerrar posición al terminar la killzone", group = grpS)
+
+grpL = "Señales"
+useSweepSig = input.bool(true, "Señal: Sweep + MSS", group = grpL)
+usePullSig  = input.bool(true, "Señal: Pullback a EMA", group = grpL)
+pivotLen    = input.int(5, "Largo de pivote (swing)", minval = 2, group = grpL)
+minorLook   = input.int(8, "Velas para el swing menor (MSS)", minval = 2, group = grpL)
+mssWindow   = input.int(15, "Velas máx. entre sweep y MSS", minval = 1, group = grpL)
+allowLong   = input.bool(true, "Permitir compras", group = grpL)
+allowShort  = input.bool(true, "Permitir ventas", group = grpL)
+
+grpR = "Riesgo"
+atrLen     = input.int(14, "ATR", minval = 1, group = grpR)
+slBuffer   = input.float(0.30, "Buffer del SL (en precio)", minval = 0, step = 0.05, group = grpR)
+rr         = input.float(2.0, "R:R del TP", minval = 0.5, step = 0.25, group = grpR)
+minDispAtr = input.float(1.2, "Cuerpo mínimo vela de desplazamiento (x ATR)", minval = 0, step = 0.1, group = grpR)
+maxSlAtr   = input.float(3.0, "SL máximo permitido (x ATR)", minval = 0.5, step = 0.25, group = grpR)
+sizeMode   = input.string("% de riesgo", "Tamaño de posición", options = ["% de riesgo", "Fijo"], group = grpR)
+riskPct    = input.float(1.0, "Riesgo por operación (% del capital)", minval = 0.1, step = 0.1, group = grpR)
+fixedQty   = input.float(1.0, "Tamaño fijo (unidades del símbolo)", minval = 0.01, step = 0.01, group = grpR)
+maxTrades  = input.int(3, "Máx. operaciones por día", minval = 1, group = grpR)
+maxLosses  = input.int(2, "Máx. pérdidas por día", minval = 1, group = grpR)
+
+grpD = "Rango de fechas"
+startDate = input.time(timestamp("2026-01-01 00:00"), "Desde", group = grpD)
+endDate   = input.time(timestamp("2099-12-31 00:00"), "Hasta", group = grpD)
+
+// ─────────────────────────── CÁLCULOS BASE ───────────────────────────
+atrV = ta.atr(atrLen)
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+emaT = ta.ema(close, emaTrendLen)
+body = math.abs(close - open)
+
+inLondon = not na(time(timeframe.period, kzLondon, tz))
+inNY     = not na(time(timeframe.period, kzNY, tz))
+inKZ     = inLondon or inNY
+kzOk     = not onlyKZ or inKZ
+inRange  = time >= startDate and time <= endDate
+
+[htfClose, htfEma] = request.security(syminfo.tickerid, htfTf, [close[1], ta.ema(close, htfEmaLen)[1]], lookahead = barmerge.lookahead_on)
+biasUp   = htfClose > htfEma
+biasDown = htfClose < htfEma
+longOk   = allowLong and (not useBias or biasUp)
+shortOk  = allowShort and (not useBias or biasDown)
+
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+// ─────────────────────────── ESTRUCTURA / SWEEPS ───────────────────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+minorLow  = ta.lowest(low, minorLook)[1]
+minorHigh = ta.highest(high, minorLook)[1]
+
+sweepHighSwing = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+sweepHighPD    = not na(pdh) and high > pdh and close < pdh
+sweepLowSwing  = not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+sweepLowPD     = not na(pdl) and low < pdl and close > pdl
+sweptHigh = sweepHighSwing or sweepHighPD
+sweptLow  = sweepLowSwing or sweepLowPD
+
+var int   bearSweepBar = na
+var float bearSweepExt = na
+var float bearSweepLvl = na
+var float bearMssLvl   = na
+var int   bullSweepBar = na
+var float bullSweepExt = na
+var float bullSweepLvl = na
+var float bullMssLvl   = na
+
+if sweptHigh
+    bearSweepBar := bar_index
+    bearSweepExt := high
+    bearSweepLvl := sweepHighPD ? pdh : lastSwingHigh
+    bearMssLvl   := minorLow
+    if sweepHighSwing
+        lastSwingHigh := na
+if sweptLow
+    bullSweepBar := bar_index
+    bullSweepExt := low
+    bullSweepLvl := sweepLowPD ? pdl : lastSwingLow
+    bullMssLvl   := minorHigh
+    if sweepLowSwing
+        lastSwingLow := na
+
+if not na(bearSweepBar) and bar_index > bearSweepBar
+    if close > bearSweepLvl or bar_index - bearSweepBar > mssWindow
+        bearSweepBar := na
+    else if high > bearSweepExt
+        bearSweepExt := high
+if not na(bullSweepBar) and bar_index > bullSweepBar
+    if close < bullSweepLvl or bar_index - bullSweepBar > mssWindow
+        bullSweepBar := na
+    else if low < bullSweepExt
+        bullSweepExt := low
+
+bigBody   = body >= minDispAtr * atrV
+sweepSell = useSweepSig and not na(bearSweepBar) and bar_index > bearSweepBar and close < bearMssLvl and close < open and bigBody and shortOk and kzOk
+sweepBuy  = useSweepSig and not na(bullSweepBar) and bar_index > bullSweepBar and close > bullMssLvl and close > open and bigBody and longOk and kzOk
+
+// ─────────────────────────── PULLBACK A EMA ───────────────────────────
+trendUp     = emaF > emaS and emaS > emaT
+trendDown   = emaF < emaS and emaS < emaT
+pullBuyRaw  = trendUp and low <= emaS and close > emaF and close > open and longOk and kzOk
+pullSellRaw = trendDown and high >= emaS and close < emaF and close < open and shortOk and kzOk
+pullBuy     = usePullSig and pullBuyRaw and not pullBuyRaw[1]
+pullSell    = usePullSig and pullSellRaw and not pullSellRaw[1]
+
+// ─────────────────────────── LÍMITES DIARIOS (día RD) ───────────────────────────
+var int tradesToday = 0
+var int lossesToday = 0
+newDay = ta.change(dayofmonth(time, tz)) != 0
+if newDay
+    tradesToday := 0
+    lossesToday := 0
+
+// Cuenta pérdidas de las operaciones que se cerraron en esta vela
+closedNow = strategy.closedtrades - nz(strategy.closedtrades[1])
+if closedNow > 0
+    for k = 1 to closedNow
+        if strategy.closedtrades.profit(strategy.closedtrades - k) < 0
+            lossesToday += 1
+
+dayOk = tradesToday < maxTrades and lossesToday < maxLosses
+
+// ─────────────────────────── ÓRDENES ───────────────────────────
+lo5 = ta.lowest(low, 5)
+hi5 = ta.highest(high, 5)
+slBuy    = sweepBuy ? bullSweepExt - slBuffer : lo5 - slBuffer
+slSell   = sweepSell ? bearSweepExt + slBuffer : hi5 + slBuffer
+riskBuy  = close - slBuy
+riskSell = slSell - close
+
+calcQty(float riskPrice) =>
+    float q = sizeMode == "Fijo" ? fixedQty : (strategy.equity * riskPct / 100) / (riskPrice * syminfo.pointvalue)
+    math.max(math.round(q, 2), 0.01)
+
+flat    = strategy.position_size == 0
+canTrade = flat and dayOk and inRange and barstate.isconfirmed
+
+goLong  = canTrade and (sweepBuy or pullBuy) and riskBuy > 0 and riskBuy <= maxSlAtr * atrV
+goShort = canTrade and not goLong and (sweepSell or pullSell) and riskSell > 0 and riskSell <= maxSlAtr * atrV
+
+if goLong
+    tag = sweepBuy ? "L-Sweep" : "L-Pullback"
+    strategy.entry(tag, strategy.long, qty = calcQty(riskBuy))
+    strategy.exit(tag + "-x", from_entry = tag, stop = slBuy, limit = close + rr * riskBuy)
+    tradesToday += 1
+    bullSweepBar := na
+if goShort
+    tag = sweepSell ? "S-Sweep" : "S-Pullback"
+    strategy.entry(tag, strategy.short, qty = calcQty(riskSell))
+    strategy.exit(tag + "-x", from_entry = tag, stop = slSell, limit = close - rr * riskSell)
+    tradesToday += 1
+    bearSweepBar := na
+
+// Cierre al salir de la killzone (opcional)
+if closeEOK and strategy.position_size != 0 and inKZ[1] and not inKZ
+    strategy.close_all(comment = "Fin KZ")
+
+// ─────────────────────────── PLOTS ───────────────────────────
+bgcolor(inLondon ? color.new(color.blue, 92) : inNY ? color.new(color.orange, 92) : na, title = "Killzones")
+plot(emaF, "EMA rápida", color = color.yellow)
+plot(emaS, "EMA lenta", color = color.orange)
+plot(emaT, "EMA tendencia", color = color.new(color.white, 30), linewidth = 2)
+plot(pdh, "PDH", color = color.new(color.red, 30), style = plot.style_stepline)
+plot(pdl, "PDL", color = color.new(color.green, 30), style = plot.style_stepline)
