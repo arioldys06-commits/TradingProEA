@@ -266,6 +266,8 @@ MEAN_REV_ACTIVA = os.getenv("MEAN_REV_ACTIVA", "false").lower() == "true"
 # ~2 horas de la subida, asi que la estrategia no la veia como tendencia.
 TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "25"))
 TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
+TREND_CONT_ADX_SUBIENDO     = os.getenv("TREND_CONT_ADX_SUBIENDO", "true").lower() == "true"
+TREND_CONT_ADX_FUERTE       = float(os.getenv("TREND_CONT_ADX_FUERTE", "35"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
 TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
 # NUEVO 2026-10-05: filtro de sesgo H1. La estrategia solo miraba EMA20/50
@@ -2611,11 +2613,19 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL", instrument="XAUUSD"):
     if atr < TREND_CONT_MIN_ATR.get(instrument, 0.5):
         return None
 
-    adx, _ = calc_adx(c5, period=ADX_PERIOD)
+    adx, adx_subiendo = calc_adx(c5, period=ADX_PERIOD)
     if adx is None:
         return None
     if adx < TREND_CONT_ADX_MIN:
         print(f"  [7] Trend Continuation: descartado — ADX {adx:.1f} < {TREND_CONT_ADX_MIN} (tendencia no suficientemente fuerte)")
+        return None
+    # NUEVO 2026-10-06: con ADX minimo en 25, un ADX que viene CAYENDO
+    # hacia 25 es una tendencia que se apaga, no una que arranca. Ese dia
+    # a las 13:09 UTC el ADX M3 bajo de 33 a 25.3 mientras el oro
+    # lateralizaba bajo 4174, salio BUY en 4172.55 y toco SL en 15 min.
+    # Por encima de TREND_CONT_ADX_FUERTE no se exige que suba.
+    if TREND_CONT_ADX_SUBIENDO and not adx_subiendo and adx < TREND_CONT_ADX_FUERTE:
+        print(f"  [7] Trend Continuation: descartado — ADX {adx:.1f} bajando (tendencia perdiendo fuerza)")
         return None
 
     ema_fast = ema(closes5, 20)
