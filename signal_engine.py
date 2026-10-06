@@ -249,6 +249,10 @@ MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
 # el MAS LEJANO entre el estructural (banda + 0.3 ATR) y ATR x MULT, y los
 # TPs son 1.5R / 3R, exactamente como strategy_trend_continuation().
 MEAN_REV_ATR_SL_MULT = float(os.getenv("MEAN_REV_ATR_SL_MULT", "2.0"))
+# PAUSADA 2026-10-06: 5 trades reales, 0 ganados, -$54.48 (ver
+# trades_ejecutados). El 06-oct vendio a las 09:11 UTC en plena subida
+# del oro. Se reactiva con MEAN_REV_ACTIVA=true en el .env.
+MEAN_REV_ACTIVA = os.getenv("MEAN_REV_ACTIVA", "false").lower() == "true"
 
 # ── Estrategia 7: Trend Continuation M5 (2026-09-03) ──
 # Ver conversacion: dias con movimiento muy direccional dejaban las
@@ -257,10 +261,36 @@ MEAN_REV_ATR_SL_MULT = float(os.getenv("MEAN_REV_ATR_SL_MULT", "2.0"))
 # precio ya se alejo demasiado (>2x ATR) de su swing origen. Esta
 # estrategia es la contraparte: EXIGE tendencia fuerte confirmada
 # (ADX alto) en vez de rechazarla.
-TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "30"))
+# Bajado de 30 a 25 (2026-10-06, a pedido de Arioldys): el 06-oct el oro
+# subio de 4113 a 4179 y el ADX M3 se quedo entre 15 y 29 las primeras
+# ~2 horas de la subida, asi que la estrategia no la veia como tendencia.
+TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "25"))
 TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
+TREND_CONT_ADX_SUBIENDO     = os.getenv("TREND_CONT_ADX_SUBIENDO", "true").lower() == "true"
+TREND_CONT_ADX_FUERTE       = float(os.getenv("TREND_CONT_ADX_FUERTE", "35"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
 TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
+# NUEVO 2026-10-05: filtro de sesgo H1. La estrategia solo miraba EMA20/50
+# y ADX en M3 (~2.5 h de historia), asi que en un oro bajista en H1 un
+# rebote de M3 cruzaba las EMAs y salia BUY (ej. 05-oct 00:49 y 08:28,
+# ambas LOSS). Ahora exige que el cierre de la ultima vela H1 CERRADA este
+# del lado correcto de la EMA100 H1: BUY solo por encima, SELL solo por
+# debajo. Sobre 47 trades cerrados (07-sep a 05-oct): a favor 30 trades
+# 19W +$63; en contra 17 trades 7W -$107 (esos son los que se bloquean).
+TREND_CONT_FILTRO_H1        = os.getenv("TREND_CONT_FILTRO_H1", "true").lower() == "true"
+TREND_CONT_H1_EMA           = int(os.getenv("TREND_CONT_H1_EMA", "100"))
+
+# ── Trend Continuation en EURUSD (NUEVO 2026-10-04) ──
+# Misma logica que en oro, sobre velas EURUSD del mismo timeframe
+# (data_engine.py tiene que subirlas). Se publica con instrument=EURUSD
+# y nombre propio, asi tiene su propio cooldown/tope diario y el bot
+# la enruta al simbolo EURUSD de MT5. El ATR minimo de oro (0.5) no
+# aplica a EURUSD: se usa TREND_CONT_MIN_ATR_EURUSD (en precio).
+TREND_CONT_EURUSD           = os.getenv("TREND_CONT_EURUSD", "true").lower() == "true"
+TREND_CONT_MIN_ATR = {
+    "XAUUSD": 0.5,
+    "EURUSD": float(os.getenv("TREND_CONT_MIN_ATR_EURUSD", "0.00008")),
+}
 
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
@@ -315,15 +345,17 @@ def telegram_signal(sig):
             latencia = f"Publicado: {publish_time}\n"
     else:
         latencia = f"Publicado: {publish_time}\n"
+    instrument = sig.get("instrument", "XAUUSD")
+    d = 2 if instrument == "XAUUSD" else 5
     return (
-        f"[SENAL {arrow}] XAUUSD\n"
+        f"[SENAL {arrow}] {instrument}\n"
         f"Estrategia: {sig['strategy']}\n"
-        f"Entrada: {sig['entry_price']:.2f}\n"
-        f"Stop Loss: {sig['stop_loss']:.2f}\n"
-        f"TP1: {sig['take_profit_1']:.2f}\n"
-        f"TP2: {sig['take_profit_2']:.2f}\n"
+        f"Entrada: {sig['entry_price']:.{d}f}\n"
+        f"Stop Loss: {sig['stop_loss']:.{d}f}\n"
+        f"TP1: {sig['take_profit_1']:.{d}f}\n"
+        f"TP2: {sig['take_profit_2']:.{d}f}\n"
         f"Score: {sig['confidence']}/100\n"
-        f"ATR: {sig.get('atr', 0):.2f} pts\n"
+        f"ATR: {sig.get('atr', 0):.{d}f}\n"
         f"{ote_line}"
         f"{latencia}"
         f"---\n"
@@ -1116,7 +1148,7 @@ def publish_signal(sig):
         return False
 
     try:
-        rows = get_candles("M5", 1)
+        rows = get_candles("M5", 1, instrument=sig.get("instrument", "XAUUSD"))
         if rows:
             precio_actual = float(rows[0]["close"])
             if not señal_vigente(sig, precio_actual):
@@ -1124,16 +1156,18 @@ def publish_signal(sig):
     except:
         pass
 
+    dec = 2 if sig.get("instrument", "XAUUSD") == "XAUUSD" else 5
     payload = {
         "id":            str(uuid.uuid4()),
         "signal_type":   sig["signal_type"],
-        "entry_price":   round(sig["entry_price"], 2),
-        "stop_loss":     round(sig["stop_loss"], 2),
-        "take_profit_1": round(sig["take_profit_1"], 2),
-        "take_profit_2": round(sig["take_profit_2"], 2),
+        "entry_price":   round(sig["entry_price"], dec),
+        "stop_loss":     round(sig["stop_loss"], dec),
+        "take_profit_1": round(sig["take_profit_1"], dec),
+        "take_profit_2": round(sig["take_profit_2"], dec),
         "confidence":    sig["confidence"],
         "strategy":      sig["strategy"],
         "timeframe":     sig.get("timeframe", "M5"),
+        "instrument":    sig.get("instrument", "XAUUSD"),
         "status":        "PENDING",
         "created_at":    datetime.now(timezone.utc).isoformat(),
     }
@@ -2538,7 +2572,22 @@ def strategy_mean_reversion_bb(c15, dxy_trend="NEUTRAL"):
     }
 
 
-def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
+def sesgo_h1(instrument="XAUUSD"):
+    """Sesgo de H1 para Trend Continuation: "BUY" si el cierre de la ultima
+    vela H1 cerrada esta sobre la EMA TREND_CONT_H1_EMA, "SELL" si esta
+    debajo, None si no hay velas suficientes (en ese caso no se filtra).
+    data_engine.py sube tambien la vela H1 en curso (copy_rates_from_pos
+    desde 0), por eso se descarta la ultima."""
+    ch1 = to_candles(get_candles("H1", TREND_CONT_H1_EMA * 3, instrument=instrument))
+    ch1 = ch1[:-1]
+    if len(ch1) < TREND_CONT_H1_EMA:
+        return None
+    e = ema([c["C"] for c in ch1], TREND_CONT_H1_EMA)
+    if e is None:
+        return None
+    return "BUY" if ch1[-1]["C"] > e else "SELL"
+
+def strategy_trend_continuation(c5, dxy_trend="NEUTRAL", instrument="XAUUSD"):
     """Estrategia 7: Trend Continuation M5.
     Contraparte deliberada de EMA Pullback/FVG Fill/etc: en vez de
     rechazar el precio cuando ya se extendio mucho (extension_agotada),
@@ -2561,14 +2610,22 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
 
     closes5 = [c["C"] for c in c5]
     atr = calc_atr(c5[-20:])
-    if atr < 0.5:
+    if atr < TREND_CONT_MIN_ATR.get(instrument, 0.5):
         return None
 
-    adx, _ = calc_adx(c5, period=ADX_PERIOD)
+    adx, adx_subiendo = calc_adx(c5, period=ADX_PERIOD)
     if adx is None:
         return None
     if adx < TREND_CONT_ADX_MIN:
         print(f"  [7] Trend Continuation: descartado — ADX {adx:.1f} < {TREND_CONT_ADX_MIN} (tendencia no suficientemente fuerte)")
+        return None
+    # NUEVO 2026-10-06: con ADX minimo en 25, un ADX que viene CAYENDO
+    # hacia 25 es una tendencia que se apaga, no una que arranca. Ese dia
+    # a las 13:09 UTC el ADX M3 bajo de 33 a 25.3 mientras el oro
+    # lateralizaba bajo 4174, salio BUY en 4172.55 y toco SL en 15 min.
+    # Por encima de TREND_CONT_ADX_FUERTE no se exige que suba.
+    if TREND_CONT_ADX_SUBIENDO and not adx_subiendo and adx < TREND_CONT_ADX_FUERTE:
+        print(f"  [7] Trend Continuation: descartado — ADX {adx:.1f} bajando (tendencia perdiendo fuerza)")
         return None
 
     ema_fast = ema(closes5, 20)
@@ -2610,9 +2667,19 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
         print(f"  [7] Trend Continuation: descartado — sin ruptura de la micro-consolidacion a favor de {trend_dir}")
         return None
 
+    if TREND_CONT_FILTRO_H1:
+        sesgo = sesgo_h1(instrument)
+        if sesgo is None:
+            print(f"  [7] Trend Continuation: sin velas H1 suficientes para el filtro de sesgo ({instrument}) — no se filtra")
+        elif sesgo != trend_dir:
+            print(f"  [7] Trend Continuation: descartado — {trend_dir} en M3 contra el sesgo H1 ({sesgo}, EMA{TREND_CONT_H1_EMA})")
+            return None
+
     sig_type = trend_dir
     score = 0
     reasons = []
+    if TREND_CONT_FILTRO_H1 and sesgo is not None:
+        reasons.append(f"H1 a favor (precio {'sobre' if sesgo == 'BUY' else 'bajo'} EMA{TREND_CONT_H1_EMA})")
 
     adx_exceso = adx - TREND_CONT_ADX_MIN
     score += 30 + min(15, round(adx_exceso))
@@ -2671,8 +2738,9 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
         "take_profit_1": tp1,
         "take_profit_2": tp2,
         "confidence":    score,
-        "strategy":      f"Trend Continuation {TREND_CONT_TF}",
+        "strategy":      f"Trend Continuation {TREND_CONT_TF}" + ("" if instrument == "XAUUSD" else f" {instrument}"),
         "timeframe":     TREND_CONT_TF,
+        "instrument":    instrument,
         "atr":           atr,
         "reasons":       reasons,
         "candle_time":   ultima["time"],
@@ -2809,8 +2877,10 @@ def analyze():
     #     print(f"  [5] Error Sweep Displacement: {e}")
 
     try:
-        sig = strategy_mean_reversion_bb(c15, dxy_trend)
-        if sig:
+        sig = strategy_mean_reversion_bb(c15, dxy_trend) if MEAN_REV_ACTIVA else None
+        if not MEAN_REV_ACTIVA:
+            print(f"  [6] Mean Reversion BB M15: pausada (MEAN_REV_ACTIVA=false)")
+        elif sig:
             if publish_signal(sig):
                 signals_found += 1
             else:
@@ -2836,6 +2906,24 @@ def analyze():
             print(f"  [7] Trend Continuation {TREND_CONT_TF}: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
     except Exception as e:
         print(f"  [7] Error Trend Continuation: {e}")
+
+    if TREND_CONT_EURUSD:
+        try:
+            c_eu = to_candles(get_candles(TREND_CONT_TF, 100, instrument="EURUSD"))
+            if len(c_eu) < 60:
+                print(f"  [7-EU] Trend Continuation {TREND_CONT_TF} EURUSD: sin velas suficientes ({len(c_eu)}) — ¿data_engine sube EURUSD {TREND_CONT_TF}?")
+                sig = None
+            else:
+                sig = strategy_trend_continuation(c_eu, dxy_trend, instrument="EURUSD")
+            if sig:
+                if publish_signal(sig):
+                    signals_found += 1
+                else:
+                    print(f"  [7-EU] Trend Continuation EURUSD: señal detectada pero no publicada")
+            elif len(c_eu) >= 60:
+                print(f"  [7-EU] Trend Continuation {TREND_CONT_TF} EURUSD: sin setup")
+        except Exception as e:
+            print(f"  [7-EU] Error Trend Continuation EURUSD: {e}")
 
     try:
         sig = strategy_crt_killzone(ch1, c5, dxy_trend)

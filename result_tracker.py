@@ -73,6 +73,22 @@ BREAKEVEN_FILE = "breakeven_signals.txt"
 LOOP_INTERVAL  = int(os.getenv("TRACKER_LOOP_INTERVAL", "60"))  # segundos entre cada revision
 
 ANTI_HUNT_SL_EXTRA = float(os.getenv("ANTI_HUNT_SL_EXTRA", "2.0"))
+# NUEVO 2026-10-04 (multi-mercado): cada señal se simula con las velas
+# de SU mercado (columna `instrument` de signals). Antes todo se medía
+# contra velas de XAUUSD, lo que daria WIN/LOSS falsos para EURUSD.
+# Anti-hunt de EURUSD en precio: misma variable que usa bot_engine.py.
+ANTI_HUNT_SL_EXTRA_POR_INSTRUMENTO = {
+    "XAUUSD": ANTI_HUNT_SL_EXTRA,
+    "EURUSD": float(os.getenv("SL_EXTRA_PRICE_EURUSD", "0.0002")),
+}
+
+
+def instrumento(signal):
+    return (signal.get("instrument") or "XAUUSD").upper()
+
+
+def decimales(signal):
+    return 2 if instrumento(signal) == "XAUUSD" else 5
 
 # ── Trailing stop por ATR (post-breakeven) — replica bot_engine.py ──
 # Mismo multiplicador que usa bot_engine.py para que la simulacion sea
@@ -150,13 +166,14 @@ def save_breakeven_signals(sig_set, intentos=3):
 
 def telegram_result(signal, result, exit_price, pnl_pts):
     emoji   = "✅" if result == "WIN" else "❌"
-    pnl_str = f"+{pnl_pts:.1f}" if pnl_pts > 0 else f"{pnl_pts:.1f}"
+    d = decimales(signal)
+    pnl_str = f"+{pnl_pts:.{d}f}" if pnl_pts > 0 else f"{pnl_pts:.{d}f}"
     return (
-        f"{emoji} <b>{result} — {signal['signal_type']} XAUUSD</b>\n"
+        f"{emoji} <b>{result} — {signal['signal_type']} {instrumento(signal)}</b>\n"
         f"---\n"
         f"Estrategia: {signal.get('strategy', '-')}\n"
         f"Entrada: <code>{signal['entry_price']}</code>\n"
-        f"Cierre: <code>{exit_price:.2f}</code>\n"
+        f"Cierre: <code>{exit_price:.{d}f}</code>\n"
         f"PnL: <b>{pnl_str} puntos</b>\n"
         f"Score: {signal.get('confidence', '-')}/100\n"
         f"---\n"
@@ -167,9 +184,9 @@ def telegram_breakeven(signal, current_price):
     return (
         f"BREAKEVEN ACTIVADO\n"
         f"---\n"
-        f"{signal['signal_type']} XAUUSD\n"
+        f"{signal['signal_type']} {instrumento(signal)}\n"
         f"Entrada: {signal['entry_price']}\n"
-        f"Precio actual: {current_price:.2f}\n"
+        f"Precio actual: {current_price:.{decimales(signal)}f}\n"
         f"SL movido a breakeven: {signal['entry_price']}\n"
         f"---\n"
         f"Operacion protegida. Riesgo = 0."
@@ -181,7 +198,7 @@ def telegram_daily_report(stats):
     pnl_str   = f"+{stats['pnl']:.2f}" if stats['pnl'] >= 0 else f"{stats['pnl']:.2f}"
 
     lines = [
-        f"REPORTE DIARIO — XAUUSD (trades reales)",
+        f"REPORTE DIARIO — XAUUSD + EURUSD (trades reales)",
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
         f"---",
         f"Total trades ejecutados: {stats['total']}",
@@ -239,7 +256,7 @@ def get_pending_signals():
         params={
             "status":  "eq.EXECUTING",
             "result":  "is.null",
-            "select":  "id,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at",
+            "select":  "id,instrument,signal_type,entry_price,stop_loss,take_profit_1,take_profit_2,confidence,strategy,created_at",
             "order":   "created_at.desc",
             "limit":   "20",
         },
@@ -281,7 +298,7 @@ def get_real_close(sig_id):
     rows = r.json()
     return rows[0] if rows else None
 
-def get_candles_after(created_at, limit=200, context_before=CONTEXT_BEFORE):
+def get_candles_after(created_at, limit=200, context_before=CONTEXT_BEFORE, instrument="XAUUSD"):
     """
     Trae las velas M5 posteriores a `created_at` (igual que antes) MAS
     un colchon de `context_before` velas ANTERIORES, necesarias para
@@ -297,7 +314,7 @@ def get_candles_after(created_at, limit=200, context_before=CONTEXT_BEFORE):
         headers=headers(),
         params={
             "select":      "candle_time,high,low,close",
-            "instrument":  "eq.XAUUSD",
+            "instrument":  f"eq.{instrument}",
             "timeframe":   "eq.M5",
             "candle_time": f"lte.{created_at}",
             "order":       "candle_time.desc",
@@ -312,7 +329,7 @@ def get_candles_after(created_at, limit=200, context_before=CONTEXT_BEFORE):
         headers=headers(),
         params={
             "select":      "candle_time,high,low,close",
-            "instrument":  "eq.XAUUSD",
+            "instrument":  f"eq.{instrument}",
             "timeframe":   "eq.M5",
             "candle_time": f"gt.{created_at}",
             "order":       "candle_time.asc",
@@ -523,18 +540,19 @@ def run_cycle():
                 save_breakeven_signals(breakeven_set)
             send_telegram(telegram_result(signal, result, exit_price, pnl_pts))
             icon = "WIN" if result == "WIN" else "LOSS"
-            print(f"  [{icon}] {sig_type} [{sig_id[:8]}] — cierre REAL (bot o manual) @ {exit_price:.2f} ({pnl_pts:+.1f} pts, ${profit:+.2f})")
+            print(f"  [{icon}] {instrumento(signal)} {sig_type} [{sig_id[:8]}] — cierre REAL (bot o manual) @ {exit_price:.{decimales(signal)}f} ({pnl_pts:+.{decimales(signal)}f}, ${profit:+.2f})")
             continue  # ya resuelto, no hace falta simular
 
+        extra = ANTI_HUNT_SL_EXTRA_POR_INSTRUMENTO.get(instrumento(signal), ANTI_HUNT_SL_EXTRA)
         if sig_type == "BUY":
-            sl = sl - ANTI_HUNT_SL_EXTRA
+            sl = sl - extra
         else:
-            sl = sl + ANTI_HUNT_SL_EXTRA
+            sl = sl + extra
 
         if sig_id in breakeven_set:
             sl = entry
 
-        candles, offset = get_candles_after(created, 200)
+        candles, offset = get_candles_after(created, 200, instrument=instrumento(signal))
         if len(candles) <= offset:
             print(f"  [{sig_type}] Sin velas M5 posteriores todavía.")
             continue
@@ -617,7 +635,7 @@ def run_cycle():
                 save_breakeven_signals(breakeven_set)
             send_telegram(telegram_result(signal, result, exit_price, pnl_pts))
             icon = "WIN" if result == "WIN" else "LOSS"
-            print(f"  [{icon}] {sig_type} [{sig_id[:8]}] — {result} @ {exit_price:.2f} ({pnl_pts:+.1f} pts)")
+            print(f"  [{icon}] {instrumento(signal)} {sig_type} [{sig_id[:8]}] — {result} @ {exit_price:.{decimales(signal)}f} ({pnl_pts:+.{decimales(signal)}f})")
         else:
             age_min = (
                 datetime.now(timezone.utc)
