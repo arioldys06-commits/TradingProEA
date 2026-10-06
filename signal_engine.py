@@ -249,6 +249,10 @@ MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
 # el MAS LEJANO entre el estructural (banda + 0.3 ATR) y ATR x MULT, y los
 # TPs son 1.5R / 3R, exactamente como strategy_trend_continuation().
 MEAN_REV_ATR_SL_MULT = float(os.getenv("MEAN_REV_ATR_SL_MULT", "2.0"))
+# PAUSADA 2026-10-06: 5 trades reales, 0 ganados, -$54.48 (ver
+# trades_ejecutados). El 06-oct vendio a las 09:11 UTC en plena subida
+# del oro. Se reactiva con MEAN_REV_ACTIVA=true en el .env.
+MEAN_REV_ACTIVA = os.getenv("MEAN_REV_ACTIVA", "false").lower() == "true"
 
 # ── Estrategia 7: Trend Continuation M5 (2026-09-03) ──
 # Ver conversacion: dias con movimiento muy direccional dejaban las
@@ -257,7 +261,10 @@ MEAN_REV_ATR_SL_MULT = float(os.getenv("MEAN_REV_ATR_SL_MULT", "2.0"))
 # precio ya se alejo demasiado (>2x ATR) de su swing origen. Esta
 # estrategia es la contraparte: EXIGE tendencia fuerte confirmada
 # (ADX alto) en vez de rechazarla.
-TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "30"))
+# Bajado de 30 a 25 (2026-10-06, a pedido de Arioldys): el 06-oct el oro
+# subio de 4113 a 4179 y el ADX M3 se quedo entre 15 y 29 las primeras
+# ~2 horas de la subida, asi que la estrategia no la veia como tendencia.
+TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "25"))
 TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
 TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
@@ -2860,8 +2867,10 @@ def analyze():
     #     print(f"  [5] Error Sweep Displacement: {e}")
 
     try:
-        sig = strategy_mean_reversion_bb(c15, dxy_trend)
-        if sig:
+        sig = strategy_mean_reversion_bb(c15, dxy_trend) if MEAN_REV_ACTIVA else None
+        if not MEAN_REV_ACTIVA:
+            print(f"  [6] Mean Reversion BB M15: pausada (MEAN_REV_ACTIVA=false)")
+        elif sig:
             if publish_signal(sig):
                 signals_found += 1
             else:

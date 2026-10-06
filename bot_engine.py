@@ -18,7 +18,7 @@ Reglas:
   donde el bot opera fuera de sesion desde que killzone dejo de ser
   bloqueo obligatorio en signal_engine.py
 - SL anti-hunt: 20 puntos extra
-- Maximo 1 operacion abierta a la vez
+- Maximo 1 operacion abierta por mercado (cuenta tambien las manuales)
 - Maximo 6 operaciones por dia (configurable via MAX_DAILY en .env)
 - Solo ejecuta estrategias permitidas
 - NUEVO: cierre por tiempo (time-stop) para estrategias en
@@ -687,6 +687,13 @@ def get_open_positions(symbol=None):
         return []
 
     return [p for p in positions if getattr(p, "magic", None) == MAGIC_NUMBER]
+
+
+def get_all_open_positions():
+    """Todas las posiciones abiertas de la cuenta (bot, manuales u otros
+    EA). Solo se usa para decidir si un mercado esta ocupado."""
+    positions = mt5.positions_get()
+    return list(positions) if positions else []
 
 
 # ── Gestion de salida por cambio de estructura (CHoCH) ─────────
@@ -1648,8 +1655,16 @@ def run_cycle():
         if not cerrada_por_tiempo and strategy in EARLY_EXIT_STRATEGIES:
             check_choch_exit(pos, side, sig_id, strategy, now_str)
 
-    # Mercados sin posicion abierta del bot: solo en esos se puede abrir.
-    ocupados = {instrument_for_symbol(p.symbol) for p in open_positions}
+    # Mercados sin NINGUNA posicion abierta: solo en esos se puede abrir.
+    # CAMBIO 2026-10-06 (a pedido de Arioldys): antes solo contaban las
+    # posiciones del bot (MAGIC_NUMBER), asi que el 06-oct el bot abrio
+    # SELL de oro (03:28 y 09:11 UTC) mientras habia una venta manual de
+    # oro abierta. Ahora cuenta toda posicion del simbolo, sea del bot,
+    # manual o de otro EA: nunca dos operaciones en el mismo mercado.
+    ocupados = {
+        MT5_TO_INSTRUMENT[p.symbol] for p in get_all_open_positions()
+        if p.symbol in MT5_TO_INSTRUMENT
+    }
     instrumentos_libres = [i for i in BOT_INSTRUMENTS if i not in ocupados]
     if not instrumentos_libres:
         return
