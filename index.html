@@ -741,6 +741,16 @@ a{color:#148d60!important}
   </div>
   <div id="scalp-status" style="margin-bottom:12px"></div>
 
+  <!-- Recomendacion: cuando entrar -->
+  <div id="s5-advice" style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px;margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em">¿Cuándo entrar? — hora RD</div>
+      <div id="s5-advice-badge" style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:3px;background:var(--bg3);color:var(--dim)">-</div>
+    </div>
+    <div id="s5-advice-main" style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:6px">Presiona Analizar para ver la recomendación.</div>
+    <div id="s5-advice-steps" style="font-size:12px;color:var(--muted);line-height:1.7"></div>
+  </div>
+
   <!-- ★ NEW: EMA Control Panel -->
   <div class="ema-control-panel">
     <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Control EMA 3 / 9 / 20 — M5</div>
@@ -787,6 +797,7 @@ a{color:#148d60!important}
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">TP1</div><div style="font-size:20px;font-weight:600;font-family:var(--mono);color:var(--green)" id="s5-tp1">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">TP2</div><div style="font-size:20px;font-weight:600;font-family:var(--mono);color:var(--green)" id="s5-tp2">-</div></div>
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Score</div><div style="font-size:20px;font-weight:600;font-family:var(--mono);color:var(--gold)" id="s5-score">-</div></div>
+    <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:12px"><div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Hora entrada (RD)</div><div style="font-size:20px;font-weight:600;font-family:var(--mono)" id="s5-time">-</div><div style="font-size:10px;color:var(--dim);margin-top:2px" id="s5-time-sub">-</div></div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
     <div style="background:var(--bg1);border:1px solid var(--b1);border-radius:var(--r2);padding:14px">
@@ -1762,6 +1773,24 @@ function isInKillzone() {
   return (t >= 300 && t < 600) || (t >= 900 && t < 1200);
 }
 
+// Hora RD (UTC-4, sin horario de verano) de una fecha/ISO.
+function rdHM(d) {
+  return new Date(d).toLocaleTimeString('es', { timeZone: 'America/Santo_Domingo', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+// Killzone actual o la proxima, en hora RD: London 3-6, NY 9-12.
+function killzoneInfo(now = new Date()) {
+  const rdMin = ((now.getUTCHours() - 4 + 24) % 24) * 60 + now.getUTCMinutes();
+  const kzs = [{ name: 'London', start: 180, end: 360 }, { name: 'NY', start: 540, end: 720 }];
+  const hm = m => String(Math.floor(m / 60) % 24).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+  for (const k of kzs) {
+    if (rdMin >= k.start && rdMin < k.end) return { active: true, name: k.name, label: `${k.name} activa hasta ${hm(k.end)}`, minsLeft: k.end - rdMin };
+  }
+  const next = kzs.find(k => k.start > rdMin) || kzs[0];
+  const wait = (next.start - rdMin + 1440) % 1440;
+  return { active: false, name: next.name, label: `Próxima: ${next.name} a las ${hm(next.start)} (en ${Math.floor(wait / 60)}h ${wait % 60}m)`, minsLeft: 0 };
+}
+
 function colorDir(dir) {
   if (!dir) return '<span style="color:var(--dim)">-</span>';
   if (dir === 'BUY') return '<span style="color:var(--green);font-weight:600">BUY</span>';
@@ -1946,7 +1975,81 @@ async function loadScalpingM5() {
   document.getElementById('s5-reasons').innerHTML = reasons.length
     ? reasons.map(r => `<div style="padding:2px 0;border-bottom:1px solid var(--bg2)">• ${r}</div>`).join('')
     : 'Sin setup válido en este momento.';
-  document.getElementById('s5-updated').textContent = 'Actualizado: ' + new Date().toLocaleTimeString();
+
+  // ── Hora de entrada + recomendacion de momento ──
+  const M5_MS = 5 * 60 * 1000;
+  const lastOpen = new Date(last.time);
+  const lastClose = new Date(lastOpen.getTime() + M5_MS);   // la señal se confirma al cierre
+  const ageMin = Math.round((Date.now() - lastClose.getTime()) / 60000);
+  const stale = ageMin > 10;
+  const kz = killzoneInfo();
+  const timeEl = document.getElementById('s5-time'), timeSub = document.getElementById('s5-time-sub');
+  if (sigType) {
+    timeEl.textContent = rdHM(lastClose);
+    timeSub.textContent = `Vela M5 ${rdHM(lastOpen)}–${rdHM(lastClose)} · válida hasta ${rdHM(lastClose.getTime() + 2 * M5_MS)}`;
+  } else {
+    timeEl.textContent = '-';
+    timeSub.textContent = `Última vela M5: ${rdHM(lastOpen)}`;
+  }
+
+  // Votos de direccion: marcos mayores (M30/H1/H2) vs D1 y EMAs M5
+  const htf = [dirM30, dirH1, dirH2].filter(Boolean);
+  const htfDir = htf.length && htf.every(d => d === htf[0]) ? htf[0] : null;
+  const m5Dir = allBull ? 'BUY' : allBear ? 'SELL' : null;
+  const conflicts = [];
+  if (htfDir && d1 && htfDir !== d1) conflicts.push(`M30/H1/H2 ${htfDir} vs D1 ${d1}`);
+  if (htfDir && m5Dir && htfDir !== m5Dir) conflicts.push(`M30/H1/H2 ${htfDir} vs EMAs M5 ${m5Dir}`);
+  if (!htfDir && htf.length) conflicts.push(`M30 ${dirM30 || '-'} / H1 ${dirH1 || '-'} / H2 ${dirH2 || '-'} no coinciden`);
+
+  // Zona de retroceso: EMA9 M5 y el FVG mas reciente a favor de la direccion
+  const pullbackZone = dir => {
+    const f = fvgs.filter(x => x.type === dir).slice(-1)[0];
+    const parts = [`EMA9 ${n(e9)}`];
+    if (f) parts.push(`FVG ${n(f.bottom)}–${n(f.top)}`);
+    return parts.join(' o ');
+  };
+
+  let badge, badgeColor, main, steps = [];
+  if (stale) {
+    badge = 'DATOS VIEJOS'; badgeColor = 'red';
+    main = `No operar con esta lectura: la última vela M5 cerró a las ${rdHM(lastClose)} (hace ${ageMin >= 120 ? Math.round(ageMin / 60) + ' h' : ageMin + ' min'}).`;
+    steps.push('Revisa que data_engine esté subiendo velas a Supabase y vuelve a presionar Analizar.');
+  } else if (sigType && score >= 75 && !conflicts.length) {
+    badge = 'ENTRAR AHORA'; badgeColor = 'green';
+    main = `${sigType} a mercado ${n(last.C)} entre ${rdHM(lastClose)} y ${rdHM(lastClose.getTime() + 2 * M5_MS)} RD.`;
+    steps.push(`Si el precio ya se fue más de ${n(atr * 0.5)} (½ ATR) de la entrada, no persigas: espera retroceso a ${pullbackZone(sigType)}.`);
+    if (!kz.active) steps.push(`Fuera de killzone (${kz.label}): reduce lote o espera la sesión.`);
+    else steps.push(`Killzone ${kz.label}.`);
+  } else if (sigType) {
+    badge = 'ESPERAR RETROCESO'; badgeColor = 'yellow';
+    main = `Setup ${sigType} con score ${score}/100${conflicts.length ? ' y conflicto de marcos' : ''}: no entrar a mercado.`;
+    steps.push(`Entrada recomendada: retroceso a ${pullbackZone(sigType)} con vela M5 de confirmación ${sigType === 'BUY' ? 'alcista' : 'bajista'} (cierre a favor).`);
+    if (conflicts.length) steps.push('Conflicto: ' + conflicts.join('; ') + '.');
+    steps.push(`Invalida si cierra ${sigType === 'BUY' ? 'bajo ' + n(swingL) : 'sobre ' + n(swingH)}.`);
+  } else {
+    const dir = htfDir && (!d1 || d1 === htfDir) ? htfDir : (m5Dir && d1 === m5Dir ? m5Dir : null);
+    if (conflicts.length || !dir) {
+      badge = 'NO ENTRAR'; badgeColor = 'red';
+      main = 'Mercado en conflicto: espera alineación antes de buscar entrada.';
+      if (conflicts.length) steps.push('Conflicto: ' + conflicts.join('; ') + '.');
+      if (htfDir) {
+        const opp = htfDir === 'BUY' ? 'SELL' : 'BUY';
+        steps.push(`Opción ${htfDir} (a favor de M30/H1/H2): espera que M5 gire a EMA3 ${htfDir === 'BUY' ? '>' : '<'} EMA9 ${htfDir === 'BUY' ? '>' : '<'} EMA20 y un sweep de ${htfDir === 'BUY' ? 'mínimo ' + n(swingL) : 'máximo ' + n(swingH)} con cierre de vuelta.`);
+        if (d1 === opp || m5Dir === opp) steps.push(`Opción ${opp} (a favor de ${d1 === opp ? 'D1' : ''}${d1 === opp && m5Dir === opp ? ' y ' : ''}${m5Dir === opp ? 'EMAs M5' : ''}): solo si M30 cambia a ${opp}; entonces ${opp === 'SELL' ? 'vende' : 'compra'} el retroceso a ${pullbackZone(opp)}.`);
+      }
+    } else {
+      badge = 'ESPERAR SETUP'; badgeColor = 'yellow';
+      main = `Sesgo ${dir}: busca ${dir} cuando haya sweep de ${dir === 'BUY' ? 'mínimo ' + n(swingL) : 'máximo ' + n(swingH)} y la vela M5 cierre de vuelta.`;
+      steps.push(`Mejor zona: retroceso a ${pullbackZone(dir)} con RSI ${dir === 'BUY' ? '< 70' : '> 30'} (ahora ${rsi}).`);
+    }
+    steps.push(kz.active ? `Killzone ${kz.label}: momento válido si aparece el setup.` : `Fuera de killzone. ${kz.label}.`);
+  }
+  const bc = { green: ['rgba(34,197,94,.15)', 'var(--green)'], yellow: ['rgba(234,179,8,.15)', 'var(--yellow)'], red: ['rgba(239,68,68,.15)', 'var(--red)'] }[badgeColor];
+  const badgeEl = document.getElementById('s5-advice-badge');
+  badgeEl.textContent = badge; badgeEl.style.background = bc[0]; badgeEl.style.color = bc[1];
+  document.getElementById('s5-advice-main').textContent = main;
+  document.getElementById('s5-advice-steps').innerHTML = steps.map(t => `<div>• ${t}</div>`).join('');
+  document.getElementById('s5-updated').textContent = `Actualizado: ${rdHM(new Date())} RD · última vela M5 ${rdHM(lastOpen)}`;
 
   statusEl.innerHTML = sigType
     ? `<div style="background:rgba(240,180,41,.08);border:1px solid rgba(240,180,41,.2);border-radius:var(--r);padding:8px 12px;color:var(--gold);font-size:12px">Setup ${sigType} detectado — Score ${score}/100 ${score >= 75 ? '✅ Válido' : '⚠ Score bajo'}</div>`
