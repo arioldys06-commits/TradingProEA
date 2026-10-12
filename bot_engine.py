@@ -1352,6 +1352,21 @@ def execute_order(signal):
             )
             if "aviso" in detalle:
                 print(f"  [RIESGO] AVISO: {detalle['aviso']}")
+            if detalle.get("bloqueado_por_apalancamiento"):
+                print(f"  [RIESGO] Tope de apalancamiento aplicado: {detalle.get('apalancamiento_nocional')}:1 -> {detalle.get('apalancamiento_maximo')}:1")
+
+    # FIX 2026-10-12: verificación de margen antes de enviar
+    try:
+        _margin_req = mt5.order_calc_margin(order_type, MT5_SYMBOL, lote, price)
+        _acct = mt5.account_info()
+        if _margin_req is not None and _acct is not None:
+            _margen_libre = _acct.margin_free
+            if _margin_req > _margen_libre * 0.9:
+                print(f"  [RIESGO] Orden rechazada: margen requerido ${_margin_req:.2f} "
+                      f"vs libre ${_margen_libre:.2f} (se deja 10% de colchón)")
+                return None
+    except Exception as _e:
+        print(f"  [RIESGO] Aviso: no se pudo verificar margen ({_e}) — se continúa")
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
