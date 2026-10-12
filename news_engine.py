@@ -94,6 +94,7 @@ def fetch_forexfactory_calendar() -> list[dict]:
             }
         )
     log.info(f"Calendario ForexFactory: {len(filtered)} eventos relevantes")
+    _save_cached_events(filtered)
     return filtered
 
 
@@ -248,3 +249,97 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
+
+# ------------------------------------------------------------------
+# 5) Filtro de blackout de noticias (FIX 2026-10-12 - fail-closed)
+# ------------------------------------------------------------------
+# signal_engine.py importa `is_news_blackout`. Antes no existía y el
+# import fallaba en silencio dejando el filtro muerto.
+import json as _json
+from pathlib import Path as _Path
+
+NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "15"))
+NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "15"))
+NEWS_MAX_STALE_HOURS = float(os.getenv("NEWS_MAX_STALE_HOURS", "6"))
+_NEWS_CACHE_FILE = _Path("news_calendar_cache.json")
+
+def _load_cached_events():
+    if _NEWS_CACHE_FILE.exists():
+        try:
+            data = _json.loads(_NEWS_CACHE_FILE.read_text())
+            return data.get("events", []), data.get("fetched_at")
+        except Exception:
+            pass
+    return [], None
+
+def _save_cached_events(events):
+    try:
+        _NEWS_CACHE_FILE.write_text(_json.dumps({
+            "events": events,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }))
+    except Exception as e:
+        log.warning(f"No se pudo guardar caché de noticias: {e}")
+
+def _parse_event_time(raw):
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=-5))).astimezone(timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def is_news_blackout(before_min=None, after_min=None):
+    """
+    Retorna (bloqueado: bool, evento: dict|None).
+    Fail-closed: si el calendario está desactualizado (>NEWS_MAX_STALE_HOURS),
+    BLOQUEA las entradas en vez de operar a ciegas.
+    """
+    before = before_min if before_min is not None else NEWS_BLACKOUT_BEFORE_MIN
+    after = after_min if after_min is not None else NEWS_BLACKOUT_AFTER_MIN
+
+    events, fetched_at = _load_cached_events()
+    stale = True
+    if fetched_at:
+        try:
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(fetched_at)).total_seconds() / 3600
+            stale = age_h > NEWS_MAX_STALE_HOURS
+        except Exception:
+            stale = True
+
+    if stale or not events:
+        fresh = fetch_forexfactory_calendar()
+        if fresh:
+            events = fresh
+            _save_cached_events(events)
+            stale = False
+        if not events:
+            return True, {
+                "event": "CALENDARIO_DESACTUALIZADO",
+                "country": "N/A",
+                "impact": "Desconocido",
+                "minutes_to_event": 0,
+                "reason": f"Sin datos de noticias por >{NEWS_MAX_STALE_HOURS}h. Bloqueo preventivo.",
+            }
+
+    now = datetime.now(timezone.utc)
+    for e in events:
+        if e.get("impact") not in ("Alto", "High"):
+            continue
+        if (e.get("currency") or e.get("country")) != "USD":
+            continue
+        et = _parse_event_time(e.get("event_time"))
+        if not et:
+            continue
+        delta_min = (et - now).total_seconds() / 60
+        if -after <= delta_min <= before:
+            return True, {
+                "event": e.get("title"),
+                "country": e.get("currency") or e.get("country"),
+                "impact": e.get("impact"),
+                "minutes_to_event": round(delta_min, 1),
+            }
+    return False, None
