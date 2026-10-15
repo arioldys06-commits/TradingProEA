@@ -53,6 +53,8 @@ import statistics
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
+import bisect
+
 import requests
 from dotenv import load_dotenv
 
@@ -61,6 +63,7 @@ load_dotenv()
 # Reutiliza TODA la logica real de las 6 estrategias — no se reimplementa
 # nada aqui. Si signal_engine.py cambia, el backtest cambia con el.
 import signal_engine as se
+import strategy_countertrend_smasher as cts
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -170,6 +173,7 @@ STRATEGY_TIMEFRAME = {
     "sweep":        "M1",
     "mean_reversion": "M15",
     "trend_continuation": None,  # se fija abajo con TREND_TF
+    "countertrend": "M5",
 }
 
 STRATEGY_LABEL = {
@@ -180,6 +184,7 @@ STRATEGY_LABEL = {
     "sweep":          "Sweep Displacement M1",
     "mean_reversion": "Mean Reversion BB M15",
     "trend_continuation": None,  # se fija abajo con TREND_TF
+    "countertrend":   cts.STRATEGY_NAME,
 }
 
 # Trend Continuation corre en el timeframe que use signal_engine.py
@@ -376,6 +381,48 @@ def run_backtest_trend_continuation(m5, dxy_trend="NEUTRAL"):
     return trades
 
 
+def run_backtest_countertrend(series_by_tf):
+    """Backtest de la Estrategia 8 (Countertrend Smasher, port del EA).
+    Camina vela M5 a vela M5. Para cada timeframe solo entran velas YA
+    CERRADAS al cierre de la vela M5 evaluada (sin look-ahead). Diferencia
+    con el vivo: en vivo los swings tambien ven la vela en formacion de
+    cada TF. Respeta el limite de 2 operaciones por dia del EA.
+    Limitacion: no simula el breakeven a 1R (solo SL/TP originales)."""
+    trades = []
+    m5 = series_by_tf["M5"]
+    # tiempo de cierre de cada vela por TF, para cortar con bisect
+    cierres = {}
+    for tf, velas in series_by_tf.items():
+        mins = cts.TF_MINUTES[tf]
+        cierres[tf] = [cts._parse_time(c["time"]) + timedelta(minutes=mins) for c in velas]
+
+    win = cts.SWING_LOOKBACK + 2 * cts.SWING_STRENGTH + 2
+    trades_por_dia = defaultdict(int)
+    i = 60
+    while i < len(m5) - 1:
+        now = cierres["M5"][i]
+        dia = now.date()
+        if trades_por_dia[dia] >= cts.MAX_TRADES_PER_DAY:
+            i += 1
+            continue
+        ventana = {}
+        for tf, velas in series_by_tf.items():
+            j = bisect.bisect_right(cierres[tf], now)
+            ventana[tf] = velas[max(0, j - win):j]
+        try:
+            sig = cts.evaluate(ventana, now_utc=now, stateless=True, log=lambda *_: None)
+        except Exception:
+            sig = None
+        if sig:
+            resultado, r = simular_resultado(sig, m5[i + 1:])
+            trades.append((m5[i]["time"], resultado, r))
+            trades_por_dia[dia] += 1
+            i += 6
+        else:
+            i += 1
+    return trades
+
+
 # ── Agregacion de resultados ──────────────────────────────────────
 
 def agregar_resultado(trades):
@@ -511,8 +558,8 @@ def main():
     parser = argparse.ArgumentParser(description="Backtest de las estrategias de signal_engine.py")
     parser.add_argument("--days", type=int, default=30, help="Dias hacia atras a testear (default 30)")
     parser.add_argument(
-        "--strategies", type=str, default="scalping,killzone,fvg,ema,sweep,mean_reversion,trend_continuation",
-        help="Lista separada por coma: scalping,killzone,fvg,ema,sweep,mean_reversion,trend_continuation"
+        "--strategies", type=str, default="scalping,killzone,fvg,ema,sweep,mean_reversion,trend_continuation,countertrend",
+        help="Lista separada por coma: scalping,killzone,fvg,ema,sweep,mean_reversion,trend_continuation,countertrend"
     )
     args = parser.parse_args()
 
@@ -534,7 +581,7 @@ def main():
     m15 = fetch_historical_candles("M15", start_iso, end_iso)
     m30 = fetch_historical_candles("M30", start_iso, end_iso)
     h1  = fetch_historical_candles("H1",  start_iso, end_iso)
-    necesita_m1 = "sweep" in seleccion or ("trend_continuation" in seleccion and TREND_TF not in ("M5", "M15", "M30", "H1"))
+    necesita_m1 = "sweep" in seleccion or "countertrend" in seleccion or ("trend_continuation" in seleccion and TREND_TF not in ("M5", "M15", "M30", "H1"))
     m1  = fetch_historical_candles("M1",  start_iso, end_iso) if necesita_m1 else []
     print(f"  M5: {len(m5)} velas | M15: {len(m15)} | M30: {len(m30)} | H1: {len(h1)} | M1: {len(m1)}")
 
@@ -622,6 +669,20 @@ def main():
         res = agregar_resultado(trades)
         if res:
             resultados_finales.append(("trend_continuation", res))
+            print(f"      {res['total_trades']} trades | winrate {res['winrate']}% | PF {res['profit_factor']}")
+        else:
+            print("      Sin trades suficientes en el rango.")
+
+    if "countertrend" in seleccion:
+        # H1/H4 necesitan ~300 velas previas para los swings: se baja historial extra
+        start_htf = (start - timedelta(days=80)).isoformat()
+        h1_cts = fetch_historical_candles("H1", start_htf, end_iso)
+        h4 = fetch_historical_candles("H4", start_htf, end_iso)
+        print(f"\n  [8] Corriendo {cts.STRATEGY_NAME}... (H4: {len(h4)} velas)")
+        trades = run_backtest_countertrend({"M1": m1, "M5": m5, "M15": m15, "H1": h1_cts, "H4": h4})
+        res = agregar_resultado(trades)
+        if res:
+            resultados_finales.append(("countertrend", res))
             print(f"      {res['total_trades']} trades | winrate {res['winrate']}% | PF {res['profit_factor']}")
         else:
             print("      Sin trades suficientes en el rango.")

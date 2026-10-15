@@ -210,6 +210,7 @@ except ImportError:
     sys.exit(1)
 
 from position_sizing import calculate_lot_size
+import strategy_countertrend_smasher as cts
 
 load_dotenv()
 
@@ -242,6 +243,9 @@ LOT_POR_ESTRATEGIA = {
     "Liquidity Sweep": 0.02,
     "Killzone Breakout": 0.02,
     "Scalping M5 SMC": 0.02,
+    # Countertrend Smasher NO usa este lote: calcula el suyo con
+    # cts.calc_lots() (2% de equity, salta si el lote minimo arriesga >5%).
+    cts.STRATEGY_NAME: 0.01,
 }
 MIN_SCORE = 75
 MAX_DAILY = int(os.getenv("MAX_DAILY", "6"))  # antes fijo en 3
@@ -345,6 +349,7 @@ ALLOWED_STRATEGIES = [
     "Sweep Displacement M1",
     "Trend Continuation M5",
     "Mean Reversion BB M15",
+    cts.STRATEGY_NAME,
 ]
 
 
@@ -894,6 +899,63 @@ def check_breakeven(position, side, now_str):
     return True
 
 
+def check_breakeven_cts(position, side, now_str):
+    """
+    Breakeven del EA Countertrend Smasher (ManageBreakeven): cuando el
+    precio avanza cts.BREAKEVEN_R veces el riesgo, el SL pasa a la
+    entrada + cts.BE_LOCK_POINTS puntos. Sin trailing despues, igual que
+    el EA. El riesgo se deriva del TP (TP = entrada +/- RR x riesgo).
+    """
+    if cts.BREAKEVEN_R <= 0 or position.ticket in _breakeven_applied:
+        return False
+    entry = position.price_open
+    if not position.sl or not position.tp:
+        return False
+    if (side == "BUY" and position.sl >= entry) or (side == "SELL" and position.sl <= entry):
+        _breakeven_applied.add(position.ticket)
+        return False
+
+    symbol = mt5.symbol_info(MT5_SYMBOL)
+    tick = mt5.symbol_info_tick(MT5_SYMBOL)
+    if symbol is None or tick is None:
+        return False
+
+    riesgo = abs(position.tp - entry) / cts.RR
+    if riesgo <= 0:
+        return False
+    stops_level = symbol.trade_stops_level * symbol.point
+    lock = cts.BE_LOCK_POINTS * symbol.point
+
+    if side == "BUY":
+        if tick.bid - entry < riesgo * cts.BREAKEVEN_R:
+            return False
+        nuevo_sl = round(entry + lock, 2)
+        if tick.bid - nuevo_sl <= stops_level:
+            return False
+    else:
+        if entry - tick.ask < riesgo * cts.BREAKEVEN_R:
+            return False
+        nuevo_sl = round(entry - lock, 2)
+        if nuevo_sl - tick.ask <= stops_level:
+            return False
+
+    ok, error_detail = modify_position_sltp(position, new_sl=nuevo_sl)
+    if not ok:
+        print(f"  [BREAKEVEN CTS] Error en ticket {position.ticket}: {error_detail}")
+        log_error_to_file(f"Breakeven CTS fallo — ticket {position.ticket}: {error_detail}")
+        return False
+
+    _breakeven_applied.add(position.ticket)
+    print(f"  [BREAKEVEN CTS] Ticket {position.ticket} — SL a {nuevo_sl} (+{cts.BREAKEVEN_R}R)")
+    send_telegram(
+        f"[BOT] BREAKEVEN ACTIVADO — {cts.STRATEGY_NAME}\n"
+        f"Ticket: {position.ticket}\n"
+        f"SL movido a: {nuevo_sl} (entrada + {cts.BE_LOCK_POINTS} pts)\n"
+        f"Hora: {now_str}"
+    )
+    return True
+
+
 def check_trailing_stop(position, side, now_str):
     """
     Una vez que el breakeven ya esta activo en esta posicion (ticket en
@@ -1311,6 +1373,13 @@ def execute_order(signal):
     # — el rechazo ocurre a nivel de ejecucion, mismo tratamiento que
     # cualquier otro fallo de execute_order() (ver run_cycle: marca
     # FAILED recien despues de que execute_order devuelve None).
+    es_cts = signal["strategy"] == cts.STRATEGY_NAME
+    if es_cts:
+        _sym = mt5.symbol_info(MT5_SYMBOL)
+        if _sym is not None and _sym.spread > cts.MAX_SPREAD_POINTS:
+            print(f"  Spread actual {_sym.spread} pts > maximo {cts.MAX_SPREAD_POINTS} pts para {signal['strategy']} — orden rechazada")
+            return None, f"Spread demasiado ancho ({_sym.spread} pts > {cts.MAX_SPREAD_POINTS} max) para {signal['strategy']}"
+
     if signal["strategy"] in SPREAD_FILTER_STRATEGIES:
         spread_ok, spread_pts = spread_actual_ok()
         if not spread_ok:
@@ -1327,7 +1396,31 @@ def execute_order(signal):
 
     account = mt5.account_info()
 
-    if USE_FIXED_LOT:
+    if es_cts:
+        # Countertrend Smasher: mismo manejo que el EA de MT5 — SL exacto
+        # (sin anti-hunt), TP = RR x riesgo desde el precio real de
+        # entrada, y lote por % de equity con el chequeo de lote minimo.
+        sl = round(original_sl, 2)
+        _sym = mt5.symbol_info(MT5_SYMBOL)
+        if _sym is not None:
+            min_dist = (_sym.trade_stops_level + 5) * _sym.point
+            if signal_type == "BUY" and price - sl < min_dist:
+                sl = round(price - min_dist, 2)
+            if signal_type == "SELL" and sl - price < min_dist:
+                sl = round(price + min_dist, 2)
+        dist = abs(price - sl)
+        if dist <= 0 or (signal_type == "BUY" and sl >= price) or (signal_type == "SELL" and sl <= price):
+            return None, f"{cts.STRATEGY_NAME}: el precio ya paso el SL ({sl})"
+        tp1 = round(price + dist * cts.RR if signal_type == "BUY" else price - dist * cts.RR, 2)
+        lote, detalle = cts.calc_lots(mt5, MT5_SYMBOL, signal_type, price, sl)
+        if lote is None:
+            print(f"  [RIESGO] {cts.STRATEGY_NAME}: {detalle}")
+            return None, f"{cts.STRATEGY_NAME}: {detalle}"
+        print(
+            f"  [RIESGO] {cts.STRATEGY_NAME}: lote {lote} | riesgo ${detalle['riesgo_dinero']} "
+            f"({detalle['riesgo_pct']}% de ${detalle['equity']}) | SL {sl} | TP {tp1}"
+        )
+    elif USE_FIXED_LOT:
         lote = LOT_POR_ESTRATEGIA.get(signal["strategy"], FIXED_LOT_SIZE)
         print(f"  [RIESGO] Lote por estrategia: {lote} ({signal['strategy']}, USE_FIXED_LOT=true)")
     else:
@@ -1477,13 +1570,17 @@ def run_cycle():
             f"Profit: ${round(pos.profit, 2)}"
         )
 
-        # ── NUEVO: breakeven real al 70% del camino a TP1 (todas las estrategias) ──
-        check_breakeven(pos, side, now_str)
-
-        # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
-        check_trailing_stop(pos, side, now_str)
-
         sig_id, strategy = get_signal_info_by_position_comment(getattr(pos, "comment", None))
+
+        if strategy == cts.STRATEGY_NAME:
+            # Countertrend Smasher: breakeven a 1R como el EA, sin trailing.
+            check_breakeven_cts(pos, side, now_str)
+        else:
+            # ── NUEVO: breakeven real al 70% del camino a TP1 (todas las estrategias) ──
+            check_breakeven(pos, side, now_str)
+
+            # ── NUEVO: trailing stop por ATR, activo solo despues del breakeven ──
+            check_trailing_stop(pos, side, now_str)
 
         # ── NUEVO 2026-08-17: cierre por tiempo si no llega a breakeven ──
         cerrada_por_tiempo = check_time_stop(pos, sig_id, strategy, now_str)
@@ -1592,6 +1689,9 @@ def run_cycle():
     price = ask if sig_type == "BUY" else bid
     sl = calc_anti_hunt_sl(sig_type, float(best["stop_loss"]))
     tp1 = float(best["take_profit_1"])
+    _req = getattr(result, "request", None)
+    if strategy == cts.STRATEGY_NAME and _req is not None:
+        sl, tp1 = _req.sl, _req.tp
 
     update_signal_status(sig_id, "EXECUTING")
 
@@ -1599,7 +1699,9 @@ def run_cycle():
     print(f"    Ticket: {result.order}")
     print(f"    Tipo:   {sig_type}")
     print(f"    Precio: {price}")
-    print(f"    SL:     {sl} (anti-hunt +{SL_EXTRA_PTS} pts)")
+    sl_nota = "(SL exacto del EA, sin anti-hunt)" if strategy == cts.STRATEGY_NAME else f"(anti-hunt +{SL_EXTRA_PTS} pts)"
+    riesgo_nota = f"{cts.RISK_PCT}% del equity" if strategy == cts.STRATEGY_NAME else f"{RISK_PERCENT}% del balance"
+    print(f"    SL:     {sl} {sl_nota}")
     print(f"    TP1:    {tp1}")
     print(f"    Lote:   {result.volume}")
     print(f"    Hoy:    {count}/{MAX_DAILY}")
@@ -1608,9 +1710,9 @@ def run_cycle():
         f"[BOT] ORDEN ABIERTA - {sig_type} XAUUSD\n"
         f"Ticket: {result.order}\n"
         f"Precio entrada: {price}\n"
-        f"Stop Loss: {sl} (anti-hunt)\n"
+        f"Stop Loss: {sl} {sl_nota}\n"
         f"Take Profit: {tp1}\n"
-        f"Lote: {result.volume} (riesgo: {RISK_PERCENT}% del balance)\n"
+        f"Lote: {result.volume} (riesgo: {riesgo_nota})\n"
         f"Score: {score}/100\n"
         f"Estrategia: {strategy}\n"
         f"Operaciones hoy: {count}/{MAX_DAILY}\n"
