@@ -166,6 +166,9 @@ except Exception as e:
     AI_ENGINE_AVAILABLE = False
     AI_ENGINE_IMPORT_ERROR = e
 
+# Estrategia 8: Countertrend Smasher (port del EA de MT5)
+import strategy_countertrend_smasher as cts
+
 load_dotenv()
 
 SUPABASE_URL     = os.getenv("SUPABASE_URL")
@@ -2646,6 +2649,21 @@ def analyze():
     except Exception as e:
         print(f"  [7] Error Trend Continuation: {e}")
 
+    try:
+        cts_candles = {
+            tf: to_candles(get_candles(tf, cts.SWING_LOOKBACK + 10))
+            for tf in cts.STRUCTURE_TFS
+        }
+        sig = cts.evaluate(cts_candles)
+        if sig:
+            if publish_signal(sig):
+                cts.register_published(sig)
+                signals_found += 1
+            else:
+                print(f"  [8] {cts.STRATEGY_NAME}: señal detectada pero no publicada")
+    except Exception as e:
+        print(f"  [8] Error {cts.STRATEGY_NAME}: {e}")
+
     if signals_found > 0:
         print(f"  => {signals_found} señal(es) publicada(s) esta ronda")
     else:
@@ -2666,6 +2684,7 @@ def main():
     print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY es bono de score, no bloqueo)")
     print(f"    6. Mean Reversion BB M15 (Bollinger 20,2 + RSI, exige ADX < {MEAN_REV_ADX_MAX} en rango)")
     print(f"    7. Trend Continuation M5 (ADX >= {TREND_CONT_ADX_MIN} + EMA20/50 alineadas + ruptura de micro-consolidación)")
+    print(f"    8. {cts.STRATEGY_NAME} (HH/LL multi-TF M1-H4 + barrido / doble techo-suelo con mecha, misma lógica que el EA de MT5)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
