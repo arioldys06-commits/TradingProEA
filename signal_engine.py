@@ -177,6 +177,10 @@ MIN_SCORE        = 75    # Score mínimo para publicar señal (igualado a bot_en
 MAX_DAILY        = 12    # Máximo señales por día (bajado de 20 a 12, 2026-08-18: 20 era ruido excesivo en Supabase/Telegram; bot_engine.py tiene su PROPIO MAX_DAILY de ejecucion, este solo limita cuantas señales se publican)
 LOOP_INTERVAL    = 30    # Segundos entre cada análisis
 SIGNAL_COOLDOWN  = 300   # subido de 120 a 300s (2026-08-18): 120s dejaba abierta la ventana a 2-3 señales de la misma estrategia en la misma zona de liquidez antes de que cierre una vela M5
+# NUEVO 2026-10-04: tope diario POR ESTRATEGIA. Trend Continuation M3
+# publicaba 9-14 señales/dia y llenaba solo el MAX_DAILY de 12, dejando a
+# las demas sin poder publicar. Con este tope cada estrategia tiene su cupo.
+MAX_DAILY_PER_STRATEGY = int(os.getenv("MAX_DAILY_PER_STRATEGY", "4"))
 
 # Pares usados para construir el indice sintetico de fuerza del dolar.
 # Deben coincidir con los que data_engine.py sube a ohlc_candles.
@@ -238,6 +242,13 @@ MEAN_REV_RSI_OVERBOUGHT = 65 # bajado de 70 a 65 (2026-08-30): idem
 # aumentar frecuencia (objetivo >=10 señales/semana) — a costa de
 # aceptar mercados con algo mas de direccionalidad como "rango".
 MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
+# NUEVO 2026-09-29: gestion de SL/TP igual que Trend Continuation (a pedido
+# de Arioldys). Antes el SL era solo banda + 0.3 ATR y podia quedar a ~1 pt
+# de la entrada cuando el precio cerraba fuera de la banda (29-sep: SL 1.21
+# pts con ATR 5.07; 24-sep: SL 2.34 pts, perdida en 26 min). Ahora el SL es
+# el MAS LEJANO entre el estructural (banda + 0.3 ATR) y ATR x MULT, y los
+# TPs son 1.5R / 3R, exactamente como strategy_trend_continuation().
+MEAN_REV_ATR_SL_MULT = float(os.getenv("MEAN_REV_ATR_SL_MULT", "2.0"))
 
 # ── Estrategia 7: Trend Continuation M5 (2026-09-03) ──
 # Ver conversacion: dias con movimiento muy direccional dejaban las
@@ -249,6 +260,7 @@ MEAN_REV_ADX_MAX = float(os.getenv("MEAN_REV_ADX_MAX", "26"))
 TREND_CONT_ADX_MIN          = float(os.getenv("TREND_CONT_ADX_MIN", "30"))
 TREND_CONT_ATR_SL_MULT      = float(os.getenv("TREND_CONT_ATR_SL_MULT", "2.0"))
 TREND_CONT_CONSOLIDACION_N  = 3  # velas previas a la de ruptura, para medir la micro-pausa
+TREND_CONT_TF               = os.getenv("TREND_CONT_TF", "M3").upper()
 
 def is_nyc_killzone():
     now = datetime.now(timezone.utc)
@@ -260,6 +272,7 @@ def is_nyc_killzone():
 last_signal_time = {}    # {strategy: datetime} — cooldown por estrategia
 daily_count      = 0
 last_day         = None
+daily_count_by_strategy = {}  # {strategy: señales publicadas hoy}
 # ──────────────────────────────────────────────────────────────
 
 def headers():
@@ -1076,12 +1089,13 @@ def in_cooldown(strategy):
     return elapsed < SIGNAL_COOLDOWN
 
 def publish_signal(sig):
-    global daily_count, last_day, last_signal_time
+    global daily_count, last_day, last_signal_time, daily_count_by_strategy
 
     today = datetime.now(timezone.utc).date()
     if last_day != today:
         daily_count = 0
         last_day    = today
+        daily_count_by_strategy = {}
 
     if daily_count >= MAX_DAILY:
         print(f"  [SKIP] Límite diario {MAX_DAILY} señales alcanzado.")
@@ -1091,6 +1105,10 @@ def publish_signal(sig):
             f"Score: {sig['confidence']}/100 | Entry: {sig['entry_price']:.2f}\n"
             f"SL: {sig['stop_loss']:.2f} | TP1: {sig['take_profit_1']:.2f}"
         )
+        return False
+
+    if daily_count_by_strategy.get(sig["strategy"], 0) >= MAX_DAILY_PER_STRATEGY:
+        print(f"  [SKIP] {sig['strategy']} ya publico {MAX_DAILY_PER_STRATEGY} señales hoy (tope por estrategia).")
         return False
 
     if in_cooldown(sig["strategy"]):
@@ -1135,6 +1153,7 @@ def publish_signal(sig):
         return False
 
     daily_count += 1
+    daily_count_by_strategy[sig["strategy"]] = daily_count_by_strategy.get(sig["strategy"], 0) + 1
     last_signal_time[sig["strategy"]] = datetime.now(timezone.utc)
 
     msg   = telegram_signal(sig)
@@ -1865,6 +1884,32 @@ def is_sweep_killzone():
     return (400 <= t < 700) or (930 <= t < 1230)
 
 
+def is_crt_nyc_killzone():
+    """Ventana ESTRICTA de NY para CRT (Candle Range Theory): 9:30-11:00 RD
+    (13:30-15:00 UTC). Mas angosta que is_nyc_killzone() (9:00-12:00),
+    porque CRT opera especificamente la manipulacion del open de NY, no
+    toda la sesion. FILTRO OBLIGATORIO para esta estrategia (igual que
+    Killzone Breakout con su propia ventana), no bono de score."""
+    now = datetime.now(timezone.utc)
+    rdh = ((now.hour - 4) + 24) % 24
+    t = rdh * 100 + now.minute
+    return 930 <= t < 1100
+
+
+def get_crt_reference_range(ch1):
+    """Rango (high, low) de la vela H1 de Londres 8-9am RD (12-13 UTC)
+    del dia actual — la vela de referencia de la que CRT espera el sweep."""
+    hoy = datetime.now(timezone.utc).date()
+    for c in ch1:
+        try:
+            ct = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if ct.date() == hoy and ct.hour == 12:
+            return c["H"], c["L"]
+    return None, None
+
+
 def en_blackout_de_noticias(buffer_minutos=5):
     # NOTA: buffer_minutos ya NO se usa para calcular la ventana — is_news_blackout()
     # trae su propia ventana asimetrica (NEWS_BLACKOUT_BEFORE_MIN/AFTER_MIN del .env
@@ -2186,6 +2231,140 @@ def strategy_sweep_displacement(c15, c5, dxy_trend="NEUTRAL"):
 
 
 # ════════════════════════════════════════════════════════════════
+# ESTRATEGIA 8: CRT (Candle Range Theory) — Kill Zone NY — NUEVO 2026-09-15
+# ════════════════════════════════════════════════════════════════
+# Reutiliza el mismo motor que Estrategia 5 (detect_sweep_mss_m1,
+# detect_fvgs, precio_en_zona_entrada, confirmar_entrada_por_vela,
+# extension_agotada). Lo distinto:
+#   1. El nivel a barrer es el rango de la vela H1 de referencia
+#      (Londres 8-9am RD), no asiatico/PDH-PDL/equal levels.
+#   2. La killzone NYC estricta (9:30-11:00) es FILTRO OBLIGATORIO,
+#      no bono de score — igual de estructural que Estrategia 2.
+#   3. El TP1 apunta al LADO OPUESTO DEL RANGO de referencia, no a
+#      una extension ATR generica — esencia de CRT.
+# ════════════════════════════════════════════════════════════════
+
+def strategy_crt_killzone(ch1, c5, dxy_trend="NEUTRAL"):
+    """Estrategia 8: CRT — Kill Zone NY."""
+
+    if not is_crt_nyc_killzone():
+        return None
+
+    if en_blackout_de_noticias(buffer_minutos=5):
+        print("  [8] CRT Kill Zone NY: descartado — blackout de noticias de alto impacto")
+        return None
+
+    if len(ch1) < 5 or len(c5) < 20:
+        return None
+
+    range_high, range_low = get_crt_reference_range(ch1)
+    if range_high is None:
+        print("  [8] CRT Kill Zone NY: sin vela H1 de referencia (8-9am RD) todavia hoy")
+        return None
+
+    rows_m1 = get_candles("M1", 60)
+    if len(rows_m1) < SWEEP_SWING_LOOKBACK + 5:
+        return None
+    c1 = to_candles(rows_m1)
+
+    atr1 = calc_atr(c1, period=14)
+    if atr1 <= 0:
+        return None
+
+    vwap = calc_session_vwap(c5)
+    last_price = c1[-1]["C"]
+
+    candidato = None
+    result_buy = detect_sweep_mss_m1(c1, range_low, "BUY", atr1)
+    if result_buy.get("valid"):
+        candidato = ("BUY", result_buy)
+    else:
+        result_sell = detect_sweep_mss_m1(c1, range_high, "SELL", atr1)
+        if result_sell.get("valid"):
+            candidato = ("SELL", result_sell)
+
+    if not candidato:
+        print("  [8] CRT Kill Zone NY: sin sweep+CHoCH valido del rango de referencia")
+        return None
+
+    sig_type, result = candidato
+    disp_idx = result["displacement_idx"]
+
+    fvgs = detect_fvgs(c1)
+    fvg = next(
+        (f for f in fvgs if f["type"] == sig_type and abs(f["idx"] - disp_idx) <= 1),
+        None,
+    )
+    en_zona, zona_desc = precio_en_zona_entrada(c1, fvg, vwap, atr1, sig_type)
+    if not en_zona:
+        return None
+
+    if not confirmar_entrada_por_vela(c1, sig_type):
+        print(f"  [8] CRT Kill Zone NY: {sig_type} descartado — sin confirmación de vela en el retest")
+        return None
+
+    score = 0
+    reasons = [f"CRT: sweep del rango H1 referencia ({range_low:.2f}-{range_high:.2f})"]
+    score += 20; reasons.append("Rechazo tras el barrido")
+    score += 20; reasons.append("CHoCH/MSS confirmado en M1")
+    score += 15; reasons.append("Desplazamiento fuerte (cuerpo >= ATR x1.2)")
+    score += 10; reasons.append(f"Entrada en retest: {zona_desc}")
+    score += 10; reasons.append("Kill Zone NY estricta (9:30-11:00)")
+
+    morfo_bonus, morfo_reason = score_morfologia_vela(c1, sig_type)
+    if morfo_bonus != 0:
+        score += morfo_bonus
+        if morfo_reason:
+            reasons.append(morfo_reason)
+
+    dxy_bonus, dxy_reason = dxy_score_bonus(sig_type, dxy_trend)
+    if dxy_bonus != 0:
+        score += dxy_bonus
+        if dxy_reason:
+            reasons.append(dxy_reason)
+
+    score = max(0, min(score, 100))
+    if score < MIN_SCORE:
+        return None
+
+    swept_extreme = result["swept_extreme"]
+    entry = last_price
+
+    if sig_type == "BUY":
+        sl = swept_extreme - SWEEP_SL_BUFFER
+        sl_pts = entry - sl
+        if sl_pts <= 0 or range_high <= entry:
+            return None
+        tp1 = range_high
+        tp2 = entry + sl_pts * 3
+    else:
+        sl = swept_extreme + SWEEP_SL_BUFFER
+        sl_pts = sl - entry
+        if sl_pts <= 0 or range_low >= entry:
+            return None
+        tp1 = range_low
+        tp2 = entry - sl_pts * 3
+
+    agotada, detalle_ext = extension_agotada(c1, sig_type, entry, atr1)
+    if agotada:
+        return None
+
+    return {
+        "signal_type":   sig_type,
+        "entry_price":   entry,
+        "stop_loss":     sl,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "confidence":    score,
+        "strategy":      "CRT Kill Zone NY",
+        "timeframe":     "M1",
+        "atr":           atr1,
+        "reasons":       reasons,
+        "candle_time":   c1[-1]["time"],
+    }
+
+
+# ════════════════════════════════════════════════════════════════
 # ESTRATEGIA 6: Mean Reversion Bollinger + RSI (M15) — NUEVO 2026-08-30
 # ════════════════════════════════════════════════════════════════
 # Motivo: las 5 estrategias anteriores son todas de tendencia/ruptura
@@ -2323,24 +2502,25 @@ def strategy_mean_reversion_bb(c15, dxy_trend="NEUTRAL"):
     entry = last["C"]
     buffer_sl = atr * 0.3
 
+    # SL/TP igual que Trend Continuation (2026-09-29): el SL es el MAS
+    # LEJANO entre el estructural (banda + 0.3 ATR) y ATR x MULT — nunca
+    # mas angosto que 2 ATR. TP1 = 1.5R, TP2 = 3R.
     if sig_type == "BUY":
-        sl  = bb["lower"] - buffer_sl
-        tp1 = bb["mid"]
-        tp2 = bb["upper"]
+        sl_estructural = bb["lower"] - buffer_sl
+        sl_atr = entry - atr * MEAN_REV_ATR_SL_MULT
+        sl = min(sl_estructural, sl_atr)
+        sl_pts = entry - sl
+        tp1 = entry + sl_pts * 1.5
+        tp2 = entry + sl_pts * 3.0
     else:
-        sl  = bb["upper"] + buffer_sl
-        tp1 = bb["mid"]
-        tp2 = bb["lower"]
+        sl_estructural = bb["upper"] + buffer_sl
+        sl_atr = entry + atr * MEAN_REV_ATR_SL_MULT
+        sl = max(sl_estructural, sl_atr)
+        sl_pts = sl - entry
+        tp1 = entry - sl_pts * 1.5
+        tp2 = entry - sl_pts * 3.0
 
-    sl_pts = abs(entry - sl)
     if sl_pts <= 0:
-        return None
-
-    # Si el TP1 (banda media) queda demasiado cerca del entry, el trade
-    # no vale el riesgo — se descarta en vez de forzar un TP artificial.
-    tp1_pts = abs(tp1 - entry)
-    if tp1_pts < sl_pts * 0.8:
-        print(f"  [6] Mean Reversion BB: {sig_type} descartado — TP1 muy cerca del entry ({tp1_pts:.2f} pts < 0.8R)")
         return None
 
     return {
@@ -2491,8 +2671,8 @@ def strategy_trend_continuation(c5, dxy_trend="NEUTRAL"):
         "take_profit_1": tp1,
         "take_profit_2": tp2,
         "confidence":    score,
-        "strategy":      "Trend Continuation M5",
-        "timeframe":     "M5",
+        "strategy":      f"Trend Continuation {TREND_CONT_TF}",
+        "timeframe":     TREND_CONT_TF,
         "atr":           atr,
         "reasons":       reasons,
         "candle_time":   ultima["time"],
@@ -2598,29 +2778,35 @@ def analyze():
     except Exception as e:
         print(f"  [3] Error FVG Fill: {e}")
 
-    try:
-        sig = strategy_ema_pullback(c5, c30, ch1, dxy_trend)
-        if sig:
-            if publish_signal(sig):
-                signals_found += 1
-            else:
-                print(f"  [4] EMA Pullback: señal detectada pero no publicada")
-        else:
-            print(f"  [4] EMA Pullback M5: sin pullback válido")
-    except Exception as e:
-        print(f"  [4] Error EMA Pullback: {e}")
+    # PAUSADA 2026-09-15: 48 trades historicos, 41.7% winrate, -$143.11 neto
+    # (ver trades_ejecutados). Codigo intacto por si se reactiva con ajustes.
+    # try:
+    #     sig = strategy_ema_pullback(c5, c30, ch1, dxy_trend)
+    #     if sig:
+    #         if publish_signal(sig):
+    #             signals_found += 1
+    #         else:
+    #             print(f"  [4] EMA Pullback: señal detectada pero no publicada")
+    #     else:
+    #         print(f"  [4] EMA Pullback M5: sin pullback válido")
+    # except Exception as e:
+    #     print(f"  [4] Error EMA Pullback: {e}")
 
-    try:
-        sig = strategy_sweep_displacement(c15, c5, dxy_trend)
-        if sig:
-            if publish_signal(sig):
-                signals_found += 1
-            else:
-                print(f"  [5] Sweep Displacement: señal detectada pero no publicada")
-        else:
-            print(f"  [5] Sweep Displacement M1: sin setup (fuera de killzone, sin sweep+MSS, o sin retest a FVG/VWAP)")
-    except Exception as e:
-        print(f"  [5] Error Sweep Displacement: {e}")
+    # PAUSADA 2026-09-15: 0 trades ejecutados NUNCA (verificado en
+    # trades_ejecutados), y su logica de sweep+MSS en M1 dentro de la
+    # ventana NYC choca con la nueva Estrategia 8 CRT Kill Zone NY.
+    # Codigo intacto por si se reactiva.
+    # try:
+    #     sig = strategy_sweep_displacement(c15, c5, dxy_trend)
+    #     if sig:
+    #         if publish_signal(sig):
+    #             signals_found += 1
+    #         else:
+    #             print(f"  [5] Sweep Displacement: señal detectada pero no publicada")
+    #     else:
+    #         print(f"  [5] Sweep Displacement M1: sin setup (fuera de killzone, sin sweep+MSS, o sin retest a FVG/VWAP)")
+    # except Exception as e:
+    #     print(f"  [5] Error Sweep Displacement: {e}")
 
     try:
         sig = strategy_mean_reversion_bb(c15, dxy_trend)
@@ -2635,16 +2821,33 @@ def analyze():
         print(f"  [6] Error Mean Reversion BB: {e}")
 
     try:
-        sig = strategy_trend_continuation(c5, dxy_trend)
+        c_tc = c5 if TREND_CONT_TF == "M5" else to_candles(get_candles(TREND_CONT_TF, 100))
+        if len(c_tc) < 60:
+            print(f"  [7] Trend Continuation {TREND_CONT_TF}: sin velas suficientes ({len(c_tc)})")
+            sig = None
+        else:
+            sig = strategy_trend_continuation(c_tc, dxy_trend)
         if sig:
             if publish_signal(sig):
                 signals_found += 1
             else:
                 print(f"  [7] Trend Continuation: señal detectada pero no publicada")
         else:
-            print(f"  [7] Trend Continuation M5: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
+            print(f"  [7] Trend Continuation {TREND_CONT_TF}: sin setup (ADX insuficiente, EMAs no alineadas, o sin ruptura de micro-consolidación)")
     except Exception as e:
         print(f"  [7] Error Trend Continuation: {e}")
+
+    try:
+        sig = strategy_crt_killzone(ch1, c5, dxy_trend)
+        if sig:
+            if publish_signal(sig):
+                signals_found += 1
+            else:
+                print(f"  [8] CRT Kill Zone NY: señal detectada pero no publicada")
+        else:
+            print(f"  [8] CRT Kill Zone NY: sin setup (fuera de killzone NYC estricta, sin sweep+CHoCH, o sin retest)")
+    except Exception as e:
+        print(f"  [8] Error CRT Kill Zone NY: {e}")
 
     if signals_found > 0:
         print(f"  => {signals_found} señal(es) publicada(s) esta ronda")
@@ -2662,10 +2865,11 @@ def main():
     print(f"    1. Scalping M5 SMC (Sweep + BOS/CHoCH + OTE Fib + OB/FVG/liquidez)")
     print(f"    2. Killzone Breakout (London/NY) con Pullback + VWAP — killzone es bono de score, no bloqueo")
     print(f"    3. FVG Fill M5 (con filtro anti-trampa institucional)")
-    print(f"    4. EMA Pullback M5 (killzone NYC exige score >= {NYC_MIN_SCORE_EMA_PULLBACK}, M30+H1 obligatorio)")
-    print(f"    5. Sweep Displacement M1 (barrido + MSS + retroceso a FVG/VWAP, killzone Londres/NY es bono de score, no bloqueo)")
+    print(f"    4. [PAUSADA 2026-09-15] EMA Pullback M5 — 48 trades, -$143.11 neto")
+    print(f"    5. [PAUSADA 2026-09-15] Sweep Displacement M1 — 0 trades nunca, choca con CRT")
     print(f"    6. Mean Reversion BB M15 (Bollinger 20,2 + RSI, exige ADX < {MEAN_REV_ADX_MAX} en rango)")
-    print(f"    7. Trend Continuation M5 (ADX >= {TREND_CONT_ADX_MIN} + EMA20/50 alineadas + ruptura de micro-consolidación)")
+    print(f"    7. Trend Continuation {TREND_CONT_TF} (ADX >= {TREND_CONT_ADX_MIN} + EMA20/50 alineadas + ruptura de micro-consolidación)")
+    print(f"    8. CRT Kill Zone NY (sweep del rango H1 referencia 8-9am RD + CHoCH + FVG retest, killzone NYC estricta 9:30-11:00 obligatoria)")
     print(f"  ICT OTE: Golden Pocket 70.5% | Zona 62-79% Fibonacci")
     print(f"  Filtro DXY sintetico: {', '.join(DOLLAR_PAIRS)} (bono/penalizacion +/-{DXY_SCORE_BONUS}pts)")
     print(f"  Filtro FVG anti-trampa: sweep previo + momentum impulso + retest")
